@@ -1,0 +1,12 @@
+.venv/
+node_modules/
+build/
+dist/
+dist-packages/
+*.tgz
+*.egg-info/
+__pycache__/
+*.py[cod]
+
+# Code intelligence cache
+.codegraph/
