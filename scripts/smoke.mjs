@@ -1,5 +1,5 @@
 /**
- * Smoke test for the current decx-agent CLI/runtime wiring.
+ * Smoke test for the current peak CLI/runtime wiring.
  *
  * This intentionally stays shallow: unit tests cover graph/stage behavior; smoke
  * verifies that the built CLI can load config, run a task with MockWorker, list
@@ -8,10 +8,13 @@
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
-const root = join(new URL("..", import.meta.url).pathname);
-const workspace = mkdtempSync(join(tmpdir(), "decx-agent-smoke-"));
+// fileURLToPath (not URL.pathname) so the repo root resolves correctly on
+// Windows — pathname yields a malformed "\\E:\\Code\\" drive path there.
+const root = fileURLToPath(new URL("..", import.meta.url));
+const workspace = mkdtempSync(join(tmpdir(), "peak-smoke-"));
 const cli = join(root, "dist", "cli.js");
 
 function run(args, options = {}) {
@@ -22,7 +25,7 @@ function run(args, options = {}) {
     ...options,
   });
   if (result.status !== 0) {
-    process.stderr.write(result.stderr || result.stdout);
+    process.stderr.write(result.stderr || result.stdout || `(no output, status=${result.status}, signal=${result.signal})`);
     process.exit(result.status ?? 1);
   }
   return result.stdout;
@@ -32,15 +35,18 @@ try {
   const taskPath = join(workspace, "task.json");
   writeFileSync(taskPath, JSON.stringify({
     task: { target: "input.apk", goal: "smoke test current runtime wiring", session: "smoke-session" },
-    workflow: { limits: { maxSteps: 1 } },
   }, null, 2));
 
-  const runOut = run(["run", taskPath, "--mock", "--no-http", "--no-metacog", "--max-steps", "1"]);
+  const runOut = run(["run", taskPath, "--mock", "--no-http", "--no-metacog"]);
   for (const expected of [
-    "[decx-agent] session: smoke-session",
-    "[decx-agent] target: input.apk",
-    "[decx-agent] running...",
-    "[decx-agent] finished: stepped",
+    "[peak] session: smoke-session",
+    "[peak] target: input.apk",
+    "[peak] running...",
+    // Natural termination: MockWorker.registerDefaults() drives the planner to
+    // open one intent, the explorer resolves it, the evaluator accepts it, and
+    // on the next planner tick (empty intents + recent accept) the planner
+    // concludes the run → openIntents hits 0 → project completes.
+    "[peak] finished: completed",
   ]) {
     if (!runOut.includes(expected)) {
       process.stderr.write(`smoke run output missing: ${expected}\n${runOut}`);

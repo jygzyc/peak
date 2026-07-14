@@ -1,14 +1,14 @@
 # 10 · HTTP 服务与 Dashboard（`src/server/`）
 
 > 审计范围：2 个文件——`http-server.ts`（HTTP API + SSE + dashboard 分发）、`dashboard.html`（嵌入式前端单页）。
-> 本层是 decx-agent 的对外观测/控制面：列出 project、查 detail、发 directive、SSE 实时推 event、提供 dashboard UI。是 Graph 状态的 adapter，不应重复 loopestration 策略（文件头 1–7 行）。
+> 本层是 peak 的对外观测/控制面：列出 project、查 detail、发 directive、SSE 实时推 event、提供 dashboard UI。是 Graph 状态的 adapter，不应重复 loopestration 策略（文件头 1–7 行）。
 
 ---
 
 ## 10.1 `http-server.ts`（191 行）— HTTP API + Dashboard 服务
 
 ### 用途
-**decx-agent session 的 HTTP API 与 dashboard 服务**。暴露 project 列表、project 详情、directives、event stream、嵌入式 dashboard HTML。server 是 Graph 状态的 adapter，不重复 loopestration 策略。
+**peak session 的 HTTP API 与 dashboard 服务**。暴露 project 列表、project 详情、directives、event stream、嵌入式 dashboard HTML。server 是 Graph 状态的 adapter，不重复 loopestration 策略。
 
 ### 关键导出
 - `HttpServer`（class）：`start(options): Promise<void>`/`stop(): Promise<void>`/`port: number`
@@ -60,7 +60,7 @@
 ## 10.2 `dashboard.html`（413 行，14684 字节）— 嵌入式 Dashboard 前端
 
 ### 用途
-**decx-agent 的单页 dashboard**，由 `GET /` 返回。GitHub 暗色主题，左侧 project 列表 + 右侧详情面板，支持 SSE 实时 event、发送 directive。
+**peak 的单页 dashboard**，由 `GET /` 返回。GitHub 暗色主题，左侧 project 列表 + 右侧详情面板，支持 SSE 实时 event、发送 directive。
 
 ### 结构
 - **`<head>`**：title + 内联 CSS（CSS 变量定义暗色主题色板：bg/bg-card/border/text/accent/green/red/yellow/purple/blue）

@@ -1,24 +1,25 @@
 /**
- * decx-agent — public entry point.
+ * peak — public entry point.
  */
 
 // Core types
 export type {
-  ProjectId, FactId, IntentId, HintId, LinkId, DirectiveId, RunId, RoleId, ISOTime,
+  ProjectId, FactId, IntentId, HintId, DirectiveId, RunId, RoleId, ISOTime,
   Project, ProjectStatus, Fact, FactStatus, Intent, IntentStatus,
-  ChainState, Hint, HintKind, Link, GraphEvent, Verdict, Progress, ChainRequest,
-  SubIntentSpec, Directive, DirectiveInput, DirectiveKind,
+  Hint, HintKind, GraphEvent, Verdict, Progress,
+  Directive, DirectiveInput, DirectiveKind,
   SubagentRun, SubagentRunInput, RunStatus,
   WorkerName, WorkerKind, WorkerConfig, TaskConfig,
   SubagentProfile, RuntimeSpec, PromptSpec, ContextSpec, GraphView,
   Permission, OutputContract, OutputSpec,
   BuiltinProfiles, ControlConfig,
-  WorkflowConfig, AgentBackendId, ToolKind,
+  SchedulerConfig, MetacogTriggers,
+  AgentBackendId, ToolKind,
 } from "./agent/types.js";
-export { DEFAULT_LIMITS, DEFAULT_METACOG_TRIGGERS, BUILTIN_ROLES, BUILTIN_PERMISSIONS } from "./agent/types.js";
+export { DEFAULT_SCHEDULER, DEFAULT_METACOG_TRIGGERS, BUILTIN_ROLES, BUILTIN_PERMISSIONS } from "./agent/types.js";
 
 // Graph interface and helpers
-export type { Graph, ProjectInput, FactInput, IntentInput, HintInput, LinkInput } from "./graph/graph.js";
+export type { Graph, ProjectInput, FactInput, IntentInput, HintInput } from "./graph/graph.js";
 export { routeHash, now, newProjectId, newRunId } from "./graph/graph.js";
 
 // Graph implementations
@@ -54,7 +55,7 @@ export { parseEnvelope, expectKind, asArray, asString, asOptionalString, asNumbe
 export { PermissionChecker, PermissionDeniedError } from "./agent/permissions.js";
 export {
   validateMainDecision, validateCandidateFact, validateVerdict,
-  validateHints, validateStop, validateChain, CONTRACTS,
+  validateHints, validateStop, CONTRACTS,
 } from "./agent/contracts.js";
 export type {
   MainDecision, MainDecisionIntent, MainDecisionFail, CandidateFact,

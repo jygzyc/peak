@@ -1,13 +1,12 @@
 /**
- * Graph interface shared by all decx-agent storage backends.
+ * Graph interface shared by all peak storage backends.
  *
  * Defines the state protocol for projects, facts, intents, hints, directives,
- * links, events, leases, and progress. SessionLoops and stages depend on this
+ * events, leases, and progress. SessionLoops and stages depend on this
  * interface instead of a specific in-memory or SQLite implementation.
  */
 
 import type {
-  ChainRequest,
   Directive,
   DirectiveId,
   DirectiveInput,
@@ -21,8 +20,6 @@ import type {
   IntentId,
   IntentStatus,
   ISOTime,
-  Link,
-  LinkId,
   Progress,
   Project,
   ProjectId,
@@ -71,13 +68,6 @@ export interface IntentInput {
   priority?: number;
 }
 
-export interface LinkInput {
-  fromFactId: FactId;
-  toFactId: FactId;
-  kind: string;
-  evidence?: string[];
-}
-
 export interface Graph {
   createProject(input: ProjectInput): Project;
   getProject(idOrSession: string): Project | undefined;
@@ -90,6 +80,9 @@ export interface Graph {
   facts(projectId: ProjectId, status?: FactStatus): Fact[];
   pendingCandidates(projectId: ProjectId): Fact[];
   resolveFact(projectId: ProjectId, factId: FactId, verdict: Verdict): void;
+  /** Clear requiredConditions on a deferred pending fact, returning it to the
+   * pendingCandidates queue for re-evaluation. No-op if the fact is not deferred. */
+  clearFactConditions(projectId: ProjectId, factId: FactId): void;
 
   addIntent(projectId: ProjectId, input: IntentInput): Intent;
   getIntent(projectId: ProjectId, intentId: IntentId): Intent | undefined;
@@ -98,8 +91,9 @@ export interface Graph {
   releaseIntent(projectId: ProjectId, intentId: IntentId): void;
   concludeIntent(projectId: ProjectId, intentId: IntentId, factId?: FactId): void;
   failIntent(projectId: ProjectId, intentId: IntentId, reason: string, recordDeadEnd?: boolean, killedBy?: Intent["killedBy"]): void;
-  chainIntent(projectId: ProjectId, intentId: IntentId, chain: ChainRequest): IntentId[];
-  resumeChainedIntent(projectId: ProjectId, intentId: IntentId): void;
+  /** Record a dead-end route by description, independent of intent lifecycle
+   * (e.g. when an evaluator rejects a fact whose intent already concluded). */
+  recordDeadEnd(projectId: ProjectId, description: string, reason: string): void;
   isDeadEnd(projectId: ProjectId, description: string): boolean;
   sweepExpiredLeases(): number;
 
@@ -111,13 +105,10 @@ export interface Graph {
   unconsumedDirectives(projectId: ProjectId): Directive[];
   consumeDirective(projectId: ProjectId, directiveId: DirectiveId): void;
 
-  addLink(projectId: ProjectId, input: LinkInput): Link;
-  links(projectId: ProjectId): Link[];
-
   createSubagentRun(projectId: ProjectId, input: SubagentRunInput): SubagentRun;
   updateSubagentRun(projectId: ProjectId, runId: RunId, patch: Partial<Pick<SubagentRun,
     "status" | "outputSummary" | "errorMessage" | "factId" | "startedAt" | "finishedAt"
-    | "usedDelta" | "inputTokens" | "outputTokens">>): void;
+    | "usedDelta" | "usedConclude" | "inputTokens" | "outputTokens">>): void;
   getSubagentRun(projectId: ProjectId, runId: RunId): SubagentRun | undefined;
   subagentRuns(projectId: ProjectId, filter?: { profileId?: string; status?: RunStatus }): SubagentRun[];
 

@@ -12,7 +12,7 @@ function makeSupervisor(graph: InMemoryGraph, worker: MockWorker, intervalMs = 5
 
 function primeForMetacog(graph: InMemoryGraph, p: ReturnType<typeof createProject>) {
   const f = graph.addFact(p.id, { description: "accepted fact", source: "explorer", confidence: 0.9 });
-  graph.resolveFact(p.id, f.id, { decision: "accept", reason: "ok" });
+  graph.resolveFact(p.id, f.id, { decision: "pass", reason: "ok" });
   return f;
 }
 

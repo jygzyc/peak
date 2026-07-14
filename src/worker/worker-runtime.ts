@@ -1,5 +1,5 @@
 /**
- * WorkerPool — the execution abstraction for decx-agent.
+ * WorkerPool — the execution abstraction for peak.
  *
  * Stages never call subprocesses directly. They call WorkerPool.execute().
  * This indirection makes every Stage a pure function of (input, graph, workerPool),
@@ -17,11 +17,15 @@ export interface WorkerRequest {
   prompt: string;
   config: WorkerConfig;
   workerName?: WorkerName;
+  /** Role of the profile issuing this request (planner/explorer/evaluator/metacog or custom). */
+  role?: string;
   projectId?: ProjectId;
   expectedPayload?: string;
   cwd?: string;
   maxOutputTokens?: number;
   sessionId?: string;
+  /** Marks this invocation as a conclude-phase call (force-summarize, no further work). */
+  conclude?: boolean;
 }
 
 export interface WorkerResult {
@@ -29,6 +33,7 @@ export interface WorkerResult {
   text: string;
   returncode: number;
   stderr?: string;
+  sessionId?: string;
   timedOut?: boolean;
 }
 

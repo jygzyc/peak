@@ -70,6 +70,19 @@ test("safeSessionName: empty/all-special returns 'session'", () => {
   assert.equal(safeSessionName(""), "session");
 });
 
+test("safeSessionName: collapses path-traversal sequences", () => {
+  // A `..` segment must never survive sanitization — it could escape the
+  // session base directory via join(baseDir, sessionId) (docs 09-config.md §9.7).
+  const evil = safeSessionName("../evil");
+  assert.ok(!evil.includes(".."), `sanitized name must not contain "..": got "${evil}"`);
+  // Windows-style traversal must also be neutralized.
+  const winEvil = safeSessionName("..\\evil");
+  assert.ok(!winEvil.includes(".."), `sanitized name must not contain "..": got "${winEvil}"`);
+  // A lone `.` is harmless (relative segment, cannot traverse), but `...`/`....`
+  // collapse so they can't be split into `..`.
+  assert.equal(safeSessionName("..."), ".");
+});
+
 test("utcnow: returns ISO-8601 string", () => {
   const ts = utcnow();
   assert.equal(typeof ts, "string");

@@ -34,7 +34,7 @@ test("http-server: GET / serves dashboard HTML", async () => {
   try {
     const resp = await fetch(`${base}/`);
     const html = await resp.text();
-    assert.ok(html.includes("<title>decx-agent Dashboard</title>"));
+    assert.ok(html.includes("<title>peak Dashboard</title>"));
   } finally { await server.stop(); }
 });
 
@@ -74,14 +74,17 @@ test("sessionLoop: multiple intents resolve to accepted facts", async () => {
   const graph = new InMemoryGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
-  config.workflow.stopGate = { requireNoOpenIntents: true };
   const p = createProject(graph);
-  worker.register(/Planner Role/i, decisions([{ description: "JOB-ALPHA" }, { description: "JOB-BETA" }]));
+  let jobsOpened = false;
+  worker.register(/automated planning module/i, () => {
+    if (!jobsOpened) { jobsOpened = true; return decisions([{ description: "JOB-ALPHA" }, { description: "JOB-BETA" }]); }
+    return env("decisions", { createIntents: [], failIntents: [], consumeHints: [], concludeRun: { description: "done" } });
+  });
   worker.register(/JOB-ALPHA/i, env("fact", { description: "alpha done", confidence: 0.9 }));
   worker.register(/JOB-BETA/i, env("fact", { description: "beta done", confidence: 0.9 }));
-  worker.register(/Evaluator Role|Candidate Fact Under Review/i, env("verdict", { decision: "accept", reason: "ok" }));
+  worker.register(/Evaluator Role|Candidate Fact Under Review/i, env("verdict", { decision: "pass", reason: "ok" }));
   const loop = new SessionLoop(graph, worker, config);
-  await loop.run(p.id, { maxSteps: 20, idlePollMs: 5 });
-  const accepted = graph.facts(p.id, "accepted");
+  await loop.run(p.id, { idlePollMs: 5 });
+  const accepted = graph.facts(p.id, "pass");
   assert.ok(accepted.length >= 2, `expected >= 2 accepted facts, got ${accepted.length}`);
 });

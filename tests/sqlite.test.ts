@@ -9,7 +9,7 @@ import { FederatedGraph } from "../dist/graph/federated-graph.js";
 import type { TaskConfig } from "../dist/agent/types.js";
 
 function tempDir(): string {
-  return mkdtempSync(join(tmpdir(), "decx-sqlite-"));
+  return mkdtempSync(join(tmpdir(), "peak-sqlite-"));
 }
 
 function config(): TaskConfig {
@@ -43,15 +43,15 @@ test("SqliteGraph: createProject + addFact + resolveFact roundtrip", () => {
 
   const f = g.addFact(p.id, { description: "test fact", source: "explorer", confidence: 0.8 });
   assert.equal(f.id, "f001");
-  assert.equal(f.status, "candidate");
+  assert.equal(f.status, "pending");
 
-  g.resolveFact(p.id, f.id, { decision: "accept", reason: "ok" });
-  assert.equal(g.getFact(p.id, f.id)!.status, "accepted");
+  g.resolveFact(p.id, f.id, { decision: "pass", reason: "ok" });
+  assert.equal(g.getFact(p.id, f.id)!.status, "pass");
 
   g.close();
 });
 
-test("SqliteGraph: blocked fact persists and can be promoted", () => {
+test("SqliteGraph: deferred fact persists and can be promoted", () => {
   const dir = tempDir();
   const dbPath = join(dir, "test.db");
   const g = new SqliteGraph(dbPath);
@@ -60,17 +60,18 @@ test("SqliteGraph: blocked fact persists and can be promoted", () => {
     worker: "w", sessionDir: dir, configPath: "/tmp", taskConfig: config(),
   });
   const f = g.addFact(p.id, { description: "conditional", source: "explorer", confidence: 0.8 });
-  g.resolveFact(p.id, f.id, { decision: "block", reason: "needs device state", requiredConditions: ["device unlocked"] });
-  assert.equal(g.getFact(p.id, f.id)!.status, "blocked");
+  g.resolveFact(p.id, f.id, { decision: "pending", reason: "needs device state", requiredConditions: ["device unlocked"] });
+  assert.equal(g.getFact(p.id, f.id)!.status, "pending");
+  assert.notEqual(g.getFact(p.id, f.id)!.status, "blocked");
   assert.deepEqual(g.getFact(p.id, f.id)!.requiredConditions, ["device unlocked"]);
-  assert.equal(g.progress(p.id).blockedFacts, 1);
+  assert.equal(g.progress(p.id).pendingFacts, 1);
   g.close();
 
   const g2 = new SqliteGraph(dbPath);
   const loaded = g2.getProject("s1")!;
-  assert.equal(g2.getFact(loaded.id, f.id)!.status, "blocked");
-  g2.resolveFact(loaded.id, f.id, { decision: "accept", reason: "condition satisfied", confidence: 0.7 });
-  assert.equal(g2.getFact(loaded.id, f.id)!.status, "accepted");
+  assert.equal(g2.getFact(loaded.id, f.id)!.status, "pending");
+  g2.resolveFact(loaded.id, f.id, { decision: "pass", reason: "condition satisfied", confidence: 0.7 });
+  assert.equal(g2.getFact(loaded.id, f.id)!.status, "pass");
   g2.close();
 });
 
@@ -90,7 +91,7 @@ test("SqliteGraph: intent lifecycle (add → claim → conclude)", () => {
 
   const fact = g.addFact(p.id, { description: "result", source: "explorer" });
   g.concludeIntent(p.id, intent.id, fact.id);
-  assert.equal(g.getIntent(p.id, intent.id)!.status, "done");
+  assert.equal(g.getIntent(p.id, intent.id)!.status, "pass");
   g.close();
 });
 
@@ -105,7 +106,7 @@ test("SqliteGraph: failIntent with killedBy", () => {
   g.claimIntent(p.id, intent.id, "w1", 60000);
   g.failIntent(p.id, intent.id, "wrong direction", false, "planner");
   const failed = g.getIntent(p.id, intent.id);
-  assert.equal(failed!.status, "failed");
+  assert.equal(failed!.status, "deny");
   assert.equal(failed!.killedBy, "planner");
   g.close();
 });
@@ -161,8 +162,8 @@ test("SqliteGraph: progress computes correctly", () => {
   g.addFact(p.id, { description: "f2", source: "explorer" });
   const pr = g.progress(p.id);
   assert.equal(pr.totalFacts, 2);
-  assert.equal(pr.candidateFacts, 2);
-  assert.equal(pr.acceptedFacts, 0);
+  assert.equal(pr.pendingFacts, 2);
+  assert.equal(pr.passFacts, 0);
   g.close();
 });
 
@@ -176,11 +177,13 @@ test("SessionManager: open, list, delete", () => {
   const sessions = sm.listSessions();
   assert.ok(sessions.includes("session-a"));
   assert.ok(sessions.includes("session-b"));
+  // Close db handles BEFORE deleting their directories: on Windows rmSync fails
+  // with EPERM while the SQLite file is still open.
+  if (g1 instanceof SqliteGraph) g1.close();
+  if (g2 instanceof SqliteGraph) g2.close();
   sm.delete("session-a");
   assert.ok(!sm.info("session-a").exists);
   assert.ok(sm.info("session-b").exists);
-  if (g1 instanceof SqliteGraph) g1.close();
-  if (g2 instanceof SqliteGraph) g2.close();
 });
 
 test("FederatedGraph: search facts across sessions", () => {
@@ -205,7 +208,7 @@ test("FederatedGraph: search facts across sessions", () => {
   });
   g2.addFact(p2.id, { description: "WebView bypass in app-b", source: "explorer", confidence: 0.8 });
 
-  const allAccepted = fed.searchFactsAcrossSessions(["app-a", "app-b"], { status: "candidate" });
+  const allAccepted = fed.searchFactsAcrossSessions(["app-a", "app-b"], { status: "pending" });
   assert.equal(allAccepted.length, 2);
 
   const webviewOnly = fed.searchFactsAcrossSessions(["app-a", "app-b"], { query: "WebView" });

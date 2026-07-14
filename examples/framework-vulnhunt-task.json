@@ -1,0 +1,76 @@
+{
+  "task": {
+    "target": "<absolute-path-to-framework-source-or-system-image>",
+    "goal": "prove exploitable Binder/system framework attack paths from unprivileged caller to privileged sink",
+    "session": "framework-vulnhunt"
+  },
+  "profiles": {
+    "planner": {
+      "role": "planner",
+      "runtime": { "worker": "opencode" },
+      "prompt": {
+        "file": "agent/prompts/planner.md",
+        "knowledge": [
+          "Android Framework Vulnerability Hunting — planning discipline. Unlike app hunting, the target is framework/system-server surface: Binder services, system providers, PendingIntent dispatch, identity transitions, transitions/animations, and native/HIDL/HAL surfaces. Start by enumerating reachable Binder/system entrypoints (service registration, AIDL, dump/shell commands), then decompose along a composite chain that crosses an identity or trust boundary toward a privileged sink.",
+          "Composite exploit-chain matrix (framework) — pick the smallest chain that matches observed code behavior:\n- Missing Binder guard -> clearCallingIdentity -> privileged sink (permission/app-op/UID/package/user gate absent before clearing identity or calling a protected callee)\n- Caller package/UID/user confusion -> cross-user/profile action (caller-supplied package/UID/user/attribution/profile/account trusted without ownership check)\n- Binder Intent/Bundle/URI -> privileged launch/broadcast/grant (service launches/broadcasts/returns/grants caller-controlled Intent/Uri/flags/selector/component/user)\n- Binder URI -> ContentResolver under system identity (service queries/opens/updates/grants caller URI after identity clear or as system)\n- Protected state -> unfiltered return/callback (package/user/account/notification/settings/task/window state returned to lower-privileged caller)\n- Framework PendingIntent -> mutable/fill-in replay (service creates/stores/sends PendingIntent with caller-controlled target/extras/flags/request/user)\n- Callback/token registration -> async stale authorization (caller registers callback/listener/token; later async work uses stale or attacker-controlled state)\n- Transition/remote animation control -> WCT/surface/task impact (lower-privileged caller controls transition metadata/finish/WCT/SurfaceControl/task mutation)\n- Validation-execution gap -> LaunchAnyWhere (Intent/URI/Bundle validated once but mutable resolution/parceling/provider state changes before actual launch)\n- Parcel mismatch -> different checked and executed object (Parcelable/Bundle serializes to a different semantic object across process/storage/callback boundaries)\n- Native socket/HIDL/HAL surface -> privileged operation (vendor/native service processes external data with weak auth)",
+          "Confidence bands (framework): proven 1.0 (framework source/trace output that can be re-read), inferred 0.5-0.7 (cross-process/identity/async resolved by assumption), speculative 0.2-0.4 (observed shape only). Framework promotion needs chain confidence >= 0.8 (higher than app's 0.7) because privileged-sink claims demand stronger proof. When the evaluator rejects a fact, fail its intent with the reason rather than re-opening near-duplicate work."
+        ],
+        "instructions": "Enumerate reachable Binder/system entrypoints first, then decompose along identity-crossing composite chains. Fail intents whose evidence the evaluator rejects."
+      },
+      "context": { "graphView": "full" },
+      "permissions": ["create_intent", "fail_intent", "spawn_subagent", "cancel_subagent", "write_hint", "conclude_run"],
+      "output": { "contract": "main_decision" },
+      "cooldownSteps": 3
+    },
+    "explorer": {
+      "role": "explorer",
+      "runtime": { "worker": "opencode" },
+      "prompt": {
+        "file": "agent/prompts/explorer.md",
+        "concludeFile": "agent/prompts/explorer-conclude.md",
+        "knowledge": [
+          "Probe-first investigation strategy (framework). Do NOT read source broadly. Probe the Binder/system surface first: service registration and AIDL, exposed methods, dump/shell commands, PendingIntent creation sites, identity-clear calls (clearCallingIdentity/restoreCallingIdentity), provider authorities exposed to system. Then follow the controlled Binder parameter/state through helpers, IPC, identity transitions, provider/launch boundaries, and async callbacks to the sink or blocker, citing the exact call chain.",
+          "Evidence you must cite in every fact: the service/AIDL method or entrypoint exposed; the source location where the caller-controlled Binder parameter/state is read; the call chain across identity/IPC/async boundaries to the sink; the identity at the trust boundary (caller UID/package/user); the authorization result (permission/app-op/UID/user/ownership check — present, bypassed, or absent); the privileged sink; the system-visible impact. If static tracing stops short of proving the identity boundary or the sink, say so explicitly.",
+          "Evidence kinds (framework) — tag each fact's role at the start of the description (e.g. 'service-entrypoint:', 'control+identity+sink:'). A proven finding needs the full seven-kind chain: service-entrypoint (Binder/service method exposed), binder-reachability (unprivileged caller can reach it), control (attacker-controlled Binder parameter/state reaches sink), identity (caller identity at the trust boundary), permission-guard or appop-guard or user-guard (authorization result — pass the one matching the trust boundary), sink (privileged operation), impact (system-visible consequence).",
+          "High-signal single-pattern routing (framework): permission missing (no service-side permission/app-op/UID-package/user gate before privileged work); clear-identity misuse (attacker-controlled branch/URI/launch/provider op inside clean identity before validation); identity confusion (trusted package/user/UID/attribution/account value caller-supplied, not checked with ownership APIs); Intent launch/grant (caller-controlled Intent/selector/component/flags/PendingIntent/user reaches privileged execution); provider proxy (caller URI queried/opened/updated/granted by more privileged service); race/TOCTOU (permission/user/package check before mutable callback/token/state/handler work changes the target); transition control (WindowOrganizer/TransitionPlayer/RemoteTransition/SurfaceControl/WCT affects other tasks/surfaces); validation gap (resolveActivity/MIME/provider result/URI target changes between check and use); Parcel mismatch (checked Bundle/Parcelable differs after unparcel/serialize/framework handoff); input-method surfaces (IME subtype/binding/callback/editor/user-profile — bind every IME action to caller identity before trusting returned text); native surface (reachable socket/HIDL/HAL/debug command parses attacker input)."
+        ],
+        "instructions": "Probe-first: enumerate Binder/system entrypoints and identity boundaries before reading source. Cite concrete evidence (AIDL, source location, caller identity) in every fact."
+      },
+      "context": { "graphView": "focused" },
+      "permissions": ["write_candidate_fact"],
+      "output": { "contract": "candidate_fact" }
+    },
+    "evaluator": {
+      "role": "evaluator",
+      "runtime": { "worker": "opencode" },
+      "prompt": {
+        "file": "agent/prompts/evaluator.md",
+        "knowledge": [
+          "Exploitability gate (framework) — accept a fact as evidence only if it contributes to a chain that can satisfy ALL FOUR conditions: (1) Reachable: an unprivileged caller can trigger the Binder/system path; (2) Controllable: the attacker controls the security-relevant Binder parameter or state; (3) Deeply traced: the value is followed through helpers, IPC, identity transitions, provider/launch/async boundaries to the privileged sink or a blocker; (4) Impactful: the path causes a system-visible security consequence (privilege escalation, cross-user data/action, identity spoofing). A proven finding needs the full seven-kind chain: service-entrypoint -> binder-reachability -> control -> identity -> permission-guard (or appop-guard/user-guard) -> sink -> impact.",
+          "Severity (framework): CRITICAL (remote/low-friction system/root/trusted-domain code execution, persistent device compromise, system_server compromise); HIGH (high-value system data disclosure, cross-user data access, credential/token theft, code execution in a privileged process, meaningful system security-interaction bypass); MEDIUM (real bounded impact requiring local app, interaction, or device/version condition); LOW (fragile/limited UI/social/recon impact); IGNORED (unreachable, non-security, crash-only, debug-only, no visible impact). Raise when chaining is clean, no malicious install is needed, or the effect persists; lower for narrow version/device scope or unstable exploitation.",
+          "Rejection rules (framework) — reject when ANY hold: the caller cannot reach the method; the exact path is guarded before the sink; a lower-level callee enforces the same guard; cleared identity wraps constants only (no attacker-controlled value flows through it); ownership/user checks bind every target; async use revalidates identity/permission at execution time; the operation is public and harmless; evidence is inline-only/speculative with no framework source or AIDL trace; the checked Bundle/Parcelable and the executed object were not compared across the identity/parcel boundary."
+        ],
+        "instructions": "Apply the four-element gate with framework specifics (identity boundary, privilege escalation) and the 0.8 promotion threshold. Reject facts with inline-only evidence."
+      },
+      "context": { "graphView": "evidence-only" },
+      "permissions": ["resolve_fact"],
+      "output": { "contract": "verdict" }
+    },
+    "metacog": {
+      "role": "metacog",
+      "runtime": { "worker": "opencode" },
+      "prompt": {
+        "file": "agent/prompts/metacog.md",
+        "instructions": "Hint when the framework hunt drifts (repeated dead-ends, duplicate routes, ignored rejection verdicts, stalled intents, or missing identity/permission-boundary review). Surface blind spots in Binder/system attack-chain coverage — especially unchecked cross-user paths, validation-execution gaps, and Parcel mismatches."
+      },
+      "context": { "graphView": "summary" },
+      "permissions": ["write_hint"],
+      "output": { "contract": "hints" }
+    }
+  },
+  "workers": {
+    "opencode": { "kind": "agent", "backend": "opencode" }
+  },
+  "scheduler": { "maxConcurrent": 3, "refillPerTick": 1, "workerLeaseMs": 1800000 },
+  "control": { "mainProfile": "planner", "metacogProfile": "metacog" }
+}

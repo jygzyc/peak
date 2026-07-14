@@ -28,9 +28,22 @@ export function positiveInt(value: unknown): number | undefined {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
-/** Sanitize a string for use as a session directory name. */
+/**
+ * Sanitize a string for use as a session directory name.
+ *
+ * Collapses runs of non-[A-Za-z0-9._-] characters to a single `-`, strips
+ * leading/trailing dashes, and collapses `..` sequences so the result cannot
+ * escape its base directory via path traversal (`../evil` → `..-evil`-style
+ * segments are reduced to a single `.`). Returns "session" if empty.
+ */
 export function safeSessionName(value: string): string {
-  return value.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "session";
+  return (
+    value
+      .replace(/[^a-zA-Z0-9._-]+/g, "-")
+      .replace(/\.{2,}/g, ".")
+      .replace(/^-+|-+$/g, "")
+    || "session"
+  );
 }
 
 /** ISO-8601 UTC timestamp for current time. */

@@ -28,6 +28,8 @@ export class AgentDriver implements WorkerDriver {
       prompt: request.prompt,
       config: this.config,
       cwd: request.cwd,
+      sessionId: request.sessionId,
+      conclude: request.conclude,
     });
 
     return {
@@ -35,6 +37,7 @@ export class AgentDriver implements WorkerDriver {
       returncode: result.returncode,
       stdout: result.text,
       stderr: result.stderr ?? "",
+      sessionId: result.sessionId,
     };
   }
 

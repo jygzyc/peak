@@ -29,7 +29,7 @@
 ## 7.2 `registry.ts`（35 行）— Provider 注册表
 
 ### 用途
-**动态从 providers.json + builtin preset 构建 provider 注册表**。首次 import 时加载 `~/.decx/agent/providers.json`（或 `DECX_AGENT_PROVIDERS` env 路径），与 preset 合并，为每项注册一个 `ConfiguredProvider`。外部仍可 `registerProvider` 编程式加自定义 adapter（文件头 1–8 行）。
+**动态从 providers.json + builtin preset 构建 provider 注册表**。首次 import 时加载 `~/.peak/agent/providers.json`（或 `PEAK_AGENT_PROVIDERS` env 路径），与 preset 合并，为每项注册一个 `ConfiguredProvider`。外部仍可 `registerProvider` 编程式加自定义 adapter（文件头 1–8 行）。
 
 ### 关键导出
 - `registerProvider(provider): () => void`（返回 unregister）
@@ -41,7 +41,7 @@
 `let REGISTRY = buildProvidersFromConfig(undefined)`——**import 即读盘**（loadProvidersFile）。
 
 ### 审计要点
-- 🚨 **模块顶层 IO 副作用**（第 13 行）：import 本模块即 `loadProvidersFile()` 读 `~/.decx/agent/providers.json`。测试若不设 `DECX_AGENT_PROVIDERS` 或 mock 文件，会读真实用户配置，污染测试。`reloadProviders(undefined)` 可重建，但初始副作用不可避免。
+- 🚨 **模块顶层 IO 副作用**（第 13 行）：import 本模块即 `loadProvidersFile()` 读 `~/.peak/agent/providers.json`。测试若不设 `PEAK_AGENT_PROVIDERS` 或 mock 文件，会读真实用户配置，污染测试。`reloadProviders(undefined)` 可重建，但初始副作用不可避免。
 - ⚠️ **`REGISTRY` 是模块级 `let`**：`reloadProviders` 整体替换，但 `registerProvider`/`getProvider` 持有的是模块绑定（非快照），reload 后第三方 registerProvider 的项丢失。
 - ⚠️ **`registerProvider` 覆盖不报错**：同 id 直接 set，silent override，无 warning。
 - ⚠️ **`reloadProviders(explicit as Record<string, never> | undefined)`**（第 31 行）：`as` 强转，类型语义可疑——explicit 是 `Record<string, unknown>`，强转 `Record<string, never>` 不安全。
@@ -96,6 +96,6 @@
 
 1. **🚨 anthropic provider 链路断裂**：`provider-presets.ts` 的 anthropic preset 无 `kind`（且 `ProviderPreset` interface 无 kind 字段）→ 复制进 providers.json 后 `kind ?? "openai"` → ConfiguredProvider 走 createOpenAI 调 Anthropic API → 必然失败。需在 preset 或 ProviderPreset 加 `kind`，且 providers-config 的 `initProvidersFile` 复制时要带上。
 2. **🪦 `ModelCallResult.session` 死字段** + `experimental_providerMetadata` cache 分支不可达（system 不被传）。
-3. **⚠️ 模块顶层 IO 副果**：import providers/registry 即读盘 `~/.decx/agent/providers.json`，测试隔离困难。
+3. **⚠️ 模块顶层 IO 副果**：import providers/registry 即读盘 `~/.peak/agent/providers.json`，测试隔离困难。
 4. **⚠️ anthropic/openai 两分支默认值与字段不对称**（maxTokens 4096 兜底、headers 缺失）。
 5. 本册是 provider 层，与 `config/provider-presets.ts`、`config/providers-config.ts` 紧耦合——anthropic bug 的根因跨册（preset 定义在 config，消费在 providers），需联合 [09-config.md](./09-config.md) 修。

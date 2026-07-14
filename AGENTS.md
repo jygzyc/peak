@@ -1,16 +1,16 @@
 # AGENTS.md
 
-Coding guidance for the optional TypeScript `decx-agent` package.
+Coding guidance for the optional TypeScript `peak` package.
 
 ## Package role
 
-- `decx-agent` is a standalone npm package (`@jygzyc/decx-agent`) with its own `decx-agent` binary.
+- `peak` is a standalone npm package (`@jygzyc/peak`) with its own `peak` binary.
 - Treat it as a generic configured agent runtime. Do not add fixed business task subcommands.
 - Keep domain-specific behavior in task config, prompts, rules, and skills rather than hardcoding it in source.
 
 ## Architecture
 
-`decx-agent` implements a profile-driven subagent control plane:
+`peak` implements a profile-driven subagent control plane:
 
 ```text
 GlobalSupervisor / AgentRuntime
@@ -42,7 +42,7 @@ Core principles:
 6. Each active session has its own MainAgent/Planner and Metacog; the global layer only supervises.
 7. Session-internal sync goes through Graph/events; cross-session insight goes through FederationBus (read-only summary + refs, never cross-session graph writes).
 
-Future evolution and rationale live in `../docs/decx-agent-subagent-control-plane-plan.md` (path is relative to the repo root, not this package).
+Per-file audit of `src/` (purpose, exports, dependencies, bugs, dead code per file) lives in `docs/` — start at `docs/README.md` for the cross-cutting findings summary and recommended audit order before touching `src/agent/`, `src/session/`, or `src/config/`.
 
 ## Source layout
 
@@ -62,13 +62,13 @@ src/
 
 ## Config model
 
-`task.json` is profiles-first:
+A `TaskConfig` is profiles-first:
 
 ```text
 task
 profiles
 workers
-workflow
+scheduler   (optional — scheduler resource knobs only; NOT a "workflow")
 control
 ```
 
@@ -76,19 +76,37 @@ Important points:
 
 - `task.target` and `task.goal` are required.
 - `profiles` declares SubagentProfiles. The built-in slots are `planner`, `explorer`, `evaluator`, and optional `metacog`; custom profiles (e.g. `source-finder`, `strict-reviewer`) live under arbitrary keys.
-- A SubagentProfile binds together: `runtime` (worker + optional model), `prompt` (file/text/rules/knowledge), `context` (graphView + maxFacts), `permissions` (capability tokens), `output` (contract name), `maxActive`, `intervalSeconds`.
-- Legacy flat fields (`worker`, `workers`, `prompt`, `promptText`) are still accepted and normalized by ProfileLoader onto the structured spec.
+- A SubagentProfile binds together: `runtime` (worker + optional model), `prompt` (file/text/rules/knowledge), `context` (graphView + maxFacts), `permissions` (capability tokens), `output` (contract name), plus per-agent tuning knobs: `maxActive`, `cooldownSteps` (planner), `triggers` (metacog), `intervalSeconds`.
 - `workers` defines low-level worker configs (`kind: "agent" | "api" | "mock"`).
-- `workflow.limits`, `workflow.metacog`, and `workflow.stopGate` tune scheduling and termination.
+- **There is no `workflow` concept.** Termination is natural (planner produces no new intent). `scheduler` (`maxConcurrent`/`refillPerTick`/`workerLeaseMs`) is the only top-level execution knob and is optional. Legacy `workflow.limits.{maxConcurrent,refillPerTick,workerLeaseMs}` map to `scheduler` for backward compat; `maxSteps`/`stopGate`/`maxStagnation` are ignored.
 - `control.mainProfile`, `control.metacogProfile`, and `control.metacogIntervalSeconds` select which profiles drive planning and metacognition.
+
+## Peak home layout (`~/.peak/`)
+
+All persistent state lives under one root (`PEAK_HOME` env overrides; default `~/.peak`):
+
+```text
+~/.peak/
+├── config.json          global baseline (default workers/control) — optional
+├── agents/<name>.json   reusable role configs injected into builtin slots
+├── tasks/<name>.json    task configs (target/goal/session + agent refs + workers)
+├── sessions/<session>/  per-session execution state (analysis.db)
+└── providers.json       model provider configs
+```
+
+- **Agents are patches, not standalone profiles.** An agent file declares a `slot` (planner/explorer/evaluator/metacog) and is deep-merged over the builtin profile — declared fields override, omitted fields keep the builtin default. This preserves the graph/blackboard architecture (SessionLoop only knows the four builtin slots). See `src/config/agent-loader.ts`.
+- A task's `agents: ["name", ...]` array references `~/.peak/agents/<name>.json`; each agent may also bring its own `workers` (merged under the task's workers).
+- Session name: `--session` > `task.session` > derived from `task.target` > derived from task filename.
+- `~/.peak/config.json` baseline is merged between `defaultConfig()` and the task file.
+- `ensurePeakLayout()` (called by `peak run`) idempotently creates `agents/`, `tasks/`, `sessions/`.
 
 ## Graph model
 
 Graph state is session-local and is the source of truth:
 
 - Projects
-- Facts (`candidate` -> `accepted` / `rejected`)
-- Intents (`open` -> `claimed` / `chained` / `done` / `failed`)
+- Facts (`pending` -> `pass` / `deny`)
+- Intents (`open` -> `claimed` -> `pass` / `deny`)
 - Hints
 - Directives
 - Links
@@ -119,14 +137,28 @@ Worker adapters are bottom-layer execution only. They must not own graph state o
 
 Backends should stay thin: prompt in, text/process result out.
 
+## Editing gotchas
+
+- **Two different `WorkerRequest`/`WorkerResult` types exist.** `worker/worker-runtime.ts` (the agent-facing `WorkerPool` abstraction: `prompt`/`config`/`workerName`/`role`/`projectId`) vs `worker/base.ts` (the driver-internal contract: `worker`/`role`/`sessionDir`/`stdout`). They share names but not shape — `AgentDriverPool` hand-maps fields between them. Check which one a symbol refers to by import path.
+- **`kind` taxonomy is inconsistent across layers.** `WorkerKind = "agent" | "api" | "mock"` in `agent/types.ts`; AGENTS.md prose and `workerCapabilities()` use `command`/`model`/`agent`/`api`. Don't assume one vocabulary.
+- **Windows path handling in scripts:** use `fileURLToPath(new URL("..", import.meta.url))` for the repo root, never `new URL("..", import.meta.url).pathname` (yields a malformed `\\E:\\` drive path on Windows). When deleting SQLite-backed session dirs in tests, `close()` the graph handle before `rmSync` (open files fail with EPERM on Windows).
+- **Session ids are filesystem-derived.** `SessionManager` sanitizes them via `safeSessionName` and rejects paths that escape `baseDir` — never bypass `sessionDir()` by joining `baseDir` with a raw id.
+
 ## Validation
 
-Run from inside `decx-agent/`:
+This repo *is* the package root (there is no nested `peak/` directory). Run all commands from the repo root:
 
 ```bash
-npm run build
-npm test
-npm run smoke
+npm run typecheck   # tsc --noEmit — fast, run before commits
+npm run build       # clean + tsc + copy dashboard.html → dist/
+npm test            # builds first, then node --test tests/*.test.ts
+npm run smoke       # exercises the built CLI; requires dist/cli.js (build first)
+npm run pack        # builds the npm tarball into dist-packages/
 ```
 
-`npm test` builds first. `npm run smoke` assumes `dist/cli.js` exists, so run `npm run build` before smoke if needed.
+Testing conventions:
+
+- Tests import compiled output via `../dist/**.js`, **never** `../src/`. `npm test` builds first for this reason — after editing source you must rebuild before tests see the change.
+- `tests/helper.ts` provides `minimalConfig()`, `createProject()`, `freshSetup()` (InMemoryGraph + MockWorker), and `env(kind, data)` (JSON envelope builder). Reuse these instead of hand-rolling fixtures.
+- The only test reference into `src/` is `tests/helper.ts`'s `PROMPTS_DIR`, which points `PromptLoader` at the real `src/agent/prompts/*.md` (markdown isn't part of the TS build).
+- Focused run: `node --test tests/<name>.test.ts` (after a build).

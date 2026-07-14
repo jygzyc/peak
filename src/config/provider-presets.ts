@@ -2,7 +2,7 @@
  * Built-in provider presets for common Chinese and international LLM APIs.
  *
  * Each preset is a complete provider config that the user copies into their
- * ~/.decx/agent/providers.json and fills in the API key. This mirrors the
+ * ~/.peak/agent/providers.json and fills in the API key. This mirrors the
  * "50+ presets" approach of cc-switch but as simple JSON, no GUI needed.
  *
  * Preset fields:
@@ -11,7 +11,7 @@
  *   baseURL     — OpenAI-compatible API endpoint
  *   apiKeyEnv   — env var holding the API key (user sets this)
  *   model       — default model id
- *   description — short note shown by `decx-agent providers list`
+ *   description — short note shown by `peak providers list`
  */
 
 export interface ProviderPreset {
@@ -21,6 +21,10 @@ export interface ProviderPreset {
   apiKeyEnv: string;
   model: string;
   description: string;
+  /** Optional provider kind: "openai" (default) or "anthropic". */
+  kind?: "openai" | "anthropic";
+  /** Optional extra headers forwarded to the underlying SDK. */
+  headers?: Record<string, string>;
 }
 
 export const PROVIDER_PRESETS: ProviderPreset[] = [
@@ -38,6 +42,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     baseURL: "https://api.anthropic.com/v1",
     apiKeyEnv: "ANTHROPIC_API_KEY",
     model: "claude-4.8-opus",
+    kind: "anthropic",
     description: "Anthropic official API (Claude)",
   },
   {

@@ -1,6 +1,6 @@
 /**
- * User-defined provider configuration loaded from ~/.decx/agent/providers.json
- * (override path via DECX_AGENT_PROVIDERS env).
+ * User-defined provider configuration loaded from ~/.peak/providers.json
+ * (override path via PEAK_AGENT_PROVIDERS env).
  *
  * Schema mirrors the on-disk JSON structure. Each provider entry is keyed by
  * id and holds baseURL, apiKeyEnv, model, plus optional overrides. The id
@@ -12,8 +12,8 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import * as path from "node:path";
-import { homedir } from "node:os";
 import { PROVIDER_PRESETS, type ProviderPreset } from "./provider-presets.js";
+import { providersFile } from "./peak-home.js";
 
 export interface UserProviderConfig {
   /** API base URL (OpenAI-compatible endpoint). */
@@ -32,14 +32,13 @@ export interface UserProviderConfig {
 
 export type ProvidersFile = Record<string, UserProviderConfig>;
 
-const DEFAULT_FILENAME = "providers.json";
 let cachedFile: ProvidersFile | undefined;
 let cachedPath: string | undefined;
 
 export function defaultProvidersPath(): string {
-  const fromEnv = process.env.DECX_AGENT_PROVIDERS;
+  const fromEnv = process.env.PEAK_AGENT_PROVIDERS;
   if (fromEnv) return fromEnv;
-  return path.join(homedir(), ".decx", "agent", DEFAULT_FILENAME);
+  return providersFile();
 }
 
 export function loadProvidersFile(filePath: string = defaultProvidersPath()): ProvidersFile {
@@ -82,6 +81,8 @@ export function initProvidersFile(
       baseURL: preset.baseURL,
       apiKeyEnv: preset.apiKeyEnv,
       model: preset.model,
+      ...(preset.kind ? { kind: preset.kind } : {}),
+      ...(preset.headers ? { headers: preset.headers } : {}),
     };
   }
   saveProvidersFile(seeded, filePath);
@@ -108,8 +109,8 @@ export function findProvider(
 export function listKnownProviders(
   file: ProvidersFile,
   presets: readonly ProviderPreset[] = PROVIDER_PRESETS,
-): Array<{ id: string; name: string; baseURL: string; apiKeyEnv: string; model: string; source: "user" | "preset" }> {
-  const byId = new Map<string, { id: string; name: string; baseURL: string; apiKeyEnv: string; model: string; source: "user" | "preset" }>();
+): Array<{ id: string; name: string; baseURL: string; apiKeyEnv: string; model: string; kind?: "openai" | "anthropic"; source: "user" | "preset" }> {
+  const byId = new Map<string, { id: string; name: string; baseURL: string; apiKeyEnv: string; model: string; kind?: "openai" | "anthropic"; source: "user" | "preset" }>();
   for (const preset of presets) {
     byId.set(preset.id, {
       id: preset.id,
@@ -117,6 +118,7 @@ export function listKnownProviders(
       baseURL: preset.baseURL,
       apiKeyEnv: preset.apiKeyEnv,
       model: preset.model,
+      ...(preset.kind ? { kind: preset.kind } : {}),
       source: "preset",
     });
   }
@@ -127,6 +129,7 @@ export function listKnownProviders(
       baseURL: cfg.baseURL,
       apiKeyEnv: cfg.apiKeyEnv,
       model: cfg.model,
+      ...(cfg.kind ? { kind: cfg.kind } : {}),
       source: "user",
     });
   }
@@ -139,5 +142,7 @@ export function presetToUserConfig(preset: ProviderPreset): UserProviderConfig {
     apiKeyEnv: preset.apiKeyEnv,
     model: preset.model,
     name: preset.name,
+    ...(preset.kind ? { kind: preset.kind } : {}),
+    ...(preset.headers ? { headers: preset.headers } : {}),
   };
 }

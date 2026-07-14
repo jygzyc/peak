@@ -15,17 +15,23 @@
 import { EventEmitter } from "node:events";
 import type { ProjectId } from "../agent/types.js";
 
+export type InsightKind = "fact" | "dead_end" | "pending" | "condition_met";
+
 export interface GlobalInsightRef {
   sessionId: string;
   projectId: ProjectId;
-  factId: string;
+  factId?: string;
 }
 
 export interface GlobalInsight {
   id: string;
+  kind: InsightKind;
   source: GlobalInsightRef;
   summary: string;
   confidence: number;
+  /** For "deferred" insights: the conditions this fact is waiting on. For
+   * "condition_met" insights: the fact ref whose condition was satisfied. */
+  requiredConditions?: string[];
   publishedAt: number;
 }
 
@@ -42,13 +48,21 @@ export class FederationBus {
     this.emitter.setMaxListeners(100);
   }
 
-  publishInsight(source: GlobalInsightRef, summary: string, confidence: number): GlobalInsight {
+  publishInsight(
+    kind: InsightKind,
+    source: GlobalInsightRef,
+    summary: string,
+    confidence: number,
+    requiredConditions?: string[],
+  ): GlobalInsight {
     this.counter += 1;
     const insight: GlobalInsight = {
       id: `gi_${this.counter}`,
+      kind,
       source,
       summary,
       confidence,
+      requiredConditions,
       publishedAt: Date.now(),
     };
     this.insights.push(insight);

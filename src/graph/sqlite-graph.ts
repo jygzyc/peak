@@ -1,21 +1,21 @@
 /**
  * SQLite-backed Graph implementation.
  *
- * Persists projects, facts, intents, hints, directives, links, events, counters,
+ * Persists projects, facts, intents, hints, directives, events, counters,
  * leases, and dead-end records for resumable agent runs. It is the production
  * state store used by CLI/runtime sessions.
  */
 
 import { DatabaseSync } from "node:sqlite";
 import type {
-  ChainRequest, Directive, DirectiveId, DirectiveInput,
+  Directive, DirectiveId, DirectiveInput,
   Fact, FactId, FactStatus, GraphEvent, Hint, HintId,
-  Intent, IntentId, IntentStatus, ISOTime, Link, LinkId,
+  Intent, IntentId, IntentStatus, ISOTime,
   Progress, Project, ProjectId, ProjectStatus, RunId, RunStatus,
   SubagentRun, SubagentRunInput, TaskConfig, Verdict,
 } from "../agent/types.js";
 import {
-  type FactInput, type HintInput, type IntentInput, type LinkInput, type ProjectInput,
+  type FactInput, type HintInput, type IntentInput, type ProjectInput,
   type Graph,
   newProjectId, newRunId, now, routeHash,
 } from "./graph.js";
@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS facts (
   evidence_json TEXT NOT NULL DEFAULT '[]',
   source TEXT NOT NULL,
   confidence REAL NOT NULL DEFAULT 1.0,
-  status TEXT NOT NULL DEFAULT 'candidate',
+  status TEXT NOT NULL DEFAULT 'pending',
   parent_intent_id TEXT,
   reviewer_reason TEXT,
   required_conditions_json TEXT NOT NULL DEFAULT '[]',
@@ -108,17 +108,6 @@ CREATE TABLE IF NOT EXISTS directives (
   PRIMARY KEY (project_id, id)
 );
 
-CREATE TABLE IF NOT EXISTS links (
-  id TEXT NOT NULL,
-  project_id TEXT NOT NULL,
-  from_fact_id TEXT NOT NULL,
-  to_fact_id TEXT NOT NULL,
-  kind TEXT NOT NULL,
-  evidence_json TEXT NOT NULL DEFAULT '[]',
-  created_at TEXT NOT NULL,
-  PRIMARY KEY (project_id, id)
-);
-
 CREATE TABLE IF NOT EXISTS subagent_runs (
   id TEXT NOT NULL,
   project_id TEXT NOT NULL,
@@ -134,6 +123,7 @@ CREATE TABLE IF NOT EXISTS subagent_runs (
   error_message TEXT,
   rotate_of TEXT,
   used_delta INTEGER,
+  used_conclude INTEGER,
   input_tokens INTEGER,
   output_tokens INTEGER,
   created_at TEXT NOT NULL,
@@ -182,6 +172,11 @@ export class SqliteGraph implements Graph {
   private migrate(): void {
     try {
       this.db.exec("ALTER TABLE facts ADD COLUMN required_conditions_json TEXT NOT NULL DEFAULT '[]'");
+    } catch (err) {
+      if (!(err instanceof Error) || !/duplicate column name/i.test(err.message)) throw err;
+    }
+    try {
+      this.db.exec("ALTER TABLE subagent_runs ADD COLUMN used_conclude INTEGER");
     } catch (err) {
       if (!(err instanceof Error) || !/duplicate column name/i.test(err.message)) throw err;
     }
@@ -253,12 +248,12 @@ export class SqliteGraph implements Graph {
       const fact: Fact = {
         id, projectId, description: input.description,
         evidence: input.evidence ?? [], source: input.source,
-        confidence: input.confidence ?? 1.0, status: "candidate",
+        confidence: input.confidence ?? 1.0, status: "pending",
         parentIntentId: input.parentIntentId, stepDiscovered, createdAt: ts,
       };
       this.run(
         `INSERT INTO facts (id, project_id, description, evidence_json, source, confidence, status, parent_intent_id, step_discovered, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'candidate', ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
         id, projectId, fact.description, JSON.stringify(fact.evidence),
         fact.source, fact.confidence, input.parentIntentId ?? null, stepDiscovered, ts,
       );
@@ -280,27 +275,60 @@ export class SqliteGraph implements Graph {
   }
 
   pendingCandidates(projectId: ProjectId): Fact[] {
-    return this.facts(projectId, "candidate");
+    return this.facts(projectId, "pending").filter((f) => !f.requiredConditions?.length);
   }
 
   resolveFact(projectId: ProjectId, factId: FactId, verdict: Verdict): void {
     this.transaction(() => {
       const fact = this.get("SELECT * FROM facts WHERE project_id = ? AND id = ?", projectId, factId);
       if (!fact) throw new Error(`fact not found: ${factId}`);
-      if (fact.status !== "candidate" && fact.status !== "blocked") throw new Error(`fact is not resolvable: ${factId}`);
-      const newStatus = verdict.decision === "reject" ? "rejected" : verdict.decision === "block" ? "blocked" : "accepted";
+      if (fact.status !== "pending") throw new Error(`fact is not resolvable: ${factId}`);
+      let newStatus: string;
+      let requiredConditions: string[];
+      if (verdict.decision === "pass") {
+        newStatus = "pass";
+        requiredConditions = [];
+      } else if (verdict.decision === "deny") {
+        newStatus = "deny";
+        requiredConditions = [];
+        this.recordDeadEnd(projectId, String(fact.description), verdict.reason);
+      } else {
+        // defer: stays pending, parked on requiredConditions
+        newStatus = "pending";
+        requiredConditions = verdict.requiredConditions ?? [];
+      }
       const newConf = verdict.confidence !== undefined
         ? verdict.confidence
-        : verdict.decision === "block"
+        : verdict.decision === "pending"
           ? Math.min(Number(fact.confidence), 0.35)
           : fact.confidence;
       this.run(
         "UPDATE facts SET status = ?, confidence = ?, reviewer_reason = ?, required_conditions_json = ? WHERE project_id = ? AND id = ?",
-        newStatus, newConf, verdict.reason, JSON.stringify(verdict.requiredConditions ?? []), projectId, factId,
+        newStatus, newConf, verdict.reason, JSON.stringify(requiredConditions), projectId, factId,
       );
       this.logEvent(projectId, "fact.resolved", { factId, verdict });
-      if (verdict.decision === "accept" || verdict.decision === "demote") {
+      if (verdict.decision === "pass") {
         this.run("UPDATE meta SET value = '0' WHERE key = ?", `stagnation:${projectId}`);
+      }
+    });
+  }
+
+  recordDeadEnd(projectId: ProjectId, description: string, reason: string): void {
+    this.transaction(() => {
+      const hash = routeHash(description);
+      this.run(
+        "INSERT OR REPLACE INTO dead_ends (project_id, route_hash, intent_id, description, reason, created_at) VALUES (?, ?, '', ?, ?, ?)",
+        projectId, hash, description, reason, now(),
+      );
+    });
+  }
+
+  clearFactConditions(projectId: ProjectId, factId: FactId): void {
+    this.transaction(() => {
+      const row = this.get("SELECT status FROM facts WHERE project_id = ? AND id = ?", projectId, factId);
+      if (row && row.status === "pending") {
+        this.run("UPDATE facts SET required_conditions_json = '[]' WHERE project_id = ? AND id = ?", projectId, factId);
+        this.logEvent(projectId, "fact.conditions_cleared", { factId });
       }
     });
   }
@@ -309,6 +337,21 @@ export class SqliteGraph implements Graph {
 
   addIntent(projectId: ProjectId, input: IntentInput): Intent {
     return this.transaction(() => {
+      // Provenance rule: an Intent is the graph edge parentFactIds →
+      // concludedFactId. Edges may only originate from verified (truth) facts.
+      const parentIds = input.parentFactIds ?? [];
+      if (parentIds.length > 0) {
+        for (const fid of parentIds) {
+          const row = this.get("SELECT status FROM facts WHERE project_id = ? AND id = ?", projectId, fid);
+          const status = row ? String(row.status) : "missing";
+          if (status !== "pass") {
+            throw new Error(
+              `intent parent fact ${fid} is not verified (status=${status}); ` +
+              `intents may only extend from verified facts`,
+            );
+          }
+        }
+      }
       const counter = this.nextId(projectId, "intents", "i");
       const id = `i${String(counter).padStart(3, "0")}`;
       const ts = now();
@@ -377,9 +420,9 @@ export class SqliteGraph implements Graph {
     this.transaction(() => {
       const row = this.get("SELECT status FROM intents WHERE project_id = ? AND id = ?", projectId, intentId);
       if (!row) throw new Error(`intent not found: ${intentId}`);
-      if (row.status === "done" || row.status === "failed") throw new Error(`intent already concluded: ${intentId}`);
+      if (row.status === "pass" || row.status === "deny") throw new Error(`intent already concluded: ${intentId}`);
       const ts = now();
-      this.run("UPDATE intents SET status = 'done', concluded_at = ?, concluded_fact_id = ? WHERE project_id = ? AND id = ?",
+      this.run("UPDATE intents SET status = 'pass', concluded_at = ?, concluded_fact_id = ? WHERE project_id = ? AND id = ?",
         ts, factId ?? null, projectId, intentId);
       this.bumpStep(projectId);
       this.logEvent(projectId, "intent.concluded", { intentId, factId });
@@ -390,10 +433,10 @@ export class SqliteGraph implements Graph {
     this.transaction(() => {
       const row = this.get("SELECT status FROM intents WHERE project_id = ? AND id = ?", projectId, intentId);
       if (!row) throw new Error(`intent not found: ${intentId}`);
-      if (row.status === "failed") throw new Error(`intent already failed: ${intentId}`);
-      const wasDone = row.status === "done";
+      if (row.status === "deny") throw new Error(`intent already failed: ${intentId}`);
+      const wasDone = row.status === "pass";
       const ts = now();
-      this.run("UPDATE intents SET status = 'failed', concluded_at = ?, failure_reason = ?, killed_by = ?, lease_worker_id = NULL WHERE project_id = ? AND id = ?",
+      this.run("UPDATE intents SET status = 'deny', concluded_at = ?, failure_reason = ?, killed_by = ?, lease_worker_id = NULL WHERE project_id = ? AND id = ?",
         ts, reason, killedBy, projectId, intentId);
       if (recordDeadEnd) {
         const descRow = this.get("SELECT description FROM intents WHERE project_id = ? AND id = ?", projectId, intentId);
@@ -407,38 +450,6 @@ export class SqliteGraph implements Graph {
         this.bumpStagnation(projectId);
       }
       this.logEvent(projectId, "intent.failed", { intentId, reason, recordDeadEnd, killedBy, wasDone });
-    });
-  }
-
-  chainIntent(projectId: ProjectId, intentId: IntentId, chain: ChainRequest): IntentId[] {
-    return this.transaction(() => {
-      const row = this.get("SELECT status FROM intents WHERE project_id = ? AND id = ?", projectId, intentId);
-      if (!row) throw new Error(`intent not found: ${intentId}`);
-      if (row.status !== "claimed") throw new Error(`can only chain a claimed intent: ${intentId} (status=${row.status})`);
-      const subIds: IntentId[] = [];
-      for (const spec of chain.subIntents) {
-        const sub = this.addIntent(projectId, {
-          description: spec.description, creator: "workflow",
-          parentIntentId: intentId, priority: spec.priority,
-        });
-        subIds.push(sub.id);
-      }
-      const ts = now();
-      this.run("UPDATE intents SET status = 'chained', chain_json = ? WHERE project_id = ? AND id = ?",
-        JSON.stringify({ reason: chain.reason, subIntentIds: subIds, waitMode: chain.waitMode, createdAt: ts }),
-        projectId, intentId);
-      this.logEvent(projectId, "intent.chained", { intentId, subIntentIds: subIds, reason: chain.reason });
-      return subIds;
-    });
-  }
-
-  resumeChainedIntent(projectId: ProjectId, intentId: IntentId): void {
-    this.transaction(() => {
-      const row = this.get("SELECT status FROM intents WHERE project_id = ? AND id = ?", projectId, intentId);
-      if (!row) throw new Error(`intent not found: ${intentId}`);
-      if (row.status !== "chained") throw new Error(`can only resume a chained intent: ${intentId} (status=${row.status})`);
-      this.run("UPDATE intents SET status = 'open' WHERE project_id = ? AND id = ?", projectId, intentId);
-      this.logEvent(projectId, "intent.resumed", { intentId });
     });
   }
 
@@ -523,28 +534,6 @@ export class SqliteGraph implements Graph {
     });
   }
 
-  // ─── Link ───
-
-  addLink(projectId: ProjectId, input: LinkInput): Link {
-    return this.transaction(() => {
-      const counter = this.nextId(projectId, "links", "l");
-      const id = `l${String(counter).padStart(3, "0")}`;
-      const ts = now();
-      const link: Link = {
-        id, projectId, fromFactId: input.fromFactId, toFactId: input.toFactId,
-        kind: input.kind, evidence: input.evidence ?? [], createdAt: ts,
-      };
-      this.run("INSERT INTO links (id, project_id, from_fact_id, to_fact_id, kind, evidence_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        id, projectId, link.fromFactId, link.toFactId, link.kind, JSON.stringify(link.evidence), ts);
-      this.logEvent(projectId, "link.created", { linkId: id, from: input.fromFactId, to: input.toFactId, kind: input.kind });
-      return link;
-    });
-  }
-
-  links(projectId: ProjectId): Link[] {
-    return this.all("SELECT * FROM links WHERE project_id = ? ORDER BY created_at, id", projectId).map(linkFromRow);
-  }
-
   // ─── SubagentRun ───
 
   createSubagentRun(projectId: ProjectId, input: SubagentRunInput): SubagentRun {
@@ -576,7 +565,7 @@ export class SqliteGraph implements Graph {
     runId: RunId,
     patch: Partial<Pick<SubagentRun,
       "status" | "outputSummary" | "errorMessage" | "factId" | "startedAt" | "finishedAt"
-      | "usedDelta" | "inputTokens" | "outputTokens">>,
+      | "usedDelta" | "usedConclude" | "inputTokens" | "outputTokens">>,
   ): void {
     this.transaction(() => {
       const existing = this.get("SELECT status FROM subagent_runs WHERE project_id = ? AND id = ?", projectId, runId);
@@ -589,6 +578,7 @@ export class SqliteGraph implements Graph {
       if (patch.errorMessage !== undefined) { sets.push("error_message = ?"); params.push(patch.errorMessage); }
       if (patch.factId !== undefined) { sets.push("fact_id = ?"); params.push(patch.factId); }
       if (patch.usedDelta !== undefined) { sets.push("used_delta = ?"); params.push(patch.usedDelta ? 1 : 0); }
+      if (patch.usedConclude !== undefined) { sets.push("used_conclude = ?"); params.push(patch.usedConclude ? 1 : 0); }
       if (patch.inputTokens !== undefined) { sets.push("input_tokens = ?"); params.push(patch.inputTokens); }
       if (patch.outputTokens !== undefined) { sets.push("output_tokens = ?"); params.push(patch.outputTokens); }
 
@@ -649,13 +639,11 @@ export class SqliteGraph implements Graph {
     const stagnationRow = this.get("SELECT value FROM meta WHERE key = ?", `stagnation:${projectId}`);
     return {
       totalFacts: facts.length,
-      acceptedFacts: facts.filter((f) => f.status === "accepted").length,
-      candidateFacts: facts.filter((f) => f.status === "candidate").length,
-      rejectedFacts: facts.filter((f) => f.status === "rejected").length,
-      blockedFacts: facts.filter((f) => f.status === "blocked").length,
+      passFacts: facts.filter((f) => f.status === "pass").length,
+      pendingFacts: facts.filter((f) => f.status === "pending").length,
+      denyFacts: facts.filter((f) => f.status === "deny").length,
       openIntents: intents.filter((i) => i.status === "open").length,
       claimedIntents: intents.filter((i) => i.status === "claimed").length,
-      chainedIntents: intents.filter((i) => i.status === "chained").length,
       stepsExecuted: Number(stepsRow?.value ?? 0),
       lastActivityAt: String(evRow?.timestamp ?? now()),
       stagnationLevel: Number(stagnationRow?.value ?? 0),
@@ -747,15 +735,12 @@ function factFromRow(row: Record<string, unknown>): Fact {
 }
 
 function intentFromRow(row: Record<string, unknown>, sources: string[]): Intent {
-  const chainJson = row.chain_json ? String(row.chain_json) : null;
-  const chain = chainJson ? JSON.parse(chainJson) as Intent["chain"] : undefined;
   return {
     id: String(row.id), projectId: String(row.project_id),
     description: String(row.description), creator: String(row.creator) as Intent["creator"],
     parentFactIds: sources.length > 0 ? sources : (JSON.parse(String(row.parent_fact_ids_json ?? "[]")) as string[]),
     status: String(row.status) as IntentStatus,
     parentIntentId: row.parent_intent_id ? String(row.parent_intent_id) : undefined,
-    chain,
     lease: row.lease_worker_id ? {
       workerId: String(row.lease_worker_id),
       claimedAt: String(row.lease_claimed_at),
@@ -791,16 +776,6 @@ function directiveFromRow(row: Record<string, unknown>): Directive {
   };
 }
 
-function linkFromRow(row: Record<string, unknown>): Link {
-  return {
-    id: String(row.id), projectId: String(row.project_id),
-    fromFactId: String(row.from_fact_id), toFactId: String(row.to_fact_id),
-    kind: String(row.kind),
-    evidence: JSON.parse(String(row.evidence_json ?? "[]")),
-    createdAt: String(row.created_at),
-  };
-}
-
 function eventFromRow(row: Record<string, unknown>): GraphEvent {
   return {
     seq: Number(row.seq), projectId: String(row.project_id),
@@ -826,6 +801,7 @@ function runFromRow(row: Record<string, unknown>): SubagentRun {
     errorMessage: row.error_message ? String(row.error_message) : undefined,
     rotateOf: row.rotate_of ? String(row.rotate_of) : undefined,
     usedDelta: row.used_delta !== undefined && row.used_delta !== null ? Boolean(row.used_delta) : undefined,
+    usedConclude: row.used_conclude !== undefined && row.used_conclude !== null ? Boolean(row.used_conclude) : undefined,
     inputTokens: row.input_tokens !== undefined && row.input_tokens !== null ? Number(row.input_tokens) : undefined,
     outputTokens: row.output_tokens !== undefined && row.output_tokens !== null ? Number(row.output_tokens) : undefined,
     createdAt: String(row.created_at),

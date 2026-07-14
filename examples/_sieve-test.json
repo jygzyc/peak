@@ -1,0 +1,61 @@
+{
+  "task": {
+    "target": "E:/Code/decx/decx-cli/tests/fixtures/sieve.apk",
+    "goal": "find exploitable vulnerabilities in this Android app: exported components, intent handling, WebView, provider leaks, pendingintent",
+    "session": "sieve-audit3"
+  },
+  "profiles": {
+    "planner": {
+      "role": "planner",
+      "runtime": { "worker": "codex" },
+      "prompt": {
+        "file": "agent/prompts/planner.md",
+        "knowledge": [
+          "Android App Vulnerability Hunting. Attack-surface priority: exported components, intent filters/deep links, AIDL, dynamic receivers, WebView bridges, PendingIntent, providers. Exhaust ALL attack-surface paths before concluding."
+        ],
+        "instructions": "Collect attack surface first, decompose into bounded intents, then trace each verified entrypoint to its sink. Exhaust all paths before concluding."
+      },
+      "context": { "graphView": "full" },
+      "permissions": ["create_intent","fail_intent","spawn_subagent","cancel_subagent","write_hint","conclude_run"],
+      "output": { "contract": "main_decision" },
+      "cooldownSteps": 3
+    },
+    "explorer": {
+      "role": "explorer",
+      "runtime": { "worker": "codex" },
+      "prompt": {
+        "file": "agent/prompts/explorer.md",
+        "concludeFile": "agent/prompts/explorer-conclude.md",
+        "knowledge": ["Probe-first: the target is an Android APK. Use shell tools to unzip/decompile and inspect it. Cite concrete evidence in every fact."]
+      },
+      "context": { "graphView": "focused" },
+      "permissions": ["write_candidate_fact"],
+      "output": { "contract": "candidate_fact" }
+    },
+    "evaluator": {
+      "role": "evaluator",
+      "runtime": { "worker": "codex" },
+      "prompt": {
+        "file": "agent/prompts/evaluator.md",
+        "knowledge": ["Evidence gate: accept only if reachable, controllable, deeply traced, and impactful."]
+      },
+      "context": { "graphView": "evidence-only" },
+      "permissions": ["resolve_fact"],
+      "output": { "contract": "verdict" }
+    },
+    "metacog": {
+      "role": "metacog",
+      "runtime": { "worker": "codex" },
+      "prompt": {
+        "file": "agent/prompts/metacog.md",
+        "instructions": "Review the graph each step. Hint when coverage is incomplete, paths are unexplored, or the planner is missing attack-surface directions."
+      },
+      "context": { "graphView": "summary" },
+      "permissions": ["write_hint"],
+      "output": { "contract": "hints" },
+      "triggers": { "everySteps": 3, "everySeconds": 30, "stagnationLevel": 3 }
+    }
+  },
+  "workers": { "codex": { "kind": "agent", "backend": "codex" } },
+  "control": { "mainProfile": "planner", "metacogProfile": "metacog" }
+}

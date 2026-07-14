@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * Command-line interface for decx-agent.
+ * Command-line interface for peak.
  *
  * Parses user commands for running, resuming, inspecting, serving, and managing
  * agent tasks, then delegates runtime construction to agent-runtime.ts. Keep this
@@ -9,26 +9,35 @@
  */
 
 import { Command } from "commander";
-import { writeFileSync } from "node:fs";
+import { writeFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { AgentRuntime } from "./app/agent-runtime.js";
 import { loadConfig } from "./config/task-config.js";
-import { InMemoryGraph } from "./graph/in-memory-graph.js";
 import { SqliteGraph } from "./graph/sqlite-graph.js";
 import { SessionManager } from "./session/session-manager.js";
 import { FederatedGraph } from "./graph/federated-graph.js";
+import { FederationBus } from "./graph/federation-bus.js";
 import { SessionLoop } from "./session/session-loop.js";
 import { HttpServer } from "./server/http-server.js";
 import { AgentDriverPool } from "./worker/agent-driver-pool.js";
 import { MockWorker } from "./worker/mock-worker.js";
 import { workerCapabilities } from "./worker/registry.js";
-import { DEFAULT_LIMITS } from "./agent/types.js";
 import { defaultConfig } from "./config/default-config.js";
+import { ensurePeakLayout, sessionsDir, agentsDir, tasksDir } from "./config/peak-home.js";
+
+/**
+ * Process-level singleton for cross-session federation. When `--federation` is
+ * passed, every AgentRuntime constructed in this process shares this bus so
+ * siblings can cross-validate candidates. A single `peak run` only creates one
+ * runtime, so the flag is inert without multiple sessions; it exists for the
+ * multi-session mode and for SDK callers wiring several runtimes together.
+ */
+let sharedFederationBus: FederationBus | undefined;
 
 const program = new Command();
 
 program
-  .name("decx-agent")
+  .name("peak")
   .description("Generic configured agent runtime")
   .version("0.1.0");
 
@@ -41,16 +50,31 @@ program
   .option("--no-http", "disable HTTP server")
   .option("--no-metacog", "disable metacog loop")
   .option("--mock", "use MockWorker instead of real backends")
-  .option("--max-steps <n>", "max steps override", parseInt)
+  .option("--federation", "share verified facts across sessions (cross-session corroboration)")
   .action(async (configPath: string, opts: {
     session?: string; port: string; host: string;
-    http: boolean; metacog: boolean; mock: boolean; maxSteps?: number;
+    http: boolean; metacog: boolean; mock: boolean; federation: boolean;
   }) => {
-    const { config, session, sessionDir, configPath: absPath } = loadConfig(configPath, opts.session);
-    if (opts.maxSteps) config.workflow.limits.maxSteps = opts.maxSteps;
+    // Ensure the ~/.peak/{agents,tasks,sessions} layout exists before running,
+    // so the session DB has a home and agents/tasks commands work afterward.
+    ensurePeakLayout();
+    const { config, session, configPath: absPath } = loadConfig(configPath, opts.session);
+    // Write the resolved session name back so AgentRuntime opens the right DB.
+    config.task.session = session;
 
-    const baseDir = sessionDir;
-    const workerPool = opts.mock ? new MockWorker() : new AgentDriverPool();
+    // Persist the session DB under ~/.peak/sessions/ so resume/status/sessions
+    // (which default to the same location) can find it. The task file's own
+    // directory is recorded on the project, not used as the store root.
+    const baseDir = sessionsDir();
+    // With --mock, register a default scenario so the loop runs end-to-end
+    // (planner → explorer → evaluator → verified fact) without a real backend.
+    const workerPool = opts.mock ? new MockWorker().registerDefaults() : new AgentDriverPool();
+
+    // Cross-session federation: share verified facts and dead-ends with sibling
+    // sessions. The bus is a process-level singleton so multiple runtimes in one
+    // process cross-validate; a single-session run gains nothing but the flag is
+    // harmless and ready for the multi-session mode.
+    const federationBus = opts.federation ? (sharedFederationBus ??= new FederationBus()) : undefined;
 
     const runtime = new AgentRuntime(config, {
       baseDir,
@@ -59,6 +83,8 @@ program
       workerPool,
       useHttp: opts.http,
       useMetacogSupervisor: opts.metacog,
+      federationBus,
+      sessionId: federationBus ? session : undefined,
     });
 
     const projectId = runtime.createProject({
@@ -66,34 +92,35 @@ program
       configPath: absPath,
     });
 
-    console.log(`[decx-agent] session: ${session}`);
-    console.log(`[decx-agent] project: ${projectId}`);
-    console.log(`[decx-agent] target: ${config.task.target}`);
-    console.log(`[decx-agent] goal: ${config.task.goal}`);
+    console.log(`[peak] session: ${session}`);
+    console.log(`[peak] project: ${projectId}`);
+    console.log(`[peak] target: ${config.task.target}`);
+    console.log(`[peak] goal: ${config.task.goal}`);
 
     if (opts.http) {
       await runtime.startHttp({ host: opts.host, port: parseInt(opts.port) });
-      console.log(`[decx-agent] dashboard: http://${opts.host}:${opts.port}`);
+      console.log(`[peak] dashboard: http://${opts.host}:${opts.port}`);
     }
     if (opts.metacog) {
-      runtime.startMetacog();
-      console.log("[decx-agent] metacog loop started (30s interval)");
+      console.log("[peak] metacog: synchronous (reviews graph each step)");
+    }
+    if (opts.federation) {
+      console.log(`[peak] federation: sharing verified facts as session "${session}"`);
     }
 
-    console.log("[decx-agent] running...");
-    const result = await runtime.run(projectId, { maxSteps: opts.maxSteps ?? config.workflow.limits.maxSteps });
-    console.log(`[decx-agent] finished: ${result.type}`);
+    console.log("[peak] running...");
+    const result = await runtime.run(projectId);
+    console.log(`[peak] finished: ${result.type}`);
 
     if (result.type === "completed") {
       const graph = runtime.graph;
-      const facts = graph.facts(projectId, "accepted");
-      console.log(`[decx-agent] accepted facts: ${facts.length}`);
+      const facts = graph.facts(projectId, "pass");
+      console.log(`[peak] passed facts: ${facts.length}`);
       for (const f of facts) {
         console.log(`  ${f.id}: ${f.description}`);
       }
     }
 
-    if (opts.metacog) runtime.stopMetacog();
     if (!opts.http) runtime.close();
   });
 
@@ -102,8 +129,9 @@ program
   .description("Resume a stopped/paused session")
   .option("-P, --port <port>", "HTTP server port", "25429")
   .option("--no-http", "disable HTTP server")
-  .action(async (session: string, opts: { port: string; http: boolean }) => {
-    const sm = new SessionManager(".decx-analysis");
+  .option("--federation", "share verified facts across sessions (cross-session corroboration)")
+  .action(async (session: string, opts: { port: string; http: boolean; federation: boolean }) => {
+    const sm = new SessionManager(sessionsDir());
     const info = sm.info(session);
     if (!info.exists) {
       console.error(`session not found: ${session}`);
@@ -120,19 +148,26 @@ program
 
     const config = project.taskConfig;
     const pool = new AgentDriverPool();
-    const loop = new SessionLoop(graph, pool, config);
+    const federationBus = opts.federation ? (sharedFederationBus ??= new FederationBus()) : undefined;
+    const loop = new SessionLoop(graph, pool, config, {
+      federationBus,
+      sessionId: federationBus ? session : undefined,
+    });
 
     let server: HttpServer | undefined;
     if (opts.http) {
       const { HttpServer } = await import("./server/http-server.js");
       server = new HttpServer(graph, loop);
       await server.start({ port: parseInt(opts.port) });
-      console.log(`[decx-agent] dashboard: http://127.0.0.1:${opts.port}`);
+      console.log(`[peak] dashboard: http://127.0.0.1:${opts.port}`);
     }
 
-    console.log(`[decx-agent] resuming project: ${project.id}`);
+    console.log(`[peak] resuming project: ${project.id}`);
+    if (opts.federation) {
+      console.log(`[peak] federation: sharing verified facts as session "${session}"`);
+    }
     const result = await loop.run(project.id);
-    console.log(`[decx-agent] finished: ${result.type}`);
+    console.log(`[peak] finished: ${result.type}`);
     await server?.stop();
   });
 
@@ -140,7 +175,7 @@ program
   .command("status <session>")
   .description("Show project status for a session")
   .action((session: string) => {
-    const sm = new SessionManager(".decx-analysis");
+    const sm = new SessionManager(sessionsDir());
     const info = sm.info(session);
     if (!info.exists) {
       console.log(`session not found: ${session}`);
@@ -155,10 +190,9 @@ program
       console.log(`  target: ${p.target}`);
       console.log(`  goal: ${p.goal}`);
       console.log(`  steps: ${progress.stepsExecuted}`);
-      console.log(`  accepted: ${progress.acceptedFacts}`);
-      console.log(`  candidate: ${progress.candidateFacts}`);
-      console.log(`  rejected: ${progress.rejectedFacts}`);
-      console.log(`  blocked: ${progress.blockedFacts}`);
+      console.log(`  passed: ${progress.passFacts}`);
+      console.log(`  pending: ${progress.pendingFacts}`);
+      console.log(`  denied: ${progress.denyFacts}`);
       console.log(`  open intents: ${progress.openIntents}`);
     }
   });
@@ -174,7 +208,7 @@ program
 program
   .command("sessions")
   .description("List all analysis sessions")
-  .option("--base-dir <dir>", "base directory", ".decx-analysis")
+  .option("--base-dir <dir>", "base directory", sessionsDir())
   .action((opts: { baseDir: string }) => {
     const sm = new SessionManager(opts.baseDir);
     const sessions = sm.listSessions();
@@ -191,8 +225,8 @@ program
 program
   .command("search <query>")
   .description("Search facts across all sessions")
-  .option("--base-dir <dir>", "base directory", ".decx-analysis")
-  .option("--status <status>", "filter by fact status (accepted/candidate/rejected/blocked)")
+  .option("--base-dir <dir>", "base directory", sessionsDir())
+    .option("--status <status>", "filter by fact status (pass/pending/deny)")
   .option("--min-confidence <n>", "minimum confidence", parseFloat)
   .option("--limit <n>", "max results", parseInt, 50)
   .action((query: string, opts: {
@@ -207,7 +241,7 @@ program
     }
     const results = fed.searchFactsAcrossSessions(sessions, {
       query,
-      status: opts.status as "accepted" | "candidate" | "rejected" | "blocked" | undefined,
+      status: opts.status as "pass" | "pending" | "deny" | undefined,
       minConfidence: opts.minConfidence,
       limit: opts.limit,
     });
@@ -227,7 +261,48 @@ program
     const configPath = join(dir, "task.json");
     writeFileSync(configPath, JSON.stringify(config, null, 2));
     console.log(`created: ${configPath}`);
-    console.log("edit target/goal/workers, then run: decx-agent run task.json");
+    console.log("edit target/goal/workers, then run: peak run task.json");
+  });
+
+program
+  .command("agents")
+  .description("List reusable agent configs in ~/.peak/agents/")
+  .action(() => {
+    const dir = agentsDir();
+    if (!existsSync(dir)) {
+      console.log("no agents directory; run a task first to initialize ~/.peak/");
+      return;
+    }
+    const names = readdirSync(dir, { withFileTypes: true })
+      .filter((d) => d.isFile() && d.name.endsWith(".json"))
+      .map((d) => d.name.replace(/\.json$/, ""))
+      .sort();
+    if (names.length === 0) {
+      console.log("no agent configs found");
+      return;
+    }
+    for (const n of names) console.log(`  ${n}`);
+    console.log(`\nreference these by name in a task's \`agents\` array`);
+  });
+
+program
+  .command("tasks")
+  .description("List task configs in ~/.peak/tasks/")
+  .action(() => {
+    const dir = tasksDir();
+    if (!existsSync(dir)) {
+      console.log("no tasks directory; run a task first to initialize ~/.peak/");
+      return;
+    }
+    const names = readdirSync(dir, { withFileTypes: true })
+      .filter((d) => d.isFile() && d.name.endsWith(".json"))
+      .map((d) => d.name.replace(/\.json$/, ""))
+      .sort();
+    if (names.length === 0) {
+      console.log("no task configs found");
+      return;
+    }
+    for (const n of names) console.log(`  ${n}`);
   });
 
 program.parse();

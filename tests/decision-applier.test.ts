@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
-import { applyMainDecision } from "../dist/agent/decision-applier.js";
+import { applyMainDecision, nearDuplicateGoal } from "../dist/agent/decision-applier.js";
 import { PermissionChecker } from "../dist/agent/permissions.js";
 import { InMemoryGraph } from "../dist/graph/in-memory-graph.js";
 import { minimalConfig, createProject } from "./helper.ts";
@@ -66,7 +66,7 @@ test("decision-applier: fails intents from failIntents", () => {
     permissions: perms(["fail_intent"]),
   });
   assert.equal(result.intentsFailed, 1);
-  assert.equal(graph.getIntent(p.id, i1.id)!.status, "failed");
+  assert.equal(graph.getIntent(p.id, i1.id)!.status, "deny");
   assert.equal(graph.getIntent(p.id, i1.id)!.killedBy, "planner");
 });
 
@@ -167,6 +167,8 @@ test("decision-applier: parentFactIds and priority passed through to addIntent",
   const graph = new InMemoryGraph();
   const p = createProject(graph);
   const f1 = graph.addFact(p.id, { description: "fact", source: "explorer", confidence: 0.9 });
+  // Intents may only extend from verified facts (Cairn-minimal edge rule).
+  graph.resolveFact(p.id, f1.id, { decision: "pass", reason: "proven", confidence: 0.9 });
   applyMainDecision({
     projectId: p.id, graph, config: minimalConfig(),
     decision: decision({ createIntents: [{ description: "task", parentFactIds: [f1.id], priority: 5 }] }),
@@ -257,4 +259,38 @@ test("decision-applier: successful decision is fully persisted", () => {
 
   assert.equal(graph.intents(p.id).length, 2);
   assert.equal(graph.intents(p.id, "open").length, 2);
+});
+
+test("decision-applier: drops near-duplicate intents already in flight", () => {
+  const graph = new InMemoryGraph();
+  const p = createProject(graph);
+  // Pre-existing open intent — a direction already being explored.
+  graph.addIntent(p.id, { description: "try the login SQL injection", creator: "planner" });
+
+  const result = applyMainDecision({
+    projectId: p.id, graph, config: minimalConfig(),
+    // First is a filler-word rewording of the existing one (should be dropped);
+    // second is genuinely different (should be created).
+    decision: decision({
+      createIntents: [
+        { description: "please attempt SQL injection on the login" },
+        { description: "scan the upload endpoint for vulnerabilities" },
+      ],
+    }),
+    permissions: perms(["create_intent"]),
+  });
+  assert.equal(result.intentsCreated, 1, "near-duplicate should be dropped, only the new one created");
+  const dupEvent = graph.events(p.id).find((e) => e.type === "planner.duplicate_intent_dropped");
+  assert.ok(dupEvent, "a duplicate_intent_dropped event should be logged");
+});
+
+test("nearDuplicateGoal: filler-word rewordings match, distinct labels don't", () => {
+  // filler-word rewording → duplicate
+  assert.ok(nearDuplicateGoal("attempt SQL injection on login", "try login SQL injection"));
+  // short placeholder labels are NOT duplicates
+  assert.ok(!nearDuplicateGoal("TASK-A", "TASK-B"));
+  // blank never matches
+  assert.ok(!nearDuplicateGoal("", "something"));
+  // genuinely different directions don't match
+  assert.ok(!nearDuplicateGoal("scan the web server", "crack the password hash"));
 });

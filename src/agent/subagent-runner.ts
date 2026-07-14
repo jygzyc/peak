@@ -27,7 +27,6 @@ import type { WorkerPool } from "../worker/worker-runtime.js";
 import { parseEnvelope, StageError, type WorkerEnvelope } from "./parse-envelope.js";
 import {
   validateCandidateFact,
-  validateChain,
   validateHints,
   validateMainDecision,
   validateStop,
@@ -48,7 +47,6 @@ export interface SubagentRunRequest {
   workerPool: WorkerPool;
   config: TaskConfig;
   promptExtra: string;
-  enrichedContext?: Fact[];
   hints?: Hint[];
   recentVerdicts?: Array<{ factId: string; verdict: Verdict; intentId?: string }>;
   promptLoader?: PromptLoader;
@@ -62,7 +60,6 @@ export interface SubagentRunRequest {
 export type SubagentOutput =
   | { kind: "decisions"; decision: MainDecision }
   | { kind: "fact"; fact: CandidateFact }
-  | { kind: "chain"; chain: ReturnType<typeof validateChain> }
   | { kind: "verdict"; verdict: Verdict }
   | { kind: "hints"; hints: ReturnType<typeof validateHints> }
   | { kind: "stop"; stop: ReturnType<typeof validateStop> };
@@ -76,6 +73,8 @@ export interface SubagentRunWithTextResult {
   rawText: string;
   prompt: string;
   usedDelta: boolean;
+  /** True when the output came from a conclude-fallback retry (first call failed to parse). */
+  usedConclude?: boolean;
 }
 
 export async function runSubagentWithText(req: SubagentRunRequest): Promise<SubagentRunWithTextResult> {
@@ -116,7 +115,6 @@ export async function runSubagentWithText(req: SubagentRunRequest): Promise<Suba
     } else {
       contextBlock = buildDynamicContext({
         projectId, graph, spec: profile.context,
-        enrichedContext: req.enrichedContext,
         hints: req.hints, recentVerdicts,
         intent: req.intent, candidate: req.candidate,
       });
@@ -124,7 +122,6 @@ export async function runSubagentWithText(req: SubagentRunRequest): Promise<Suba
   } else {
     contextBlock = buildDynamicContext({
       projectId, graph, spec: profile.context,
-      enrichedContext: req.enrichedContext,
       hints: req.hints, recentVerdicts,
       intent: req.intent, candidate: req.candidate,
     });
@@ -136,7 +133,13 @@ export async function runSubagentWithText(req: SubagentRunRequest): Promise<Suba
     prompt,
     config: workerConfig,
     workerName,
+    role: profile.role,
     projectId,
+    // Run the worker in the session directory (an isolated workspace), NOT the
+    // caller's cwd. Without this, coding-agent workers (opencode, claude) scan
+    // the host project directory and treat it as the task context, ignoring the
+    // prompt's actual instructions.
+    cwd: project.sessionDir,
     maxOutputTokens: profile.maxOutputTokens,
     sessionId: useSession && req.sessionManager
       ? req.sessionManager.get(projectId, req.profileId)?.sessionId
@@ -155,14 +158,59 @@ export async function runSubagentWithText(req: SubagentRunRequest): Promise<Suba
     ledger.sync(projectId, req.profileId, graph, recentVerdicts, progress);
   }
 
-  const envelope = parseEnvelope(result.text, profile.role);
-  const output = validateOutput(envelope, profile, req.profileId);
-  return { output, rawText: result.text, prompt, usedDelta };
+  // Conclude fallback: if the worker returned (returncode 0) but its output fails
+  // to parse into a valid envelope, re-invoke the worker in the same session with
+  // a conclude prompt that forces it to summarize already-confirmed findings into
+  // the required JSON shape. Modeled on Cairn's conclude phase. Only triggers for
+  // profiles that declare prompt.concludeFile.
+  try {
+    const envelope = parseEnvelope(result.text, profile.role);
+    const output = validateOutput(envelope, profile, req.profileId);
+    return { output, rawText: result.text, prompt, usedDelta };
+  } catch (parseErr) {
+    const concludeFile = profile.prompt.concludeFile;
+    if (!concludeFile) throw parseErr;
+
+    // Load the conclude preamble and re-invoke the worker in the same session
+    // (when the backend supports resume; sessionId propagates through the pool).
+    const concludeResolved = loader.load({ file: concludeFile });
+    if (!concludeResolved.fromConfig) throw parseErr;
+    const concludePromptExtra = [
+      promptExtra,
+      `## Prior Worker Output (first attempt, failed to parse)\n${result.text.slice(0, 4000)}`,
+    ].filter(Boolean).join("\n\n");
+    const concludePrompt = [concludeResolved.preamble, contextBlock, concludePromptExtra]
+      .filter(Boolean).join("\n\n");
+
+    const concludeResult = await workerPool.execute({
+      prompt: concludePrompt,
+      config: workerConfig,
+      workerName,
+      role: profile.role,
+      projectId,
+      cwd: project.sessionDir,
+      maxOutputTokens: profile.maxOutputTokens,
+      sessionId: result.sessionId,
+      conclude: true,
+    });
+
+    if (concludeResult.returncode !== 0) throw parseErr;
+
+    const concludeEnvelope = parseEnvelope(concludeResult.text, profile.role);
+    const concludeOutput = validateOutput(concludeEnvelope, profile, req.profileId);
+    return {
+      output: concludeOutput,
+      rawText: concludeResult.text,
+      prompt: concludePrompt,
+      usedDelta,
+      usedConclude: true,
+    };
+  }
 }
 
 const CONTRACT_KIND_MAP: Record<string, Set<string>> = {
   main_decision: new Set(["decisions"]),
-  candidate_fact: new Set(["fact", "chain"]),
+  candidate_fact: new Set(["fact"]),
   verdict: new Set(["verdict"]),
   hints: new Set(["hints", "stop"]),
 };
@@ -186,8 +234,6 @@ function validateOutput(
       return { kind: "decisions", decision: validateMainDecision(envelope) };
     case "fact":
       return { kind: "fact", fact: validateCandidateFact(envelope, stage) };
-    case "chain":
-      return { kind: "chain", chain: validateChain(envelope, stage) };
     case "verdict":
       return { kind: "verdict", verdict: validateVerdict(envelope, stage) };
     case "hints":
@@ -244,16 +290,8 @@ export function explorerExtra(
   intentDescription: string,
   parentFactIds: string[],
   insights: Fact[],
-  isResume: boolean,
 ): string {
   const lines: string[] = [];
-  if (isResume) {
-    lines.push("## Resume Context");
-    lines.push(
-      "This is a RESUMED execution. Previously you requested additional context via a chain. " +
-        "The enriched context section above contains the results of those sub-investigations.",
-    );
-  }
   if (insights.length > 0) {
     lines.push("## Recent Discoveries by Other Explorers");
     lines.push("These facts were just discovered by parallel explorers. Use them — avoid duplicating their work.");
@@ -268,11 +306,50 @@ export function explorerExtra(
   return lines.join("\n");
 }
 
-export function evaluatorExtra(candidate: Fact): string {
+/**
+ * A cross-session insight surfaced to the evaluator as read-only corroboration.
+ * Federation facts never enter the local graph — they are shown to the evaluator
+ * so it can cross-validate a local candidate against what siblings have already
+ * verified or ruled out, saving redundant local verification work.
+ */
+export interface SiblingInsight {
+  summary: string;
+  confidence: number;
+  fromSession: string;
+}
+
+export function evaluatorExtra(
+  candidate: Fact,
+  siblingFacts?: SiblingInsight[],
+  siblingDeadEnds?: SiblingInsight[],
+): string {
   const lines: string[] = ["## Candidate Fact Under Review"];
   lines.push(`ID: ${candidate.id}`);
   lines.push(`Description: ${candidate.description}`);
   lines.push(`Confidence claimed: ${candidate.confidence}`);
+
+  if (siblingFacts && siblingFacts.length > 0) {
+    lines.push("## Cross-session Corroboration (VERIFIED by other sessions)");
+    lines.push(
+      "Other sessions have VERIFIED these facts. Use them as supporting evidence — " +
+        "if this candidate is corroborated by any of them, you may accept with higher confidence.",
+    );
+    for (const f of siblingFacts) {
+      lines.push(`- [session ${f.fromSession}, conf ${f.confidence}] ${f.summary}`);
+    }
+  }
+
+  if (siblingDeadEnds && siblingDeadEnds.length > 0) {
+    lines.push("## Cross-session Dead-ends (RULED OUT by other sessions)");
+    lines.push(
+      "Other sessions ruled OUT these paths. If this candidate aligns with a ruled-out " +
+        "direction, reject it unless you have strong independent evidence.",
+    );
+    for (const d of siblingDeadEnds) {
+      lines.push(`- [session ${d.fromSession}] ${d.summary}`);
+    }
+  }
+
   if (candidate.evidence.length > 0) {
     lines.push("Evidence:");
     for (const e of candidate.evidence) lines.push(`- ${e}`);

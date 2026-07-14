@@ -41,14 +41,13 @@ test("GlobalSupervisor: tick steps all registered sessions", async () => {
   const graph = new InMemoryGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
-  config.workflow.stopGate = { requireNoOpenIntents: true };
 
   const p1 = createProject(graph, { session: "sess1" });
   const p2 = createProject(graph, { session: "sess2" });
 
-  worker.register(/Planner Role/i, decisions([{ description: "TASK" }]));
+  worker.register(/automated planning module/i, decisions([{ description: "TASK" }]));
   worker.register(/TASK/i, env("fact", { description: "done", confidence: 0.9 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "accept", reason: "ok" }));
+  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
 
   const loop1 = new SessionLoop(graph, worker, config);
   const loop2 = new SessionLoop(graph, worker, config);
@@ -68,6 +67,7 @@ test("GlobalSupervisor: owns a FederationBus", () => {
   const sup = new GlobalSupervisor();
   assert.ok(sup.federationBus);
   sup.federationBus.publishInsight(
+    "fact",
     { sessionId: "s1", projectId: "p1", factId: "f1" },
     "test", 0.5,
   );

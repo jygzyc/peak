@@ -1,13 +1,13 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
-import { runSubagent, plannerExtra, explorerExtra, evaluatorExtra, metacogExtra } from "../dist/agent/subagent-runner.js";
+import { runSubagent, runSubagentWithText, plannerExtra, explorerExtra, evaluatorExtra, metacogExtra } from "../dist/agent/subagent-runner.js";
 import { MainAgent } from "../dist/agent/main-agent.js";
 import { freshSetup, createProject, env, minimalConfig } from "./helper.ts";
 
 test("planner via MainAgent: empty graph returns createIntents decisions", async () => {
   const { graph, worker, config } = freshSetup();
   const p = createProject(graph);
-  worker.register(/Planner Role/i, env("decisions", {
+  worker.register(/automated planning module/i, env("decisions", {
     createIntents: [{ description: "scan", from: [], priority: 2 }],
     failIntents: [], consumeHints: [], concludeRun: null,
   }));
@@ -37,6 +37,48 @@ test("planner via MainAgent: hint-received returns failIntents", async () => {
   assert.deepEqual(decision.consumeHintIds, [h1.id]);
 });
 
+test("planner via MainAgent: explicit consumeHints overrides the actionable default", async () => {
+  // Planner selectively consumes only h1, ignoring h2 — its choice must be
+  // respected (previously MainAgent overwrote consumeHintIds with ALL hints).
+  const { graph, worker, config } = freshSetup();
+  const p = createProject(graph);
+  const h1 = graph.addHint(p.id, { content: "act on me", creator: "metacog", kind: "direction" });
+  const h2 = graph.addHint(p.id, { content: "ignore me", creator: "metacog", kind: "direction" });
+
+  worker.register(/## Hints Requiring Response/i, env("decisions", {
+    createIntents: [],
+    failIntents: [],
+    consumeHints: [h1.id], // explicitly consume only h1
+    concludeRun: null,
+  }));
+
+  const agent = new MainAgent({ projectId: p.id, graph, config, workerPool: worker });
+  const { decision } = await agent.run({ hints: [h1, h2] });
+  assert.deepEqual(decision.consumeHintIds, [h1.id], "planner's explicit selection must win over the default");
+});
+
+test("planner via MainAgent: absent consumeHints defaults to all actionable hints", async () => {
+  // Backward-compat: when the planner does not declare consumeHints, actionable
+  // hints (stop-explorer / direction) are still consumed so the pipeline's
+  // stop-explorer-kill path keeps working.
+  const { graph, worker, config } = freshSetup();
+  const p = createProject(graph);
+  const hAction = graph.addHint(p.id, { content: "do X", creator: "metacog", kind: "direction" });
+  // A "warning" hint is NOT actionable — it must not be auto-consumed.
+  const hWarn = graph.addHint(p.id, { content: "heads up", creator: "metacog", kind: "warning" });
+
+  worker.register(/## Hints Requiring Response/i, env("decisions", {
+    createIntents: [],
+    failIntents: [],
+    consumeHints: [], // planner did not select any
+    concludeRun: null,
+  }));
+
+  const agent = new MainAgent({ projectId: p.id, graph, config, workerPool: worker });
+  const { decision } = await agent.run({ hints: [hAction, hWarn] });
+  assert.deepEqual(decision.consumeHintIds, [hAction.id], "only actionable hints are consumed by default");
+});
+
 test("planner via MainAgent: verdict-driven can conclude", async () => {
   const { graph, worker, config } = freshSetup();
   const p = createProject(graph);
@@ -47,7 +89,7 @@ test("planner via MainAgent: verdict-driven can conclude", async () => {
 
   const agent = new MainAgent({ projectId: p.id, graph, config, workerPool: worker });
   const { decision } = await agent.run({
-    recentVerdicts: [{ factId: "f001", verdict: { decision: "accept", reason: "ok" } }],
+    recentVerdicts: [{ factId: "f001", verdict: { decision: "pass", reason: "ok" } }],
   });
   assert.ok(decision.concludeRun);
   assert.equal(decision.concludeRun!.description, "goal achieved");
@@ -62,33 +104,41 @@ test("explorer via runSubagent: produces candidate fact", async () => {
   const output = await runSubagent({
     profile: config.profiles.explorer, profileId: "explorer",
     projectId: p.id, graph, workerPool: worker, config,
-    promptExtra: explorerExtra(intent.id, intent.description, intent.parentFactIds, [], false),
+    promptExtra: explorerExtra(intent.id, intent.description, intent.parentFactIds, []),
   });
   assert.equal(output.kind, "fact");
   assert.equal(output.fact.description, "X is 42");
   assert.equal(output.fact.confidence, 0.9);
 });
 
-test("explorer via runSubagent: emits chain when context insufficient", async () => {
+test("explorer via runSubagent: conclude fallback recovers from unparseable first output", async () => {
   const { graph, worker, config } = freshSetup();
   const p = createProject(graph);
-  const intent = graph.addIntent(p.id, { description: "analyze subsystem", creator: "planner" });
-  worker.register(/Explorer Role/i, env("chain", { reason: "need Y", subIntents: [{ description: "Y" }], waitMode: "all" }));
+  const intent = graph.addIntent(p.id, { description: "find Y", creator: "planner" });
 
-  const output = await runSubagent({
+  // First call (execute phase, matched by "Explorer Role"): returns prose without
+  // a valid JSON envelope → parseEnvelope throws → conclude fallback fires.
+  worker.register(/Explorer Role/i, "I looked around but did not find anything useful yet.");
+  // Conclude phase (matched by the conclude prompt's "CONCLUDE" marker, registered
+  // last so it unshifts to highest priority): returns a valid fact envelope.
+  worker.register(/CONCLUDE/i, env("fact", { description: "Y not found, blocked by permissions", evidence: ["access denied"], confidence: 0.2 }));
+
+  const result = await runSubagentWithText({
     profile: config.profiles.explorer, profileId: "explorer",
     projectId: p.id, graph, workerPool: worker, config,
-    promptExtra: explorerExtra(intent.id, intent.description, intent.parentFactIds, [], false),
+    promptExtra: explorerExtra(intent.id, intent.description, intent.parentFactIds, []),
   });
-  assert.equal(output.kind, "chain");
-  assert.equal(output.chain.subIntents.length, 1);
+  assert.equal(result.output.kind, "fact");
+  assert.equal(result.output.fact.description, "Y not found, blocked by permissions");
+  assert.equal(result.usedConclude, true);
+  assert.equal(worker.calls().length, 2, "should have called worker twice (execute + conclude)");
 });
 
 test("evaluator via runSubagent: returns accept verdict", async () => {
   const { graph, worker, config } = freshSetup();
   const p = createProject(graph);
   const candidate = graph.addFact(p.id, { description: "X is 42", evidence: ["measured"], source: "explorer", confidence: 0.9 });
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "accept", reason: "ok" }));
+  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
 
   const output = await runSubagent({
     profile: config.profiles.evaluator, profileId: "evaluator",
@@ -96,35 +146,35 @@ test("evaluator via runSubagent: returns accept verdict", async () => {
     promptExtra: evaluatorExtra(candidate),
   });
   assert.equal(output.kind, "verdict");
-  assert.equal(output.verdict.decision, "accept");
+  assert.equal(output.verdict.decision, "pass");
 });
 
 test("evaluator via runSubagent: returns reject verdict", async () => {
   const { graph, worker, config } = freshSetup();
   const p = createProject(graph);
   const candidate = graph.addFact(p.id, { description: "wrong", source: "explorer" });
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "reject", reason: "bad" }));
+  worker.register(/Evaluator Role/i, env("verdict", { decision: "deny", reason: "bad" }));
 
   const output = await runSubagent({
     profile: config.profiles.evaluator, profileId: "evaluator",
     projectId: p.id, graph, workerPool: worker, config,
     promptExtra: evaluatorExtra(candidate),
   });
-  assert.equal(output.verdict.decision, "reject");
+  assert.equal(output.verdict.decision, "deny");
 });
 
 test("evaluator via runSubagent: demote with adjusted confidence", async () => {
   const { graph, worker, config } = freshSetup();
   const p = createProject(graph);
   const candidate = graph.addFact(p.id, { description: "partial", source: "explorer", confidence: 0.9 });
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "demote", reason: "weak", confidence: 0.3 }));
+  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "weak", confidence: 0.3 }));
 
   const output = await runSubagent({
     profile: config.profiles.evaluator, profileId: "evaluator",
     projectId: p.id, graph, workerPool: worker, config,
     promptExtra: evaluatorExtra(candidate),
   });
-  assert.equal(output.verdict.decision, "demote");
+  assert.equal(output.verdict.decision, "pass");
   assert.equal(output.verdict.confidence, 0.3);
 });
 
@@ -178,7 +228,7 @@ test("plannerExtra: with hints renders hint response block", () => {
 });
 
 test("plannerExtra: with verdicts renders verdict block", () => {
-  const verdicts = [{ factId: "f001", verdict: { decision: "reject" as const, reason: "bad" } }];
+  const verdicts = [{ factId: "f001", verdict: { decision: "deny" as const, reason: "bad" } }];
   const text = plannerExtra(undefined, verdicts);
   assert.match(text, /Recent Evaluator Verdicts/);
   assert.match(text, /reject/);
@@ -190,7 +240,7 @@ test("plannerExtra: empty input returns empty string", () => {
 });
 
 test("explorerExtra: includes intent id and description", () => {
-  const text = explorerExtra("i001", "find bugs", ["f001"], [], false);
+  const text = explorerExtra("i001", "find bugs", ["f001"], []);
   assert.match(text, /i001/);
   assert.match(text, /find bugs/);
   assert.match(text, /f001/);
@@ -200,7 +250,7 @@ test("evaluatorExtra: includes candidate id and evidence", () => {
   const candidate = {
     id: "f005", projectId: "p", description: "finding",
     evidence: ["proof1", "proof2"], source: "explorer",
-    confidence: 0.8, status: "candidate" as const, createdAt: "",
+    confidence: 0.8, status: "pending" as const, createdAt: "",
   };
   const text = evaluatorExtra(candidate);
   assert.match(text, /f005/);
@@ -217,13 +267,13 @@ test("contract enforcement: explorer returning verdict is rejected", async () =>
   const { graph, worker, config } = freshSetup();
   const p = createProject(graph);
   const intent = graph.addIntent(p.id, { description: "task", creator: "planner" });
-  worker.register(/Explorer Role/i, env("verdict", { decision: "accept", reason: "wrong role" }));
+  worker.register(/Explorer Role/i, env("verdict", { decision: "pass", reason: "wrong role" }));
 
   await assert.rejects(
     runSubagent({
       profile: config.profiles.explorer, profileId: "explorer",
       projectId: p.id, graph, workerPool: worker, config,
-      promptExtra: explorerExtra(intent.id, intent.description, [], [], false),
+      promptExtra: explorerExtra(intent.id, intent.description, [], []),
     }),
     /contract="candidate_fact".*kind="verdict"/,
   );

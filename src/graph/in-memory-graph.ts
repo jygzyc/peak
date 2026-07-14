@@ -7,7 +7,6 @@
  */
 
 import type {
-  ChainRequest,
   Directive,
   DirectiveId,
   DirectiveInput,
@@ -21,8 +20,6 @@ import type {
   IntentId,
   IntentStatus,
   ISOTime,
-  Link,
-  LinkId,
   Progress,
   Project,
   ProjectId,
@@ -39,7 +36,6 @@ import {
   type FactInput,
   type HintInput,
   type IntentInput,
-  type LinkInput,
   type ProjectInput,
   type Graph,
   newProjectId,
@@ -54,7 +50,6 @@ interface InMemoryState {
   intents: Map<ProjectId, Map<IntentId, Intent>>;
   hints: Map<ProjectId, Map<HintId, Hint>>;
   directives: Map<ProjectId, Map<DirectiveId, Directive>>;
-  links: Map<ProjectId, Map<LinkId, Link>>;
   events: Map<ProjectId, GraphEvent[]>;
   runs: Map<ProjectId, Map<RunId, SubagentRun>>;
   seqCounters: Map<ProjectId, number>;
@@ -66,7 +61,6 @@ interface InMemoryState {
   intentCounters: Map<ProjectId, number>;
   hintCounters: Map<ProjectId, number>;
   directiveCounters: Map<ProjectId, number>;
-  linkCounters: Map<ProjectId, number>;
 
   snapshots: Map<ProjectId, unknown[]>;
 }
@@ -78,7 +72,6 @@ export class InMemoryGraph implements Graph {
     intents: new Map(),
     hints: new Map(),
     directives: new Map(),
-    links: new Map(),
     events: new Map(),
     runs: new Map(),
     seqCounters: new Map(),
@@ -89,7 +82,6 @@ export class InMemoryGraph implements Graph {
     intentCounters: new Map(),
     hintCounters: new Map(),
     directiveCounters: new Map(),
-    linkCounters: new Map(),
     snapshots: new Map(),
   };
 
@@ -125,7 +117,6 @@ export class InMemoryGraph implements Graph {
       this.state.intents.set(id, new Map());
       this.state.hints.set(id, new Map());
       this.state.directives.set(id, new Map());
-      this.state.links.set(id, new Map());
       this.state.events.set(id, []);
       this.state.runs.set(id, new Map());
       this.state.seqCounters.set(id, 0);
@@ -136,7 +127,6 @@ export class InMemoryGraph implements Graph {
       this.state.intentCounters.set(id, 0);
       this.state.hintCounters.set(id, 0);
       this.state.directiveCounters.set(id, 0);
-      this.state.linkCounters.set(id, 0);
     });
 
     return project;
@@ -181,7 +171,7 @@ export class InMemoryGraph implements Graph {
         evidence: input.evidence ?? [],
         source: input.source,
         confidence: input.confidence ?? 1.0,
-        status: "candidate",
+        status: "pending",
         parentIntentId: input.parentIntentId,
         stepDiscovered: this.state.stepCounters.get(projectId) ?? 0,
         createdAt: now(),
@@ -207,7 +197,9 @@ export class InMemoryGraph implements Graph {
   }
 
   pendingCandidates(projectId: ProjectId): Fact[] {
-    return this.facts(projectId, "candidate");
+    // Pending facts awaiting evaluation, EXCLUDING deferred ones (those with
+    // requiredConditions are parked until a condition is satisfied).
+    return this.facts(projectId, "pending").filter((f) => !f.requiredConditions?.length);
   }
 
   resolveFact(projectId: ProjectId, factId: FactId, verdict: Verdict): void {
@@ -215,21 +207,45 @@ export class InMemoryGraph implements Graph {
       const factsMap = this.requireFacts(projectId);
       const fact = factsMap.get(factId);
       if (!fact) throw new Error(`fact not found: ${factId}`);
-      if (fact.status !== "candidate" && fact.status !== "blocked") {
+      if (fact.status !== "pending") {
         throw new Error(`fact is not resolvable: ${factId} (status=${fact.status})`);
       }
-      fact.status = verdict.decision === "reject" ? "rejected" : verdict.decision === "block" ? "blocked" : "accepted";
+      if (verdict.decision === "pass") {
+        fact.status = "pass";
+        fact.requiredConditions = [];
+      } else if (verdict.decision === "deny") {
+        fact.status = "deny";
+        fact.requiredConditions = [];
+        // Auto-record dead-end: a rejected fact means this direction is
+        // disproven. recordDeadEnd is intent-independent (the intent already
+        // concluded done when the explorer produced the fact).
+        this.recordDeadEnd(projectId, fact.description, verdict.reason);
+      } else {
+        // defer: stays pending, parks on requiredConditions until a condition
+        // is satisfied and the fact is re-evaluated.
+        fact.status = "pending";
+        fact.requiredConditions = verdict.requiredConditions ?? [];
+      }
       if (verdict.confidence !== undefined) {
         fact.confidence = verdict.confidence;
-      } else if (verdict.decision === "block") {
+      } else if (verdict.decision === "pending") {
         fact.confidence = Math.min(fact.confidence, 0.35);
       }
       fact.reviewerReason = verdict.reason;
-      fact.requiredConditions = verdict.requiredConditions ?? [];
       this.logEvent(projectId, "fact.resolved", { factId, verdict });
 
-      if (verdict.decision === "accept" || verdict.decision === "demote") {
+      if (verdict.decision === "pass") {
         this.state.stagnationCounters.set(projectId, 0);
+      }
+    });
+  }
+
+  clearFactConditions(projectId: ProjectId, factId: FactId): void {
+    this.transaction(() => {
+      const fact = this.requireFacts(projectId).get(factId);
+      if (fact && fact.status === "pending" && fact.requiredConditions?.length) {
+        fact.requiredConditions = [];
+        this.logEvent(projectId, "fact.conditions_cleared", { factId });
       }
     });
   }
@@ -239,6 +255,24 @@ export class InMemoryGraph implements Graph {
   addIntent(projectId: ProjectId, input: IntentInput): Intent {
     return this.transaction(() => {
       const intentsMap = this.requireIntents(projectId);
+      // Provenance rule: an Intent is the graph edge parentFactIds →
+      // concludedFactId. Edges may only originate from verified (truth) facts —
+      // building downstream from a candidate/rejected fact would let unproven
+      // work propagate. Empty parentFactIds is allowed (fresh attack-surface
+      // collection from the origin).
+      const parentIds = input.parentFactIds ?? [];
+      if (parentIds.length > 0) {
+        const factsMap = this.requireFacts(projectId);
+        for (const fid of parentIds) {
+          const f = factsMap.get(fid);
+          if (!f || f.status !== "pass") {
+            throw new Error(
+              `intent parent fact ${fid} is not verified (status=${f?.status ?? "missing"}); ` +
+              `intents may only extend from verified facts`,
+            );
+          }
+        }
+      }
       const counter = this.state.intentCounters.get(projectId)! + 1;
       this.state.intentCounters.set(projectId, counter);
       const id = `i${String(counter).padStart(3, "0")}`;
@@ -304,10 +338,10 @@ export class InMemoryGraph implements Graph {
   concludeIntent(projectId: ProjectId, intentId: IntentId, factId?: FactId): void {
     this.transaction(() => {
       const intent = this.requireIntent(projectId, intentId);
-      if (intent.status === "done" || intent.status === "failed") {
+      if (intent.status === "pass" || intent.status === "deny") {
         throw new Error(`intent already concluded: ${intentId}`);
       }
-      intent.status = "done";
+      intent.status = "pass";
       intent.concludedAt = now();
       intent.concludedFactId = factId;
       this.bumpStep(projectId);
@@ -318,11 +352,11 @@ export class InMemoryGraph implements Graph {
   failIntent(projectId: ProjectId, intentId: IntentId, reason: string, recordDeadEnd = true, killedBy: Intent["killedBy"] = undefined): void {
     this.transaction(() => {
       const intent = this.requireIntent(projectId, intentId);
-      if (intent.status === "failed") {
+      if (intent.status === "deny") {
         throw new Error(`intent already failed: ${intentId}`);
       }
-      const wasDone = intent.status === "done";
-      intent.status = "failed";
+      const wasDone = intent.status === "pass";
+      intent.status = "deny";
       intent.concludedAt = now();
       intent.failureReason = reason;
       intent.killedBy = killedBy;
@@ -343,43 +377,12 @@ export class InMemoryGraph implements Graph {
     });
   }
 
-  chainIntent(projectId: ProjectId, intentId: IntentId, chain: ChainRequest): IntentId[] {
-    return this.transaction(() => {
-      const intent = this.requireIntent(projectId, intentId);
-      if (intent.status !== "claimed") {
-        throw new Error(`can only chain a claimed intent: ${intentId} (status=${intent.status})`);
-      }
-      const subIds: IntentId[] = [];
-      for (const spec of chain.subIntents) {
-        const sub = this.addIntent(projectId, {
-          description: spec.description,
-          creator: "workflow",
-          parentIntentId: intentId,
-          parentFactIds: intent.parentFactIds,
-          priority: spec.priority ?? intent.priority,
-        });
-        subIds.push(sub.id);
-      }
-      intent.status = "chained";
-      intent.chain = {
-        reason: chain.reason,
-        subIntentIds: subIds,
-        waitMode: chain.waitMode,
-        createdAt: now(),
-      };
-      this.logEvent(projectId, "intent.chained", { intentId, subIntentIds: subIds, reason: chain.reason });
-      return subIds;
-    });
-  }
-
-  resumeChainedIntent(projectId: ProjectId, intentId: IntentId): void {
+  recordDeadEnd(projectId: ProjectId, description: string, reason: string): void {
     this.transaction(() => {
-      const intent = this.requireIntent(projectId, intentId);
-      if (intent.status !== "chained") {
-        throw new Error(`can only resume a chained intent: ${intentId} (status=${intent.status})`);
-      }
-      intent.status = "open";
-      this.logEvent(projectId, "intent.resumed", { intentId });
+      const deadEndsMap = this.state.deadEnds.get(projectId) ?? new Map();
+      const hash = routeHash(description);
+      deadEndsMap.set(hash, { intentId: "", description, reason });
+      this.state.deadEnds.set(projectId, deadEndsMap);
     });
   }
 
@@ -478,38 +481,6 @@ export class InMemoryGraph implements Graph {
     });
   }
 
-  // ─── Link ───
-
-  addLink(projectId: ProjectId, input: LinkInput): Link {
-    return this.transaction(() => {
-      const linksMap = this.requireLinks(projectId);
-      const counter = this.state.linkCounters.get(projectId)! + 1;
-      this.state.linkCounters.set(projectId, counter);
-      const id = `l${String(counter).padStart(3, "0")}`;
-      const link: Link = {
-        id,
-        projectId,
-        fromFactId: input.fromFactId,
-        toFactId: input.toFactId,
-        kind: input.kind,
-        evidence: input.evidence ?? [],
-        createdAt: now(),
-      };
-      linksMap.set(id, link);
-      this.logEvent(projectId, "link.created", {
-        linkId: id,
-        from: input.fromFactId,
-        to: input.toFactId,
-        kind: input.kind,
-      });
-      return link;
-    });
-  }
-
-  links(projectId: ProjectId): Link[] {
-    return [...(this.state.links.get(projectId)?.values() ?? [])];
-  }
-
   // ─── SubagentRun ───
 
   createSubagentRun(projectId: ProjectId, input: SubagentRunInput): SubagentRun {
@@ -547,7 +518,7 @@ export class InMemoryGraph implements Graph {
     runId: RunId,
     patch: Partial<Pick<SubagentRun,
       "status" | "outputSummary" | "errorMessage" | "factId" | "startedAt" | "finishedAt"
-      | "usedDelta" | "inputTokens" | "outputTokens">>,
+      | "usedDelta" | "usedConclude" | "inputTokens" | "outputTokens">>,
   ): void {
     this.transaction(() => {
       const runsMap = this.state.runs.get(projectId);
@@ -608,13 +579,11 @@ export class InMemoryGraph implements Graph {
 
     return {
       totalFacts: facts.length,
-      acceptedFacts: facts.filter((f) => f.status === "accepted").length,
-      candidateFacts: facts.filter((f) => f.status === "candidate").length,
-      rejectedFacts: facts.filter((f) => f.status === "rejected").length,
-      blockedFacts: facts.filter((f) => f.status === "blocked").length,
+      passFacts: facts.filter((f) => f.status === "pass").length,
+      pendingFacts: facts.filter((f) => f.status === "pending").length,
+      denyFacts: facts.filter((f) => f.status === "deny").length,
       openIntents: intents.filter((i) => i.status === "open").length,
       claimedIntents: intents.filter((i) => i.status === "claimed").length,
-      chainedIntents: intents.filter((i) => i.status === "chained").length,
       stepsExecuted,
       lastActivityAt,
       stagnationLevel: this.state.stagnationCounters.get(projectId) ?? 0,
@@ -699,11 +668,6 @@ export class InMemoryGraph implements Graph {
   private requireDirectives(projectId: ProjectId): Map<DirectiveId, Directive> {
     this.requireProject(projectId);
     return this.ensureMap(this.state.directives, projectId);
-  }
-
-  private requireLinks(projectId: ProjectId): Map<LinkId, Link> {
-    this.requireProject(projectId);
-    return this.ensureMap(this.state.links, projectId);
   }
 
   private ensureMap<K, V>(root: Map<ProjectId, Map<K, V>>, projectId: ProjectId): Map<K, V> {

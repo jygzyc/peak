@@ -37,20 +37,24 @@ export class OpencodeHttpBackend implements AgentBackend {
     }
 
     let sessionId: string;
-    try {
-      const sessionResp = await fetch(`${baseUrl}/session`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ title: `decx-agent-${Date.now()}` }),
-        signal: AbortSignal.timeout(10_000),
-      });
-      if (!sessionResp.ok) {
-        return errorResult(`opencode server returned ${sessionResp.status}: ${await sessionResp.text()}`);
+    if (input.sessionId) {
+      sessionId = input.sessionId;
+    } else {
+      try {
+        const sessionResp = await fetch(`${baseUrl}/session`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ title: `peak-${Date.now()}` }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!sessionResp.ok) {
+          return errorResult(`opencode server returned ${sessionResp.status}: ${await sessionResp.text()}`);
+        }
+        const session = await sessionResp.json() as { id: string };
+        sessionId = session.id;
+      } catch (err) {
+        return errorResult(`failed to connect to opencode server at ${baseUrl}. Is 'opencode serve' running? (${err instanceof Error ? err.message : String(err)})`);
       }
-      const session = await sessionResp.json() as { id: string };
-      sessionId = session.id;
-    } catch (err) {
-      return errorResult(`failed to connect to opencode server at ${baseUrl}. Is 'opencode serve' running? (${err instanceof Error ? err.message : String(err)})`);
     }
 
     try {
@@ -60,7 +64,7 @@ export class OpencodeHttpBackend implements AgentBackend {
         body: JSON.stringify({
           parts: [{ type: "text", text: input.prompt }],
         }),
-        signal: AbortSignal.timeout(input.config.maxTokens ? input.config.maxTokens * 1000 : DEFAULT_TIMEOUT_MS),
+        signal: AbortSignal.timeout(input.config.timeoutMs ?? DEFAULT_TIMEOUT_MS),
       });
 
       if (!messageResp.ok) {
@@ -69,10 +73,23 @@ export class OpencodeHttpBackend implements AgentBackend {
 
       const result = await messageResp.json() as { info?: { role?: string }; parts?: Array<{ type: string; text?: string; content?: unknown }> };
       const text = extractAssistantText(result);
-      return { text, returncode: 0, stderr: "" };
+      return { text, returncode: 0, stderr: "", sessionId };
     } catch (err) {
       return errorResult(`opencode message failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  extractSession(_stdout: string, _stderr: string): string | undefined {
+    // HTTP backend carries sessionId in BackendInvokeResult directly (set above);
+    // this method is a no-op kept for interface symmetry with subprocess backends.
+    return undefined;
+  }
+
+  extractResponseText(stdout: string, _stderr: string): string {
+    // HTTP backend already extracts assistant text inside invoke() (via
+    // extractAssistantText from the JSON response body). The stdout here is
+    // that extracted text, so it's identity.
+    return stdout;
   }
 }
 

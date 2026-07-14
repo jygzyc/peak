@@ -55,27 +55,27 @@ export class ContextLedger {
     deltaThreshold = 0.3,
   ): DeltaResult {
     const entry = this.get(projectId, profileId);
-    const acceptedFacts = graph.facts(projectId, "accepted");
-    const rejectedFacts = graph.facts(projectId, "rejected");
+    const passFacts = graph.facts(projectId, "pass");
+    const denyFacts = graph.facts(projectId, "deny");
     const allIntents = graph.intents(projectId);
 
     if (!entry) {
-      return this.fullResult(acceptedFacts, rejectedFacts, allIntents, recentVerdicts);
+      return this.fullResult(passFacts, denyFacts, allIntents, recentVerdicts);
     }
 
-    const newAccepted = acceptedFacts.filter((f) => !entry.factIds.has(f.id));
-    const newRejected = rejectedFacts.filter((f) => !entry.rejectedFactIds.has(f.id));
+    const newAccepted = passFacts.filter((f) => !entry.factIds.has(f.id));
+    const newRejected = denyFacts.filter((f) => !entry.rejectedFactIds.has(f.id));
     const newIntents = allIntents.filter((i) => !entry.intentIds.has(i.id));
     const newVerdicts = recentVerdicts.filter((v) => {
       const sig = verdictSig(v);
       return !entry.verdictSigs.has(sig);
     });
 
-    const totalItems = acceptedFacts.length + rejectedFacts.length + allIntents.length;
+    const totalItems = passFacts.length + denyFacts.length + allIntents.length;
     const deltaItems = newAccepted.length + newRejected.length + newIntents.length;
 
     if (totalItems > 0 && deltaItems / totalItems > deltaThreshold) {
-      return this.fullResult(acceptedFacts, rejectedFacts, allIntents, recentVerdicts);
+      return this.fullResult(passFacts, denyFacts, allIntents, recentVerdicts);
     }
 
     if (deltaItems === 0 && newVerdicts.length === 0) {
@@ -91,11 +91,11 @@ export class ContextLedger {
 
     const lines: string[] = ["## Delta (since last call)"];
     if (newAccepted.length > 0) {
-      lines.push("### New accepted facts:");
+      lines.push("### New passed facts:");
       for (const f of newAccepted) lines.push(`- ${f.id}: ${f.description}`);
     }
     if (newRejected.length > 0) {
-      lines.push("### Newly rejected (dead-ends):");
+      lines.push("### Newly denied (dead-ends):");
       for (const f of newRejected) lines.push(`- ${f.id}: ${f.description}`);
     }
     if (newIntents.length > 0) {
@@ -124,13 +124,13 @@ export class ContextLedger {
     recentVerdicts: Array<{ factId: string; verdict: Verdict; intentId?: string }>,
     progress: { stepsExecuted: number },
   ): void {
-    const acceptedFacts = graph.facts(projectId, "accepted");
-    const rejectedFacts = graph.facts(projectId, "rejected");
+    const passFacts = graph.facts(projectId, "pass");
+    const denyFacts = graph.facts(projectId, "deny");
     const allIntents = graph.intents(projectId);
 
     const entry: LedgerEntry = {
-      factIds: new Set(acceptedFacts.map((f) => f.id)),
-      rejectedFactIds: new Set(rejectedFacts.map((f) => f.id)),
+      factIds: new Set(passFacts.map((f) => f.id)),
+      rejectedFactIds: new Set(denyFacts.map((f) => f.id)),
       intentIds: new Set(allIntents.map((i) => i.id)),
       verdictSigs: new Set(recentVerdicts.map((v) => verdictSig(v))),
       lastSyncStep: progress.stepsExecuted,
@@ -150,16 +150,16 @@ export class ContextLedger {
   }
 
   private fullResult(
-    acceptedFacts: Fact[],
-    rejectedFacts: Fact[],
+    passFacts: Fact[],
+    denyFacts: Fact[],
     allIntents: Intent[],
     recentVerdicts: Array<{ factId: string; verdict: Verdict; intentId?: string }>,
   ): DeltaResult {
     return {
       isDelta: false,
       deltaBlock: "",
-      newFactIds: acceptedFacts.map((f) => f.id),
-      newRejectedFactIds: rejectedFacts.map((f) => f.id),
+      newFactIds: passFacts.map((f) => f.id),
+      newRejectedFactIds: denyFacts.map((f) => f.id),
       newIntentIds: allIntents.map((i) => i.id),
       newVerdicts: recentVerdicts,
     };

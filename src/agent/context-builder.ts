@@ -21,7 +21,6 @@ export interface BuildContextOptions {
   projectId: ProjectId;
   graph: Graph;
   spec?: ContextSpec;
-  enrichedContext?: Fact[];
   insights?: Fact[];
   hints?: Hint[];
   recentVerdicts?: Array<{ factId: string; verdict: Verdict; intentId?: string }>;
@@ -31,6 +30,7 @@ export interface BuildContextOptions {
 
 export function buildDynamicContext(options: BuildContextOptions): string {
   const { projectId, graph, spec } = options;
+  const project = graph.getProject(projectId);
 
   const viewOptions: GraphViewOptions = {
     view: spec?.graphView ?? "full",
@@ -39,25 +39,24 @@ export function buildDynamicContext(options: BuildContextOptions): string {
     includeProgress: spec?.includeProgress ?? false,
   };
 
-  let acceptedFacts = graph.facts(projectId, "accepted");
+  let passFacts = graph.facts(projectId, "pass");
 
-  if (spec?.relevanceScope === "chain") {
+  if (spec?.relevanceScope === "linked") {
     const rootIds = collectRootFactIds(options);
     if (rootIds.length > 0) {
-      acceptedFacts = filterRelevantFacts(graph, projectId, acceptedFacts, rootIds, 2);
+      passFacts = filterRelevantFacts(graph, projectId, passFacts, rootIds, 2);
     }
   }
 
   const input: GraphViewInput = {
-    acceptedFacts,
-    rejectedFacts: graph.facts(projectId, "rejected"),
-    blockedFacts: graph.facts(projectId, "blocked"),
-    candidateFacts: graph.facts(projectId, "candidate"),
+    passFacts,
+    denyFacts: graph.facts(projectId, "deny"),
+    pendingFacts: graph.facts(projectId, "pending"),
     openIntents: graph.intents(projectId, "open"),
     claimedIntents: graph.intents(projectId, "claimed"),
-    chainedIntents: graph.intents(projectId, "chained"),
+    target: project?.target,
+    goal: project?.goal,
     progress: viewOptions.includeProgress ? graph.progress(projectId) : undefined,
-    enrichedContext: options.enrichedContext,
     recentVerdicts: options.recentVerdicts,
     hints: options.hints?.map((h) => ({
       id: h.id, content: h.content, creator: h.creator,
@@ -79,9 +78,6 @@ function collectRootFactIds(options: BuildContextOptions): string[] {
       for (const id of intent.parentFactIds) ids.add(id);
     }
   }
-  if (options.enrichedContext) {
-    for (const f of options.enrichedContext) ids.add(f.id);
-  }
   return [...ids];
 }
 
@@ -93,16 +89,25 @@ function filterRelevantFacts(
   maxHops: number,
 ): Fact[] {
   const relevant = new Set(rootFactIds);
-  const links = graph.links(projectId);
+  // An Intent IS the graph edge (parentFactIds → concludedFactId). Traverse
+  // concluded intents to find facts connected to the roots — same BFS that Link
+  // used to do, now derived from the Intent edges themselves.
+  const edges = graph.intents(projectId).filter((i) => i.concludedFactId);
 
   for (let hop = 0; hop < maxHops; hop++) {
     const frontier = [...relevant];
-    for (const link of links) {
-      if (frontier.includes(link.fromFactId) && !relevant.has(link.toFactId)) {
-        relevant.add(link.toFactId);
+    for (const intent of edges) {
+      const fromIds = intent.parentFactIds;
+      const toId = intent.concludedFactId!;
+      // forward: from a frontier fact to its conclusion
+      if (fromIds.some((id) => frontier.includes(id)) && !relevant.has(toId)) {
+        relevant.add(toId);
       }
-      if (frontier.includes(link.toFactId) && !relevant.has(link.fromFactId)) {
-        relevant.add(link.fromFactId);
+      // reverse: from a conclusion back to its sources
+      if (frontier.includes(toId)) {
+        for (const id of fromIds) {
+          if (!relevant.has(id)) relevant.add(id);
+        }
       }
     }
   }

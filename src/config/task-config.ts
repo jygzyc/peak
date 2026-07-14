@@ -8,10 +8,18 @@
  */
 
 import { readFileSync, existsSync } from "node:fs";
-import { resolve, dirname } from "node:path";
-import type { TaskConfig, WorkerConfig, WorkerName, SubagentProfile } from "../agent/types.js";
+import { resolve, dirname, basename } from "node:path";
+import type { TaskConfig, WorkerConfig, WorkerName, SubagentProfile, SchedulerConfig } from "../agent/types.js";
+import { DEFAULT_SCHEDULER } from "../agent/types.js";
 import { defaultConfig } from "./default-config.js";
 import { normalizeProfile } from "./profile-loader.js";
+import { injectAgents, type InjectionOptions } from "./agent-loader.js";
+import { configFile } from "./peak-home.js";
+
+export interface LoadConfigOptions extends InjectionOptions {
+  /** Skip merging ~/.peak/config.json baseline (testing). */
+  skipBaseline?: boolean;
+}
 
 export interface LoadedConfig {
   config: TaskConfig;
@@ -20,7 +28,7 @@ export interface LoadedConfig {
   configPath: string;
 }
 
-export function loadConfig(configPath: string, sessionOverride?: string): LoadedConfig {
+export function loadConfig(configPath: string, sessionOverride?: string, opts: LoadConfigOptions = {}): LoadedConfig {
   const absPath = resolve(configPath);
   if (!existsSync(absPath)) {
     throw new Error(`task config not found: ${absPath}`);
@@ -34,12 +42,22 @@ export function loadConfig(configPath: string, sessionOverride?: string): Loaded
     throw new Error(`task config is not valid JSON: ${(err as Error).message}`);
   }
 
-  if (recordValue(parsed, "agents")) {
-    throw new Error("task config uses removed field agents; use profiles instead");
-  }
-
+  // Start from defaultConfig(), then overlay the global ~/.peak/config.json
+  // baseline (if present), then the task file itself.
   const base = defaultConfig();
-  const config = mergeConfig(base, parsed);
+  const baseline = opts.skipBaseline ? undefined : readBaselineConfig();
+  const config = mergeConfig(base, baseline ?? {}, parsed);
+
+  // New: `agents` is an array of names referencing ~/.peak/agents/<name>.json.
+  // Each is a patch injected into its declared builtin slot. (The legacy
+  // rejection of `agents` as a removed field is lifted — it now means injection.)
+  const agentNames = parseAgentRefs(parsed);
+  if (agentNames.length > 0) {
+    const injected = injectAgents(config.profiles, agentNames, opts);
+    config.profiles = injected.profiles;
+    // Agent-provided workers go UNDER the task's own workers (task wins).
+    config.workers = { ...injected.workers, ...config.workers };
+  }
 
   if (!config.task.target) {
     throw new Error("task.target is required in task config");
@@ -48,13 +66,59 @@ export function loadConfig(configPath: string, sessionOverride?: string): Loaded
     throw new Error("task.goal is required in task config");
   }
 
-  const session = sessionOverride ?? config.task.session ?? deriveSessionName(absPath);
+  const session = sessionOverride ?? config.task.session ?? deriveSessionFromTarget(config.task.target) ?? deriveSessionName(absPath);
   const sessionDir = dirname(absPath);
 
   return { config, session, sessionDir, configPath: absPath };
 }
 
-function mergeConfig(base: TaskConfig, override: Record<string, unknown>): TaskConfig {
+/** Read ~/.peak/config.json if it exists; return undefined otherwise. */
+function readBaselineConfig(): Record<string, unknown> | undefined {
+  const path = configFile();
+  if (!existsSync(path)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf-8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // Malformed baseline is ignored — task config still loads.
+  }
+  return undefined;
+}
+
+/** `agents` must be a string array; anything else is ignored (legacy safe). */
+function parseAgentRefs(parsed: Record<string, unknown>): string[] {
+  const v = parsed.agents;
+  if (!Array.isArray(v)) return [];
+  return v.filter((x): x is string => typeof x === "string" && x.length > 0);
+}
+
+/** Derive a session name from the task target (e.g. "app.apk" -> "app"). */
+function deriveSessionFromTarget(target: string): string | undefined {
+  if (!target) return undefined;
+  const base = basename(target.replace(/[\\/]/g, "/"));
+  const stem = base.replace(/\.[^.]+$/, "");
+  const safe = stem.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  return safe || undefined;
+}
+
+/**
+ * Merge config layers: defaultConfig (base) ← ~/.peak/config.json (baseline)
+ * ← task.json (override). Each layer overlays the one below; task fields win
+ * over baseline, baseline over defaults.
+ */
+function mergeConfig(
+  base: TaskConfig,
+  baseline: Record<string, unknown>,
+  override: Record<string, unknown>,
+): TaskConfig {
+  // Effective per-layer worker sources: baseline workers go under task workers.
+  const baselineWorkers = recordValue(baseline, "workers");
+  const mergedWorkers = baselineWorkers
+    ? mergeWorkers(base.workers, baselineWorkers)
+    : base.workers;
+
   const profilesRaw = recordValue(override, "profiles");
   const profiles: Record<string, SubagentProfile> = { ...base.profiles };
 
@@ -74,18 +138,21 @@ function mergeConfig(base: TaskConfig, override: Record<string, unknown>): TaskC
   // from defaults so the structured contract always holds.
   const result: TaskConfig = {
     task: {
-      target: stringValue(override, "task.target") ?? base.task.target,
-      goal: stringValue(override, "task.goal") ?? base.task.goal,
-      session: stringValue(override, "task.session") ?? base.task.session,
-      name: stringValue(override, "task.name") ?? base.task.name,
+      target: stringValue(override, "task.target") ?? stringValue(baseline, "task.target") ?? base.task.target,
+      goal: stringValue(override, "task.goal") ?? stringValue(baseline, "task.goal") ?? base.task.goal,
+      session: stringValue(override, "task.session") ?? stringValue(baseline, "task.session") ?? base.task.session,
+      name: stringValue(override, "task.name") ?? stringValue(baseline, "task.name") ?? base.task.name,
     },
     profiles: {
       ...base.profiles,
       ...profiles,
     } as TaskConfig["profiles"],
-    workers: mergeWorkers(base.workers, recordValue(override, "workers")),
-    workflow: mergeWorkflow(base.workflow, recordValue(override, "workflow")),
-    control: mergeControl(base.control, recordValue(override, "control")),
+    workers: mergeWorkers(mergedWorkers, recordValue(override, "workers")),
+    scheduler: mergeScheduler(base.scheduler, { ...baseline, ...override }),
+    control: mergeControl(
+      mergeControl(base.control, recordValue(baseline, "control")),
+      recordValue(override, "control"),
+    ),
   };
   return result;
 }
@@ -118,35 +185,33 @@ function mergeWorkers(
   return result;
 }
 
-function mergeWorkflow(
-  base: TaskConfig["workflow"],
-  override: Record<string, unknown> | undefined,
-): TaskConfig["workflow"] {
-  if (!override) return base;
-  const limitsRaw = recordValue(override, "limits");
-  const metacogRaw = recordValue(override, "metacog");
-  const stopGateRaw = recordValue(override, "stopGate");
+/**
+ * Merge scheduler config. Accepts the new top-level `scheduler` shape and, for
+ * backward compatibility, the legacy `workflow.limits` fields maxConcurrent /
+ * refillPerTick / workerLeaseMs (the depth/stop/stagnation controls are ignored
+ * — there is no depth limit and termination is natural).
+ */
+function mergeScheduler(
+  base: SchedulerConfig | undefined,
+  override: Record<string, unknown>,
+): SchedulerConfig | undefined {
+  const directRaw = recordValue(override, "scheduler");
+  const legacyLimits = recordValue(recordValue(override, "workflow") ?? {}, "limits");
 
-  return {
-    limits: {
-      maxSteps: limitsRaw ? numberValue(limitsRaw, "maxSteps") ?? base.limits.maxSteps : base.limits.maxSteps,
-      maxConcurrent: limitsRaw ? numberValue(limitsRaw, "maxConcurrent") ?? base.limits.maxConcurrent : base.limits.maxConcurrent,
-      refillPerTick: limitsRaw ? numberValue(limitsRaw, "refillPerTick") ?? base.limits.refillPerTick : base.limits.refillPerTick,
-      maxStagnation: limitsRaw ? numberValue(limitsRaw, "maxStagnation") ?? base.limits.maxStagnation : base.limits.maxStagnation,
-      workerLeaseMs: limitsRaw ? numberValue(limitsRaw, "workerLeaseMs") ?? base.limits.workerLeaseMs : base.limits.workerLeaseMs,
-    },
-    metacog: metacogRaw ? {
-      triggers: {
-        everySteps: numberValue(recordValue(metacogRaw, "triggers") ?? {}, "everySteps") ?? base.metacog?.triggers?.everySteps,
-        everySeconds: numberValue(recordValue(metacogRaw, "triggers") ?? {}, "everySeconds") ?? base.metacog?.triggers?.everySeconds,
-        stagnationLevel: numberValue(recordValue(metacogRaw, "triggers") ?? {}, "stagnationLevel") ?? base.metacog?.triggers?.stagnationLevel,
-      },
-    } : base.metacog,
-    stopGate: stopGateRaw ? {
-      requireNoOpenIntents: typeof stopGateRaw.requireNoOpenIntents === "boolean" ? stopGateRaw.requireNoOpenIntents : base.stopGate?.requireNoOpenIntents,
-      minFactConfidence: numberValue(stopGateRaw, "minFactConfidence") ?? base.stopGate?.minFactConfidence,
-    } : base.stopGate,
-  };
+  const maxConcurrent =
+    (directRaw ? numberValue(directRaw, "maxConcurrent") : undefined) ??
+    (legacyLimits ? numberValue(legacyLimits, "maxConcurrent") : undefined) ??
+    base?.maxConcurrent ?? DEFAULT_SCHEDULER.maxConcurrent;
+  const refillPerTick =
+    (directRaw ? numberValue(directRaw, "refillPerTick") : undefined) ??
+    (legacyLimits ? numberValue(legacyLimits, "refillPerTick") : undefined) ??
+    base?.refillPerTick ?? DEFAULT_SCHEDULER.refillPerTick;
+  const workerLeaseMs =
+    (directRaw ? numberValue(directRaw, "workerLeaseMs") : undefined) ??
+    (legacyLimits ? numberValue(legacyLimits, "workerLeaseMs") : undefined) ??
+    base?.workerLeaseMs ?? DEFAULT_SCHEDULER.workerLeaseMs;
+
+  return { maxConcurrent, refillPerTick, workerLeaseMs };
 }
 
 function mergeControl(

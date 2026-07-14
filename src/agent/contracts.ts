@@ -1,15 +1,15 @@
 /**
  * Output contract validators.
  *
- * Each named contract (main_decision, candidate_fact, verdict, hints, stop,
- * chain) has a dedicated validator that takes a parsed WorkerEnvelope and
+ * Each named contract (main_decision, candidate_fact, verdict, hints, stop)
+ * has a dedicated validator that takes a parsed WorkerEnvelope and
  * returns a typed, validated payload — or throws on shape mismatch.
  *
  * The Stage implementations and the decision applier share these validators,
  * so output enforcement is centralized rather than duplicated per stage.
  */
 
-import type { OutputContract, Verdict, ChainRequest, SubIntentSpec } from "./types.js";
+import type { OutputContract, Verdict } from "./types.js";
 import type { HintInput } from "../graph/graph.js";
 import {
   asArray,
@@ -62,7 +62,14 @@ export function validateMainDecision(envelope: WorkerEnvelope): MainDecision {
     ? { description: concludeRaw.description }
     : undefined;
 
-  return { createIntents, failIntents, consumeHintIds: [], concludeRun };
+  // Honor the planner's own consumeHints selection (string[]). Previously this
+  // was hard-coded to [] and the planner had zero control over hint consumption
+  // (docs 03-agent.md §3.3). An empty/missing array is preserved as [] so the
+  // caller (MainAgent) can apply its "consume all actionable hints" default.
+  const consumeRaw = Array.isArray(data.consumeHints) ? data.consumeHints : [];
+  const consumeHintIds = consumeRaw.filter((v): v is string => typeof v === "string" && v.length > 0);
+
+  return { createIntents, failIntents, consumeHintIds, concludeRun };
 }
 
 // ─── candidate_fact (explorer output) ───
@@ -87,9 +94,9 @@ export function validateCandidateFact(envelope: WorkerEnvelope, stage: string): 
 export function validateVerdict(envelope: WorkerEnvelope, stage: string): Verdict {
   const data = expectKind(envelope, "verdict", stage);
   const decisionRaw = asString(data, "decision", stage);
-  if (decisionRaw !== "accept" && decisionRaw !== "reject" && decisionRaw !== "demote" && decisionRaw !== "block") {
+  if (decisionRaw !== "pass" && decisionRaw !== "deny" && decisionRaw !== "pending") {
     throw new StageError(
-      `verdict decision must be accept|reject|demote|block, got: ${decisionRaw}`,
+      `verdict decision must be accept|reject|defer, got: ${decisionRaw}`,
       stage,
     );
   }
@@ -121,21 +128,6 @@ export function validateStop(envelope: WorkerEnvelope, stage: string): { reason:
   return { reason: asString(data, "reason", stage) };
 }
 
-// ─── chain (explorer chain request) ───
-
-export function validateChain(envelope: WorkerEnvelope, stage: string): ChainRequest {
-  const data = expectKind(envelope, "chain", stage);
-  const reason = asString(data, "reason", stage);
-  const subsRaw = asArray(data, "subIntents", stage) as Array<Record<string, unknown>>;
-  const subIntents: SubIntentSpec[] = subsRaw.map((raw) => ({
-    description: asString(raw, "description", stage),
-    role: asOptionalString(raw, "role"),
-    priority: typeof raw.priority === "number" ? raw.priority : undefined,
-  }));
-  const waitMode = (data.waitMode === "any" ? "any" : "all") as "all" | "any";
-  return { reason, subIntents, waitMode };
-}
-
 // ─── contract registry ───
 
 export const CONTRACTS: Record<OutputContract, (envelope: WorkerEnvelope, stage: string) => unknown> = {
@@ -144,5 +136,4 @@ export const CONTRACTS: Record<OutputContract, (envelope: WorkerEnvelope, stage:
   verdict: (e, s) => validateVerdict(e, s),
   hints: (e, s) => validateHints(e, s, "system"),
   stop: (e, s) => validateStop(e, s),
-  chain: (e, s) => validateChain(e, s),
 };

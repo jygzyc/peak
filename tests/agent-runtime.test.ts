@@ -5,8 +5,8 @@ import { MockWorker } from "../dist/worker/mock-worker.js";
 import { InMemoryGraph } from "../dist/graph/in-memory-graph.js";
 import { minimalConfig, env } from "./helper.ts";
 
-function decisions(createIntents: unknown[] = []) {
-  return env("decisions", { createIntents, failIntents: [], consumeHints: [], concludeRun: null });
+function decisions(createIntents: unknown[] = [], concludeRun: unknown = null) {
+  return env("decisions", { createIntents, failIntents: [], consumeHints: [], concludeRun });
 }
 
 function makeRuntime(opts: { workerPool?: MockWorker } = {}) {
@@ -31,9 +31,9 @@ test("agent-runtime: step drives a single project step", async () => {
   const worker = new MockWorker();
   const { runtime } = makeRuntime({ workerPool: worker });
 
-  worker.register(/Planner Role/i, decisions([{ description: "TASK" }]));
+  worker.register(/automated planning module/i, decisions([{ description: "TASK" }]));
   worker.register(/TASK/i, env("fact", { description: "done", confidence: 0.9 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "accept", reason: "ok" }));
+  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
 
   const pid = runtime.createProject({ session: "s1" });
   const result = await runtime.step(pid);
@@ -43,25 +43,31 @@ test("agent-runtime: step drives a single project step", async () => {
 test("agent-runtime: run drives to completion", async () => {
   const worker = new MockWorker();
   const { runtime, config } = makeRuntime({ workerPool: worker });
-  config.workflow.stopGate = { requireNoOpenIntents: true };
 
-  worker.register(/Planner Role/i, decisions([{ description: "TASK" }]));
+  let round = 0;
+  worker.register(/automated planning module/i, () => {
+    round++;
+    return round === 1 ? decisions([{ description: "TASK" }]) : decisions([], { description: "goal met" });
+  });
   worker.register(/TASK/i, env("fact", { description: "done", confidence: 0.9 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "accept", reason: "ok" }));
+  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
 
   const pid = runtime.createProject({ session: "s1" });
-  const result = await runtime.run(pid, { maxSteps: 20, idlePollMs: 5 });
+  const result = await runtime.run(pid, { idlePollMs: 5 });
   assert.equal(result.type, "completed");
 });
 
 test("agent-runtime: tick steps all active projects", async () => {
   const worker = new MockWorker();
   const { runtime, config } = makeRuntime({ workerPool: worker });
-  config.workflow.stopGate = { requireNoOpenIntents: true };
 
-  worker.register(/Planner Role/i, decisions([{ description: "TASK" }]));
+  let round = 0;
+  worker.register(/automated planning module/i, () => {
+    round++;
+    return round <= 2 ? decisions([{ description: "TASK" }]) : decisions([], { description: "goal met" });
+  });
   worker.register(/TASK/i, env("fact", { description: "done", confidence: 0.9 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "accept", reason: "ok" }));
+  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
 
   runtime.createProject({ session: "s1" });
   runtime.createProject({ session: "s2" });

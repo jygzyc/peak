@@ -32,7 +32,7 @@ test("failIntent records killedBy", () => {
   g.claimIntent(p.id, intent.id, "w1", 1000);
   g.failIntent(p.id, intent.id, "wrong direction", false, "planner");
   const failed = g.getIntent(p.id, intent.id);
-  assert.equal(failed!.status, "failed");
+  assert.equal(failed!.status, "deny");
   assert.equal(failed!.killedBy, "planner");
 });
 
@@ -91,69 +91,84 @@ test("progress stagnation resets on fact accept", () => {
   g.failIntent(p.id, intent.id, "failed", false);
   assert.equal(g.progress(p.id).stagnationLevel, 1);
   const fact = g.addFact(p.id, { description: "good", source: "explorer" });
-  g.resolveFact(p.id, fact.id, { decision: "accept", reason: "ok" });
+  g.resolveFact(p.id, fact.id, { decision: "pass", reason: "ok" });
   assert.equal(g.progress(p.id).stagnationLevel, 0);
 });
 
-test("blocked fact stays in graph, is low weight, and can be promoted later", () => {
+test("deferred fact stays pending in graph, is low weight, and can be promoted later", () => {
   const g = new InMemoryGraph();
   const p = createProject(g);
   const f = g.addFact(p.id, { description: "reachable only after login", source: "explorer", confidence: 0.9 });
 
   g.resolveFact(p.id, f.id, {
-    decision: "block",
+    decision: "pending",
     reason: "missing auth precondition",
     requiredConditions: ["valid login session"],
   });
 
   const blocked = g.getFact(p.id, f.id)!;
-  assert.equal(blocked.status, "blocked");
+  assert.equal(blocked.status, "pending");
+  assert.notEqual(blocked.status, "blocked");
   assert.equal(blocked.confidence, 0.35);
   assert.deepEqual(blocked.requiredConditions, ["valid login session"]);
-  assert.equal(g.progress(p.id).blockedFacts, 1);
+  assert.equal(g.progress(p.id).pendingFacts, 1);
 
-  g.resolveFact(p.id, f.id, { decision: "accept", reason: "precondition satisfied by another session", confidence: 0.75 });
+  g.resolveFact(p.id, f.id, { decision: "pass", reason: "precondition satisfied by another session", confidence: 0.75 });
   const accepted = g.getFact(p.id, f.id)!;
-  assert.equal(accepted.status, "accepted");
+  assert.equal(accepted.status, "pass");
   assert.equal(accepted.confidence, 0.75);
 });
 
-
-test("addLink creates a link between two facts", () => {
+test("resolveFact reject auto-records dead-end", () => {
   const g = new InMemoryGraph();
   const p = createProject(g);
-  const f1 = g.addFact(p.id, { description: "source fact", source: "explorer" });
-  const f2 = g.addFact(p.id, { description: "derived fact", source: "explorer" });
-  const link = g.addLink(p.id, { fromFactId: f1.id, toFactId: f2.id, kind: "supports" });
-  assert.ok(link.id);
-  assert.equal(link.fromFactId, f1.id);
-  assert.equal(link.toFactId, f2.id);
-  assert.equal(link.kind, "supports");
+  const f = g.addFact(p.id, { description: "SQL injection via login form", source: "explorer", confidence: 0.9 });
+
+  g.resolveFact(p.id, f.id, { decision: "deny", reason: "not exploitable: parameterized query" });
+
+  assert.equal(g.getFact(p.id, f.id)!.status, "deny");
+  // The rejected fact's description should be auto-recorded as a dead-end route.
+  assert.ok(g.isDeadEnd(p.id, "SQL injection via login form"), "reject should auto-record dead-end");
 });
 
-test("links() returns all links for a project", () => {
+test("clearFactConditions reactivates a deferred pending fact", () => {
   const g = new InMemoryGraph();
   const p = createProject(g);
-  const f1 = g.addFact(p.id, { description: "a", source: "explorer" });
-  const f2 = g.addFact(p.id, { description: "b", source: "explorer" });
-  const f3 = g.addFact(p.id, { description: "c", source: "explorer" });
-  g.addLink(p.id, { fromFactId: f1.id, toFactId: f2.id, kind: "supports" });
-  g.addLink(p.id, { fromFactId: f2.id, toFactId: f3.id, kind: "contradicts", evidence: ["x"] });
-  const links = g.links(p.id);
-  assert.equal(links.length, 2);
-  assert.deepEqual(links[0]!.evidence, []);
-  assert.deepEqual(links[1]!.evidence, ["x"]);
+  const f = g.addFact(p.id, { description: "admin panel accessible", source: "explorer", confidence: 0.9 });
+  g.resolveFact(p.id, f.id, { decision: "pending", reason: "needs auth", requiredConditions: ["admin token"] });
+
+  // Before: deferred (pending + conditions), excluded from pendingCandidates
+  assert.equal(g.pendingCandidates(p.id).length, 0);
+
+  g.clearFactConditions(p.id, f.id);
+  // After: conditions cleared, back in pendingCandidates for re-evaluation
+  assert.equal(g.getFact(p.id, f.id)!.requiredConditions?.length, 0);
+  assert.equal(g.pendingCandidates(p.id).length, 1);
 });
 
-test("links() isolated per project", () => {
+
+test("addIntent rejects parentFactIds that are not verified (Cairn-minimal edge rule)", () => {
   const g = new InMemoryGraph();
-  const p1 = createProject(g, { session: "s-link-1" });
-  const p2 = createProject(g, { session: "s-link-2" });
-  const f1 = g.addFact(p1.id, { description: "a", source: "explorer" });
-  const f2 = g.addFact(p1.id, { description: "b", source: "explorer" });
-  g.addLink(p1.id, { fromFactId: f1.id, toFactId: f2.id, kind: "supports" });
-  assert.equal(g.links(p1.id).length, 1);
-  assert.equal(g.links(p2.id).length, 0);
+  const p = createProject(g);
+  // A pending (candidate) fact — not verified yet.
+  const f1 = g.addFact(p.id, { description: "candidate fact", source: "explorer" });
+  assert.equal(f1.status, "pending");
+  assert.throws(
+    () => g.addIntent(p.id, { description: "downstream", creator: "planner", parentFactIds: [f1.id] }),
+    /not verified/,
+  );
+  // Empty parentFactIds is always allowed (fresh attack-surface collection).
+  assert.doesNotThrow(() => g.addIntent(p.id, { description: "fresh", creator: "planner" }));
+});
+
+test("addIntent accepts parentFactIds that are verified", () => {
+  const g = new InMemoryGraph();
+  const p = createProject(g);
+  const f1 = g.addFact(p.id, { description: "verified fact", source: "explorer" });
+  g.resolveFact(p.id, f1.id, { decision: "pass", reason: "proven", confidence: 0.9 });
+  assert.equal(g.facts(p.id, "pass").length, 1);
+  const intent = g.addIntent(p.id, { description: "downstream", creator: "planner", parentFactIds: [f1.id] });
+  assert.deepEqual(intent.parentFactIds, [f1.id]);
 });
 
 test("claimIntent on non-open intent throws", () => {
@@ -194,9 +209,9 @@ test("resolveFact on already-resolved fact throws", () => {
   const g = new InMemoryGraph();
   const p = createProject(g);
   const f = g.addFact(p.id, { description: "x", source: "explorer" });
-  g.resolveFact(p.id, f.id, { decision: "accept", reason: "ok" });
+  g.resolveFact(p.id, f.id, { decision: "pass", reason: "ok" });
   assert.throws(
-    () => g.resolveFact(p.id, f.id, { decision: "reject", reason: "changed mind" }),
+    () => g.resolveFact(p.id, f.id, { decision: "deny", reason: "changed mind" }),
     /is not resolvable/,
   );
 });

@@ -26,6 +26,7 @@ export class AgentDriverPool implements WorkerPool {
       args: config.args,
       model: config.model,
       baseUrl: config.baseUrl,
+      apiKey: config.apiKey,
       apiKeyEnv: config.apiKeyEnv,
       password: config.password,
       provider: config.provider,
@@ -38,12 +39,14 @@ export class AgentDriverPool implements WorkerPool {
     if (request.projectId) this.markRunning(request.projectId, workerName);
     const result = await Promise.resolve(executeWorker({
       worker: workerName,
-      role: "explorer",
+      role: request.role ?? "explorer",
       projectId: request.projectId ?? "project",
       sessionDir: request.cwd ?? process.cwd(),
       prompt: request.prompt,
       config: backendConfig,
       cwd: request.cwd,
+      sessionId: request.sessionId,
+      conclude: request.conclude,
     })).finally(() => {
       if (request.projectId) this.unmarkRunning(request.projectId, workerName);
     });
@@ -53,6 +56,7 @@ export class AgentDriverPool implements WorkerPool {
       text: result.stdout,
       returncode: result.returncode,
       stderr: result.stderr,
+      sessionId: result.sessionId,
     };
   }
 

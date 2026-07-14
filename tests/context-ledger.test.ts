@@ -6,7 +6,7 @@ import { createProject } from "./helper.ts";
 
 function acceptFact(graph: ReturnType<typeof createProject> extends never ? never : import("../dist/graph/graph.js").Graph, projectId: string, description: string) {
   const f = graph.addFact(projectId, { description, source: "explorer", confidence: 0.9 });
-  graph.resolveFact(projectId, f.id, { decision: "accept", reason: "ok" });
+  graph.resolveFact(projectId, f.id, { decision: "pass", reason: "ok" });
   return f;
 }
 
@@ -39,7 +39,7 @@ test("ContextLedger: new fact produces compact delta", () => {
   acceptFact(graph, p.id, "new fact");
   const delta = ledger.computeDelta(p.id, "planner", graph, []);
   assert.equal(delta.isDelta, true);
-  assert.match(delta.deltaBlock, /New accepted facts/);
+  assert.match(delta.deltaBlock, /New passed facts/);
   assert.match(delta.deltaBlock, /new fact/);
   assert.equal(delta.newFactIds.length, 1);
 });
@@ -63,14 +63,14 @@ test("ContextLedger: sync records all fact/intent/verdict ids", () => {
   const p = createProject(graph);
   const f1 = acceptFact(graph, p.id, "fact");
   const i1 = graph.addIntent(p.id, { description: "intent", creator: "planner" });
-  const verdicts = [{ factId: f1.id, verdict: { decision: "accept" as const, reason: "ok" } }];
+  const verdicts = [{ factId: f1.id, verdict: { decision: "pass" as const, reason: "ok" } }];
   const ledger = new ContextLedger();
   ledger.sync(p.id, "planner", graph, verdicts, { stepsExecuted: 1 });
   const entry = ledger.get(p.id, "planner");
   assert.ok(entry);
   assert.ok(entry!.factIds.has(f1.id));
   assert.ok(entry!.intentIds.has(i1.id));
-  assert.ok(entry!.verdictSigs.has(`${f1.id}:accept`));
+  assert.ok(entry!.verdictSigs.has(`${f1.id}:pass`));
 });
 
 test("ContextLedger: reset clears entry so next call is full", () => {
@@ -90,11 +90,11 @@ test("ContextLedger: new verdicts appear in delta", () => {
   const f1 = graph.addFact(p.id, { description: "fact", source: "explorer", confidence: 0.9 });
   const ledger = new ContextLedger();
   ledger.sync(p.id, "planner", graph, [], { stepsExecuted: 1 });
-  const verdicts = [{ factId: f1.id, verdict: { decision: "accept" as const, reason: "good" } }];
+  const verdicts = [{ factId: f1.id, verdict: { decision: "pass" as const, reason: "good" } }];
   const delta = ledger.computeDelta(p.id, "planner", graph, verdicts);
   assert.equal(delta.isDelta, true);
   assert.match(delta.deltaBlock, /New verdicts/);
-  assert.match(delta.deltaBlock, /accept/);
+  assert.match(delta.deltaBlock, /pass/);
 });
 
 test("ContextLedger: delta produces shorter block than full context", () => {

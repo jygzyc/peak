@@ -1,5 +1,5 @@
 /**
- * Session registry for decx-agent graph stores.
+ * Session registry for peak graph stores.
  *
  * Maps task sessions to filesystem locations, creates/open SQLite graph files,
  * and lists/deletes saved sessions. Runtime state remains per-session; this
@@ -7,9 +7,11 @@
  */
 
 import { mkdirSync, existsSync, readdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, relative } from "node:path";
 import { SqliteGraph } from "../graph/sqlite-graph.js";
 import type { Graph } from "../graph/graph.js";
+import { safeSessionName } from "../config/utils.js";
+import { sessionsDir } from "../config/peak-home.js";
 
 export interface SessionInfo {
   sessionId: string;
@@ -19,10 +21,21 @@ export interface SessionInfo {
 }
 
 export class SessionManager {
-  constructor(private readonly baseDir: string) {}
+  constructor(private readonly baseDir: string = sessionsDir()) {}
 
   sessionDir(sessionId: string): string {
-    return join(this.baseDir, sessionId);
+    // Sanitize on the single entry point that every other method routes
+    // through, and verify the resolved path stays inside baseDir. Without this,
+    // a sessionId like "../evil" would escape baseDir via join() — letting
+    // open() create and delete() rmSync directories outside the session root
+    // (docs 04-session.md §4.5).
+    const safe = safeSessionName(sessionId);
+    const dir = resolve(this.baseDir, safe);
+    const rel = relative(this.baseDir, dir);
+    if (rel.startsWith("..") || resolve(this.baseDir, rel) !== dir) {
+      throw new Error(`refusing session id outside base directory: ${sessionId}`);
+    }
+    return dir;
   }
 
   dbPath(sessionId: string): string {
@@ -31,7 +44,7 @@ export class SessionManager {
 
   info(sessionId: string): SessionInfo {
     const dir = this.sessionDir(sessionId);
-    const dbPath = this.dbPath(sessionId);
+    const dbPath = join(dir, "analysis.db");
     return { sessionId, dbPath, dir, exists: existsSync(dbPath) };
   }
 
@@ -47,7 +60,7 @@ export class SessionManager {
   open(sessionId: string): Graph {
     const dir = this.sessionDir(sessionId);
     mkdirSync(dir, { recursive: true });
-    return new SqliteGraph(this.dbPath(sessionId));
+    return new SqliteGraph(join(dir, "analysis.db"));
   }
 
   openReadOnly(sessionId: string): Graph {

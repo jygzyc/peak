@@ -1,5 +1,5 @@
 /**
- * HTTP API and dashboard server for decx-agent sessions.
+ * HTTP API and dashboard server for peak sessions.
  *
  * Exposes project lists, project details, directives, event streams, and the
  * embedded dashboard HTML. The server is an adapter over Graph state and should
@@ -91,9 +91,8 @@ export class HttpServer {
         const intents = this.graph.intents(project.id);
         const hints = this.graph.unconsumedHints(project.id);
         const directives = this.graph.unconsumedDirectives(project.id);
-        const links = this.graph.links(project.id);
         const progress = this.graph.progress(project.id);
-        return this.json(res, { project, facts, intents, hints, directives, links, progress });
+        return this.json(res, { project, facts, intents, hints, directives, progress });
       }
 
       const directiveMatch = path.match(/^\/api\/projects\/([^/]+)\/directives$/);

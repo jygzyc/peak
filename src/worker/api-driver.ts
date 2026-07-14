@@ -31,7 +31,7 @@ export class ApiDriver implements WorkerDriver {
     const providerId = resolveProviderId(this.config);
     const provider = getProvider(providerId);
     if (!provider) {
-      return { worker: this.name, returncode: 1, stdout: "", stderr: `unknown model provider: ${providerId}. Run 'decx-agent providers init' to set up providers.` };
+      return { worker: this.name, returncode: 1, stdout: "", stderr: `unknown model provider: ${providerId}. Run 'peak providers init' to set up providers.` };
     }
     try {
       const callInput: ModelCallInput = {
@@ -51,14 +51,14 @@ export class ApiDriver implements WorkerDriver {
 /**
  * Resolve provider id in priority order:
  *   1. config.provider (explicit in task.json)
- *   2. DECX_AGENT_API_PROVIDER env
+ *   2. PEAK_AGENT_API_PROVIDER env
  *   3. Scan providers.json + presets for the first provider whose apiKeyEnv is set in env
  *   4. "openai" as final fallback
  */
 export function resolveProviderId(config: WorkerConfig): string {
   const fromConfig = config.provider?.trim();
   if (fromConfig) return fromConfig;
-  const fromEnv = process.env.DECX_AGENT_API_PROVIDER?.trim();
+  const fromEnv = process.env.PEAK_AGENT_API_PROVIDER?.trim();
   if (fromEnv) return fromEnv;
 
   const file = loadProvidersFile();

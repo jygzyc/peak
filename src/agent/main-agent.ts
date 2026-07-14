@@ -74,8 +74,16 @@ export class MainAgent {
       );
     }
 
-    if (input.hints && input.hints.length > 0) {
-      output.decision.consumeHintIds = input.hints.map((h) => h.id);
+    // Honor the planner's explicit hint-consumption selection. Only when the
+    // planner did NOT declare consumeHints (empty) do we fall back to consuming
+    // all actionable hints — preserving the previous "act on every hint"
+    // behavior so stop-explorer hints are still consumed by default. The prompt
+    // tells the planner it may ignore hints, and that choice is now respected.
+    if (output.decision.consumeHintIds.length === 0 && input.hints && input.hints.length > 0) {
+      const actionable = input.hints.filter((h) => h.kind === "stop-explorer" || h.kind === "direction");
+      if (actionable.length > 0) {
+        output.decision.consumeHintIds = actionable.map((h) => h.id);
+      }
     }
 
     return { decision: output.decision, permissions: new PermissionChecker(profile) };

@@ -9,15 +9,15 @@ function decisions(createIntents: unknown[] = [], concludeRun: unknown = null) {
   return env("decisions", { createIntents, failIntents: [], consumeHints: [], concludeRun });
 }
 
-test("planner-skip: accept verdict does NOT trigger planner with verdicts", async () => {
+test("planner-skip: accept verdict DOES re-trigger planner (to chain downstream work)", async () => {
   const graph = new InMemoryGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
 
   const p = createProject(graph);
-  worker.register(/Planner Role/i, decisions([{ description: "TASK" }]));
+  worker.register(/automated planning module/i, decisions([{ description: "TASK" }]));
   worker.register(/TASK/i, env("fact", { description: "done", confidence: 0.9 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "accept", reason: "ok" }));
+  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
   let verdictBlockCallCount = 0;
   worker.register(/## Recent Evaluator Verdicts/i, () => { verdictBlockCallCount++; return decisions(); });
 
@@ -25,7 +25,10 @@ test("planner-skip: accept verdict does NOT trigger planner with verdicts", asyn
   await loop.step(p.id);
   await loop.step(p.id);
 
-  assert.equal(verdictBlockCallCount, 0);
+  // An accept verdict must re-trigger the planner so it can chain a downstream
+  // intent from the verified fact (exhaustive exploration, not first-finding-
+  // stop). The planner sees the verdicts block on this re-plan pass.
+  assert.ok(verdictBlockCallCount > 0, "planner SHOULD see Recent Evaluator Verdicts after an accept");
 });
 
 test("planner-skip: reject verdict DOES trigger planner with verdicts", async () => {
@@ -34,9 +37,13 @@ test("planner-skip: reject verdict DOES trigger planner with verdicts", async ()
   const config = minimalConfig();
 
   const p = createProject(graph);
-  worker.register(/Planner Role/i, decisions([{ description: "BAD-TASK" }]));
+  // Planner creates the rejected intent plus a keepalive intent, so the project
+  // does not naturally complete (openIntents>0) before the verdict-driven
+  // planner pass runs on the next step.
+  worker.register(/automated planning module/i, decisions([{ description: "BAD-TASK" }, { description: "KEEPALIVE" }]));
   worker.register(/BAD-TASK/i, env("fact", { description: "wrong", confidence: 0.2 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "reject", reason: "bad" }));
+  worker.register(/KEEPALIVE/i, env("fact", { description: "ok", confidence: 0.9 }));
+  worker.register(/Evaluator Role/i, env("verdict", { decision: "deny", reason: "bad" }));
   let plannerWithVerdictsCalled = false;
   worker.register(/## Recent Evaluator Verdicts/i, () => {
     plannerWithVerdictsCalled = true;
@@ -51,15 +58,16 @@ test("planner-skip: reject verdict DOES trigger planner with verdicts", async ()
   assert.equal(plannerWithVerdictsCalled, true);
 });
 
-test("planner-skip: demote verdict DOES trigger planner", async () => {
+test("planner-skip: defer verdict DOES trigger planner", async () => {
   const graph = new InMemoryGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
 
   const p = createProject(graph);
-  worker.register(/Planner Role/i, decisions([{ description: "TASK" }]));
+  worker.register(/automated planning module/i, decisions([{ description: "TASK" }, { description: "KEEPALIVE" }]));
   worker.register(/TASK/i, env("fact", { description: "partial", confidence: 0.9 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "demote", reason: "weak", confidence: 0.3 }));
+  worker.register(/KEEPALIVE/i, env("fact", { description: "ok", confidence: 0.9 }));
+  worker.register(/Evaluator Role/i, env("verdict", { decision: "pending", reason: "needs precondition", requiredConditions: ["login token"] }));
   let plannerWithVerdictsCalled = false;
   worker.register(/## Recent Evaluator Verdicts/i, () => { plannerWithVerdictsCalled = true; return decisions(); });
 
@@ -74,12 +82,13 @@ test("planner-skip: stop-explorer hint triggers planner even during cooldown", a
   const graph = new InMemoryGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
-  config.workflow.limits.plannerCooldownSteps = 0;
+  config.profiles.planner.cooldownSteps = 0;
 
   const p = createProject(graph);
-  worker.register(/Planner Role/i, decisions([{ description: "TASK" }]));
+  worker.register(/automated planning module/i, decisions([{ description: "TASK" }, { description: "KEEPALIVE" }]));
   worker.register(/TASK/i, env("fact", { description: "done", confidence: 0.9 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "accept", reason: "ok" }));
+  worker.register(/KEEPALIVE/i, env("fact", { description: "ok", confidence: 0.9 }));
+  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
   let plannerWithHintsCalled = false;
   worker.register(/## Hints Requiring Response/i, () => { plannerWithHintsCalled = true; return decisions(); });
 
@@ -99,12 +108,12 @@ test("planner-skip: empty graph always runs planner", async () => {
   const p = createProject(graph);
 
   let plannerCalled = false;
-  worker.register(/Planner Role/i, () => {
+  worker.register(/automated planning module/i, () => {
     plannerCalled = true;
     return decisions([{ description: "INIT" }]);
   });
   worker.register(/INIT/i, env("fact", { description: "done", confidence: 0.9 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "accept", reason: "ok" }));
+  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
 
   const loop = new SessionLoop(graph, worker, config);
   await loop.step(p.id);
@@ -112,44 +121,48 @@ test("planner-skip: empty graph always runs planner", async () => {
   assert.equal(plannerCalled, true);
 });
 
-test("planner-skip: with cooldown>0, planner NOT called again on accept verdict", async () => {
+test("planner-skip: accept verdict re-plans (to chain downstream), but cooldown still gates idle re-runs", async () => {
   const graph = new InMemoryGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
-  config.workflow.limits.plannerCooldownSteps = 5;
+  config.profiles.planner.cooldownSteps = 5;
 
   const p = createProject(graph);
   let plannerCallCount = 0;
-  worker.register(/Planner Role/i, () => {
+  worker.register(/automated planning module/i, () => {
     plannerCallCount++;
     return decisions([{ description: "WORK-TASK" }]);
   });
   worker.register(/WORK-TASK/i, env("fact", { description: "done", confidence: 0.9 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "accept", reason: "ok" }));
+  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
 
   const loop = new SessionLoop(graph, worker, config);
   await loop.step(p.id);
   const callsAfterStep1 = plannerCallCount;
   assert.equal(callsAfterStep1, 1, "planner should run once on empty graph");
 
+  // An accept verdict must re-trigger the planner so it can chain downstream
+  // work from a verified fact (previously this skipped and the run stopped
+  // after the first accept). Cooldown no longer gates accept verdicts.
   await loop.step(p.id);
-  assert.equal(plannerCallCount, callsAfterStep1, "planner should NOT run again on accept verdict");
+  assert.ok(plannerCallCount > callsAfterStep1, "planner SHOULD re-run on an accept verdict to chain downstream");
 });
 
 test("planner-skip: reject bypasses cooldown and triggers planner", async () => {
   const graph = new InMemoryGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
-  config.workflow.limits.plannerCooldownSteps = 99;
+  config.profiles.planner.cooldownSteps = 99;
 
   const p = createProject(graph);
   let plannerCallCount = 0;
-  worker.register(/Planner Role/i, () => {
+  worker.register(/automated planning module/i, () => {
     plannerCallCount++;
-    return decisions([{ description: "BAD-WORK" }]);
+    return decisions([{ description: "BAD-WORK" }, { description: "KEEPALIVE" }]);
   });
   worker.register(/BAD-WORK/i, env("fact", { description: "wrong", confidence: 0.2 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "reject", reason: "bad" }));
+  worker.register(/KEEPALIVE/i, env("fact", { description: "ok", confidence: 0.9 }));
+  worker.register(/Evaluator Role/i, env("verdict", { decision: "deny", reason: "bad" }));
   worker.register(/## Recent Evaluator Verdicts/i, () => {
     plannerCallCount++;
     return decisions([{ description: "RETRY" }]);

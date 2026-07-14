@@ -50,7 +50,7 @@ else                  → new InMemoryGraph()             // 纯内存
 ## 2. `src/app/version.ts`（9 行）
 
 ### 用途
-`decx-agent` 包的**版本常量**。文件头注释（1–6 行）声称「读取仓库根 version 文件，使 agent 与 DECX 报告同一版本」。
+`peak` 包的**版本常量**。文件头注释（1–6 行）声称「读取仓库根 version 文件，使 agent 与 Peak 报告同一版本」。
 
 ### 职责
 导出 `VERSION = "0.1.0"` 常量。
@@ -64,7 +64,7 @@ else                  → new InMemoryGraph()             // 纯内存
 ### 审计要点
 - 🚨 **注释撒谎**：文件头说「Reads the repository root version file at build/runtime」，但实现是**硬编码字符串**，根本不读 `version` 文件。注释与实现严重不符。
 - 🚨 **`VERSION` 从未被任何文件 import**（codegraph 确认：`src/`、`tests/` 全局仅 `version.ts:8` 一处出现 `VERSION`）。`cli.ts` 第 33 行另写一份 `0.1.0`，`package.json` 第三份。**三处版本各写各的**，且 `version.ts` 这份完全是死代码。
-- ⚠️ 文件头注释承诺的「与 DECX 统一版本」机制完全未实现（DECX 的版本在仓库根 `version` 文件，由 Gradle 读取）。
+- ⚠️ 文件头注释承诺的「与 Peak 统一版本」机制完全未实现（Peer 的版本在仓库根 `version` 文件，由 Gradle 读取）。
 
 ### 跨文件观察
 - 这是「死文件 + 撒谎注释」的典型，建议要么真正实现「读 version 文件」并被 `cli.ts` 引用，要么删除。

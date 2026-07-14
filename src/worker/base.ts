@@ -16,6 +16,9 @@ export interface WorkerRequest {
   intentId?: string;
   cwd?: string;
   config?: WorkerConfig;
+  sessionId?: string;
+  /** Marks this invocation as a conclude-phase call (force-summarize, no further work). */
+  conclude?: boolean;
 }
 
 export interface WorkerResult {
@@ -23,6 +26,7 @@ export interface WorkerResult {
   returncode: number;
   stdout: string;
   stderr: string;
+  sessionId?: string;
 }
 
 export interface WorkerDriver {

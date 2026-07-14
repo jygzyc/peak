@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>decx-agent Dashboard</title>
+  <title>peak Dashboard</title>
   <style>
     :root {
       --bg: #0d1117;
@@ -138,9 +138,9 @@
       transition: border-color 0.1s;
     }
     .fact-card:hover { border-color: var(--text-faint); }
-    .fact-card.accepted { border-left: 3px solid var(--green); }
-    .fact-card.candidate { border-left: 3px solid var(--yellow); }
-    .fact-card.rejected { border-left: 3px solid var(--red); opacity: 0.6; }
+    .fact-card.pass { border-left: 3px solid var(--green); }
+    .fact-card.pending { border-left: 3px solid var(--yellow); }
+    .fact-card.deny { border-left: 3px solid var(--red); opacity: 0.6; }
     .fact-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
     .fact-id {
       font-family: 'SF Mono', 'Fira Code', monospace;
@@ -167,9 +167,8 @@
     }
     .intent-card.open { border-left: 3px solid var(--accent); }
     .intent-card.claimed { border-left: 3px solid var(--yellow); }
-    .intent-card.chained { border-left: 3px solid var(--purple); }
-    .intent-card.done { border-left: 3px solid var(--green); }
-    .intent-card.failed { border-left: 3px solid var(--red); opacity: 0.7; }
+    .intent-card.pass { border-left: 3px solid var(--green); }
+    .intent-card.deny { border-left: 3px solid var(--red); opacity: 0.7; }
 
     /* ─── Hint cards ─── */
     .hint-card {
@@ -328,9 +327,9 @@
       var pr = data.progress;
       document.getElementById('progress-bar').innerHTML =
         '<span class="progress-item"><span>steps</span><strong>' + pr.stepsExecuted + '</strong></span>' +
-        '<span class="progress-item"><span>accepted</span><strong>' + pr.acceptedFacts + '</strong></span>' +
-        '<span class="progress-item"><span>candidate</span><strong>' + pr.candidateFacts + '</strong></span>' +
-        '<span class="progress-item"><span>rejected</span><strong>' + pr.rejectedFacts + '</strong></span>' +
+        '<span class="progress-item"><span>passed</span><strong>' + pr.passFacts + '</strong></span>' +
+        '<span class="progress-item"><span>pending</span><strong>' + pr.pendingFacts + '</strong></span>' +
+        '<span class="progress-item"><span>denied</span><strong>' + pr.denyFacts + '</strong></span>' +
         '<span class="progress-item"><span>open</span><strong>' + pr.openIntents + '</strong></span>' +
         '<span class="progress-item"><span>stagnation</span><strong>' + pr.stagnationLevel + '</strong></span>';
 

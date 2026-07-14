@@ -7,16 +7,23 @@
  */
 
 import type { WorkerConfig } from "../../agent/types.js";
-import { SubprocessBackend } from "./subprocess.js";
+import { SubprocessBackend, type BuildArgvOptions } from "./subprocess.js";
+
+const SESSION_RE = /session[: ]+([0-9a-fA-F-]{8,})/i;
 
 export class ClaudeBackend extends SubprocessBackend {
   readonly id = "claude-code";
 
-  buildArgv(config: WorkerConfig, prompt: string) {
-    return {
-      argv: ["claude", "--dangerously-skip-permissions", "-p", "--", prompt],
-      env: envFor(config),
-    };
+  buildArgv(config: WorkerConfig, prompt: string, opts?: BuildArgvOptions) {
+    const argv = ["claude", "--dangerously-skip-permissions", "-p"];
+    if (opts?.sessionId) argv.push("--resume", opts.sessionId);
+    argv.push("--", prompt);
+    return { argv, env: envFor(config) };
+  }
+
+  extractSession(stdout: string, stderr: string): string | undefined {
+    const m = SESSION_RE.exec(stderr) ?? SESSION_RE.exec(stdout);
+    return m ? m[1] : undefined;
   }
 }
 

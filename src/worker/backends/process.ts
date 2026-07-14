@@ -7,12 +7,12 @@
  */
 
 import type { WorkerConfig } from "../../agent/types.js";
-import { SubprocessBackend } from "./subprocess.js";
+import { SubprocessBackend, type BuildArgvOptions } from "./subprocess.js";
 
 export class ProcessBackend extends SubprocessBackend {
   readonly id = "process";
 
-  buildArgv(config: WorkerConfig, prompt: string) {
+  buildArgv(config: WorkerConfig, prompt: string, _opts?: BuildArgvOptions) {
     const command = config.command ?? "echo";
     const args = config.args ?? [];
     return { argv: [command, ...args], input: prompt };

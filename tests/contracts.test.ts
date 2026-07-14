@@ -4,7 +4,6 @@ import {
   validateMainDecision,
   validateCandidateFact,
   validateVerdict,
-  validateChain,
   validateHints,
   validateStop,
 } from "../dist/agent/contracts.js";
@@ -36,6 +35,34 @@ test("contracts: validateMainDecision parses concludeRun", () => {
   assert.equal(d.concludeRun!.description, "goal met");
 });
 
+test("contracts: validateMainDecision honors planner consumeHints selection", () => {
+  // Previously consumeHintIds was hard-coded to [] (docs 03-agent.md §3.3) —
+  // the planner's selection was discarded entirely.
+  const d = validateMainDecision(env("decisions", {
+    createIntents: [], failIntents: [],
+    consumeHints: ["h001", "h002"],
+    concludeRun: null,
+  }));
+  assert.deepEqual(d.consumeHintIds, ["h001", "h002"]);
+});
+
+test("contracts: validateMainDecision filters non-string consumeHints entries", () => {
+  const d = validateMainDecision(env("decisions", {
+    createIntents: [], failIntents: [],
+    consumeHints: ["h001", 123, null, "", "h003"],
+    concludeRun: null,
+  }));
+  assert.deepEqual(d.consumeHintIds, ["h001", "h003"]);
+});
+
+test("contracts: validateMainDecision defaults consumeHintIds to [] when absent", () => {
+  const d = validateMainDecision(env("decisions", {
+    createIntents: [], failIntents: [],
+    concludeRun: null,
+  }));
+  assert.deepEqual(d.consumeHintIds, []);
+});
+
 test("contracts: validateCandidateFact defaults confidence to 0.7", () => {
   const c = validateCandidateFact(env("fact", { description: "x", evidence: [] }), "explorer");
   assert.equal(c.confidence, 0.7);
@@ -47,39 +74,23 @@ test("contracts: validateCandidateFact parses evidence array", () => {
   assert.equal(c.confidence, 0.9);
 });
 
-test("contracts: validateVerdict accepts accept/reject/demote/block", () => {
-  for (const decision of ["accept", "reject", "demote", "block"] as const) {
+test("contracts: validateVerdict accepts accept/reject/defer", () => {
+  for (const decision of ["pass", "deny", "pending"] as const) {
     const v = validateVerdict(env("verdict", { decision, reason: "r" }), "evaluator");
     assert.equal(v.decision, decision);
   }
 });
 
-test("contracts: validateVerdict parses blocked prerequisites", () => {
+test("contracts: validateVerdict parses deferred prerequisites", () => {
   const v = validateVerdict(env("verdict", {
-    decision: "block", reason: "needs precondition", requiredConditions: ["login", "token"],
+    decision: "pending", reason: "needs precondition", requiredConditions: ["login", "token"],
   }), "evaluator");
-  assert.equal(v.decision, "block");
+  assert.equal(v.decision, "pending");
   assert.deepEqual(v.requiredConditions, ["login", "token"]);
 });
 
 test("contracts: validateVerdict throws on invalid decision", () => {
   assert.throws(() => validateVerdict(env("verdict", { decision: "maybe", reason: "r" }), "evaluator"));
-});
-
-test("contracts: validateChain parses subIntents and waitMode", () => {
-  const c = validateChain(env("chain", {
-    reason: "need more", subIntents: [{ description: "sub" }], waitMode: "any",
-  }), "explorer");
-  assert.equal(c.reason, "need more");
-  assert.equal(c.subIntents.length, 1);
-  assert.equal(c.waitMode, "any");
-});
-
-test("contracts: validateChain defaults waitMode to all", () => {
-  const c = validateChain(env("chain", {
-    reason: "x", subIntents: [{ description: "y" }], waitMode: "bogus",
-  }), "explorer");
-  assert.equal(c.waitMode, "all");
 });
 
 test("contracts: validateHints maps creator", () => {

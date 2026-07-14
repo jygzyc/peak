@@ -1,8 +1,8 @@
 /**
  * Provider registry. Built dynamically from providers.json + built-in presets.
  *
- * On first import, the registry loads ~/.decx/agent/providers.json (or path
- * from DECX_AGENT_PROVIDERS env), merges with presets, and registers a
+ * On first import, the registry loads ~/.peak/agent/providers.json (or path
+ * from PEAK_AGENT_PROVIDERS env), merges with presets, and registers a
  * ConfiguredProvider for each entry. External code can still call
  * `registerProvider` to add custom adapters programmatically.
  */

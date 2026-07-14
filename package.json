@@ -1,5 +1,5 @@
 {
-  "name": "@jygzyc/decx-agent",
+  "name": "@jygzyc/peak",
   "version": "0.1.0",
   "description": "Standalone configured agent runtime",
   "type": "module",
@@ -9,27 +9,28 @@
     "AGENTS.md"
   ],
   "bin": {
-    "decx-agent": "dist/cli.js"
+    "peak": "dist/cli.js"
   },
   "scripts": {
     "clean": "rm -rf dist dist-packages",
     "build": "npm run clean && tsc && npm run copy-assets",
-    "copy-assets": "cp src/server/dashboard.html dist/server/dashboard.html",
+    "copy-assets": "cp src/server/dashboard.html dist/server/dashboard.html && cp -r src/agent/prompts dist/agent/prompts",
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test tests/*.test.ts",
     "smoke": "node scripts/smoke.mjs",
-    "pack": "node scripts/pack.mjs"
+    "pack": "node scripts/pack.mjs",
+    "prepack": "node scripts/pack.mjs"
   },
   "dependencies": {
-    "@ai-sdk/anthropic": "^3.0.85",
-    "@ai-sdk/openai": "^3.0.73",
-    "ai": "^6.0.208",
+    "@ai-sdk/anthropic": "^4.0.12",
+    "@ai-sdk/openai": "^4.0.11",
+    "ai": "^7.0.22",
     "commander": "^15.0.0"
   },
   "devDependencies": {
     "@types/node": "^26.0.0",
     "esbuild": "^0.28.1",
-    "typescript": "^6.0.3"
+    "typescript": "^7.0.2"
   },
   "engines": {
     "node": ">=22.5.0"

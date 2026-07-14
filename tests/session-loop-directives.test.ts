@@ -14,9 +14,9 @@ test("directive stop: project moves to stopped, step returns completed", async (
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
-  worker.register(/Planner Role/i, decisions([{ description: "INITIAL" }]));
+  worker.register(/automated planning module/i, decisions([{ description: "INITIAL" }]));
   worker.register(/INITIAL/i, env("fact", { description: "done", confidence: 0.9 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "accept", reason: "ok" }));
+  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
 
   graph.addDirective(p.id, { kind: "stop", payload: "human requested stop" });
   const loop = new SessionLoop(graph, worker, config);
@@ -31,7 +31,7 @@ test("directive pause: project moves to paused, step returns idle", async () => 
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
-  worker.register(/Planner Role/i, decisions());
+  worker.register(/automated planning module/i, decisions());
   graph.addDirective(p.id, { kind: "pause", payload: "break time" });
 
   const loop = new SessionLoop(graph, worker, config);
@@ -48,9 +48,12 @@ test("directive resume: paused project returns to active via directive", async (
   graph.updateProjectStatus(p.id, "paused");
   graph.addDirective(p.id, { kind: "resume", payload: "" });
 
-  worker.register(/Planner Role/i, decisions([{ description: "RESUMED-TASK" }]));
+  // Two intents so the project stays active after one resolves (otherwise it
+  // would naturally complete within the same step).
+  worker.register(/automated planning module/i, decisions([{ description: "RESUMED-TASK" }, { description: "KEEPALIVE" }]));
   worker.register(/RESUMED-TASK/i, env("fact", { description: "r", confidence: 0.9 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "accept", reason: "ok" }));
+  worker.register(/KEEPALIVE/i, env("fact", { description: "ok", confidence: 0.9 }));
+  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
 
   const loop = new SessionLoop(graph, worker, config);
   await loop.step(p.id);
@@ -62,10 +65,10 @@ test("directive hint: adds hint to graph, consumed by planner", async () => {
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
-  worker.register(/Planner Role/i, decisions([{ description: "INITIAL" }]));
+  worker.register(/automated planning module/i, decisions([{ description: "INITIAL" }]));
   worker.register(/## Hints Requiring Response/i, decisions([]));
   worker.register(/INITIAL/i, env("fact", { description: "done", confidence: 0.9 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "accept", reason: "ok" }));
+  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
 
   graph.addDirective(p.id, { kind: "hint", payload: "check auth bypass" });
 
@@ -85,9 +88,9 @@ test("directive kill-intent: fails the targeted intent", async () => {
   const p = createProject(graph);
 
   // First step: planner creates an intent
-  worker.register(/Planner Role/i, decisions([{ description: "TARGET-INTENT" }]));
+  worker.register(/automated planning module/i, decisions([{ description: "TARGET-INTENT" }]));
   worker.register(/TARGET-INTENT/i, env("fact", { description: "done", confidence: 0.9 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "accept", reason: "ok" }));
+  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
 
   const loop = new SessionLoop(graph, worker, config);
   await loop.step(p.id);
@@ -100,7 +103,7 @@ test("directive kill-intent: fails the targeted intent", async () => {
   await loop.step(p.id);
 
   const killed = graph.getIntent(p.id, intent!.id);
-  assert.equal(killed!.status, "failed");
+  assert.equal(killed!.status, "deny");
 });
 
 test("directive spawn-intent: adds new intent to graph", async () => {
@@ -108,8 +111,8 @@ test("directive spawn-intent: adds new intent to graph", async () => {
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
-  worker.register(/Planner Role/i, decisions());
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "accept", reason: "ok" }));
+  worker.register(/automated planning module/i, decisions());
+  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
 
   graph.addDirective(p.id, { kind: "spawn-intent", payload: "human-defined task" });
 
@@ -126,10 +129,10 @@ test("directive: multiple directives consumed in order", async () => {
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
-  worker.register(/Planner Role/i, decisions());
+  worker.register(/automated planning module/i, decisions());
   worker.register(/## Hints Requiring Response/i, decisions([{ description: "FROM-HINT" }]));
   worker.register(/FROM-HINT/i, env("fact", { description: "done", confidence: 0.9 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "accept", reason: "ok" }));
+  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
 
   graph.addDirective(p.id, { kind: "hint", payload: "first hint" });
   graph.addDirective(p.id, { kind: "spawn-intent", payload: "spawned task" });

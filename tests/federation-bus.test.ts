@@ -8,6 +8,7 @@ test("FederationBus: publishInsight + subscribeInsights receives summary", () =>
   bus.subscribeInsights((insight) => received.push(insight.summary));
 
   bus.publishInsight(
+    "fact",
     { sessionId: "s1", projectId: "p1", factId: "f001" },
     "found auth bypass", 0.9,
   );
@@ -18,8 +19,8 @@ test("FederationBus: publishInsight + subscribeInsights receives summary", () =>
 
 test("FederationBus: insightsForSession excludes own session", () => {
   const bus = new FederationBus();
-  bus.publishInsight({ sessionId: "s1", projectId: "p1", factId: "f001" }, "from s1", 0.9);
-  bus.publishInsight({ sessionId: "s2", projectId: "p2", factId: "f002" }, "from s2", 0.9);
+  bus.publishInsight("fact", { sessionId: "s1", projectId: "p1", factId: "f001" }, "from s1", 0.9);
+  bus.publishInsight("fact", { sessionId: "s2", projectId: "p2", factId: "f002" }, "from s2", 0.9);
 
   const forS1 = bus.insightsForSession("s1");
   assert.equal(forS1.length, 1);
@@ -29,7 +30,7 @@ test("FederationBus: insightsForSession excludes own session", () => {
 test("FederationBus: recentInsights caps at limit", () => {
   const bus = new FederationBus();
   for (let i = 0; i < 10; i++) {
-    bus.publishInsight({ sessionId: "s1", projectId: "p1", factId: `f${i}` }, `insight ${i}`, 0.5);
+    bus.publishInsight("fact", { sessionId: "s1", projectId: "p1", factId: `f${i}` }, `insight ${i}`, 0.5);
   }
   assert.equal(bus.recentInsights(3).length, 3);
   assert.match(bus.recentInsights(1)[0]!.summary, /insight 9/);
@@ -39,8 +40,8 @@ test("FederationBus: unsubscribe stops receiving", () => {
   const bus = new FederationBus();
   const received: string[] = [];
   const unsub = bus.subscribeInsights((i) => received.push(i.summary));
-  bus.publishInsight({ sessionId: "s1", projectId: "p1", factId: "f1" }, "first", 0.5);
+  bus.publishInsight("fact", { sessionId: "s1", projectId: "p1", factId: "f1" }, "first", 0.5);
   unsub();
-  bus.publishInsight({ sessionId: "s1", projectId: "p1", factId: "f2" }, "second", 0.5);
+  bus.publishInsight("fact", { sessionId: "s1", projectId: "p1", factId: "f2" }, "second", 0.5);
   assert.equal(received.length, 1);
 });

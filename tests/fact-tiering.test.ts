@@ -5,7 +5,7 @@ import { tierFacts, renderTieredFacts, DEFAULT_TIER_OPTIONS } from "../dist/agen
 function fact(id: string, desc: string, step: number) {
   return {
     id, projectId: "p", description: desc, evidence: [],
-    source: "explorer", confidence: 0.9, status: "accepted" as const,
+    source: "explorer", confidence: 0.9, status: "pass" as const,
     createdAt: new Date(step * 1000).toISOString(),
     stepDiscovered: step,
   };

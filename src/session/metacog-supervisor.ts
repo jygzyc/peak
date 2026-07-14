@@ -7,6 +7,7 @@
  */
 
 import type { ProjectId, TaskConfig } from "../agent/types.js";
+import { DEFAULT_METACOG_TRIGGERS } from "../agent/types.js";
 import type { Graph } from "../graph/graph.js";
 import type { WorkerPool } from "../worker/worker-runtime.js";
 import { runSubagent, metacogExtra } from "../agent/subagent-runner.js";
@@ -15,7 +16,9 @@ import { ContextLedger } from "../agent/context-ledger.js";
 import { WorkerSessionManager } from "../worker/session-manager.js";
 import { ProjectLockManager } from "./project-lock.js";
 
-const DEFAULT_METACOG_INTERVAL_MS = 30_000;
+const DEFAULT_METACOG_INTERVAL_MS = DEFAULT_METACOG_TRIGGERS.everySeconds
+  ? DEFAULT_METACOG_TRIGGERS.everySeconds * 1000
+  : 30_000;
 
 export class MetacogSupervisor {
   private timer: ReturnType<typeof setInterval> | undefined;
@@ -32,8 +35,13 @@ export class MetacogSupervisor {
     private readonly locks: ProjectLockManager,
     intervalMs?: number,
   ) {
-    const cfg = config.workflow.metacog?.triggers?.everySeconds;
-    this.intervalMs = intervalMs ?? (cfg ? cfg * 1000 : DEFAULT_METACOG_INTERVAL_MS);
+    // Read the wall-clock interval from the metacog profile's triggers (per-
+    // agent), not a global workflow block. Fall back to the constructor arg,
+    // then the module default.
+    const metacogProfileId = config.control?.metacogProfile ?? "metacog";
+    const metacogProfile = config.profiles[metacogProfileId] ?? config.profiles.metacog;
+    const everySeconds = metacogProfile?.triggers?.everySeconds;
+    this.intervalMs = intervalMs ?? (everySeconds ? everySeconds * 1000 : DEFAULT_METACOG_INTERVAL_MS);
     this.promptLoader = new PromptLoader();
   }
 
@@ -67,74 +75,93 @@ export class MetacogSupervisor {
     await Promise.allSettled(active.map((p) => this.runForProject(p.id)));
   }
 
-  private async runForProject(projectId: ProjectId): Promise<void> {
-    await this.locks.acquire(projectId, async () => {
-      const progress = this.graph.progress(projectId);
-      const stagnationTrigger = this.config.workflow.metacog?.triggers?.stagnationLevel ?? 3;
-      const everySteps = this.config.workflow.metacog?.triggers?.everySteps ?? 5;
+  /** Run metacog for a project, acquiring the project lock. Used by the timer
+   * and runOnce. Returns true if the metacog produced hints or a stop. */
+  async runForProject(projectId: ProjectId): Promise<boolean> {
+    return this.locks.acquire(projectId, () => this.runForProjectLocked(projectId));
+  }
 
-      const shouldRun =
-        progress.stagnationLevel >= stagnationTrigger
-        || progress.stepsExecuted > 0 && progress.stepsExecuted % everySteps === 0
-        || progress.openIntents === 0 && progress.chainedIntents === 0 && progress.candidateFacts === 0 && progress.acceptedFacts > 0;
+  /**
+   * Run metacog for a project WITHOUT acquiring the project lock. Called from
+   * SessionLoop.stepLocked, which already holds the lock (ProjectLockManager is
+   * non-reentrant, so the caller must NOT re-acquire). Returns true if the
+   * metacog produced hints or a stop request — the loop uses this to decide
+   * whether to give the planner another step to act on the hint.
+   */
+  async runForProjectLocked(projectId: ProjectId): Promise<boolean> {
+    const progress = this.graph.progress(projectId);
+    const metacogProfileId = this.config.control?.metacogProfile ?? "metacog";
+    const profile = this.config.profiles[metacogProfileId] ?? this.config.profiles.metacog;
+    if (!profile) return false;
 
-      if (!shouldRun) return;
+    // Per-profile triggers (no global workflow block). Stagnation is NOT a
+    // hard stop — it only fires the metacog loop, whose hints the planner
+    // then acts on. The planner remains the sole termination judge.
+    const triggers = profile.triggers ?? DEFAULT_METACOG_TRIGGERS;
+    const stagnationTrigger = triggers.stagnationLevel ?? DEFAULT_METACOG_TRIGGERS.stagnationLevel ?? 3;
+    const everySteps = triggers.everySteps ?? DEFAULT_METACOG_TRIGGERS.everySteps ?? 5;
 
-      const metacogProfileId = this.config.control?.metacogProfile ?? "metacog";
-      const profile = this.config.profiles[metacogProfileId] ?? this.config.profiles.metacog;
-      if (!profile) return;
+    const shouldRun =
+      progress.stagnationLevel >= stagnationTrigger
+      || progress.stepsExecuted > 0 && progress.stepsExecuted % everySteps === 0
+      || progress.openIntents === 0 && progress.pendingFacts === 0 && progress.passFacts > 0;
 
-      const maxActive = profile.maxActive ?? 1;
-      const activeRuns = this.graph.subagentRuns(projectId, { profileId: metacogProfileId, status: "running" });
-      if (activeRuns.length >= maxActive) return;
+    if (!shouldRun) return false;
 
-      const run = this.graph.createSubagentRun(projectId, {
+    const maxActive = profile.maxActive ?? 1;
+    const activeRuns = this.graph.subagentRuns(projectId, { profileId: metacogProfileId, status: "running" });
+    if (activeRuns.length >= maxActive) return false;
+
+    const run = this.graph.createSubagentRun(projectId, {
+      profileId: metacogProfileId,
+      role: profile.role,
+      workerName: profile.runtime.worker,
+      inputSummary: "scheduled metacog tick",
+    });
+
+    try {
+      this.graph.updateSubagentRun(projectId, run.id, { status: "running" });
+
+      const output = await runSubagent({
+        profile,
         profileId: metacogProfileId,
-        role: profile.role,
-        workerName: profile.runtime.worker,
-        inputSummary: "scheduled metacog tick",
+        projectId, graph: this.graph,
+        workerPool: this.workerPool, config: this.config,
+        promptLoader: this.promptLoader,
+        contextLedger: this.contextLedger,
+        sessionManager: this.sessionManager,
+        promptExtra: metacogExtra("scheduled"),
       });
 
-      try {
-        this.graph.updateSubagentRun(projectId, run.id, { status: "running" });
-
-        const output = await runSubagent({
-          profile,
-          profileId: metacogProfileId,
-          projectId, graph: this.graph,
-          workerPool: this.workerPool, config: this.config,
-          promptLoader: this.promptLoader,
-          contextLedger: this.contextLedger,
-          sessionManager: this.sessionManager,
-          promptExtra: metacogExtra("scheduled"),
-        });
-
-        if (output.kind === "hints") {
-          for (const hint of output.hints.hints) {
-            this.graph.addHint(projectId, hint);
-          }
-          this.graph.updateSubagentRun(projectId, run.id, {
-            status: "completed",
-            outputSummary: `${output.hints.hints.length} hints`,
-          });
-        } else if (output.kind === "stop") {
-          this.graph.updateProjectStatus(projectId, "stopped");
-          this.graph.logEvent(projectId, "metacog.stop_request", { reason: output.stop.reason });
-          this.graph.updateSubagentRun(projectId, run.id, {
-            status: "completed",
-            outputSummary: `stop: ${output.stop.reason}`,
-          });
-        } else {
-          this.graph.updateSubagentRun(projectId, run.id, {
-            status: "completed",
-            outputSummary: `unexpected kind: ${output.kind}`,
-          });
+      if (output.kind === "hints") {
+        for (const hint of output.hints.hints) {
+          this.graph.addHint(projectId, hint);
         }
-      } catch (err) {
-        const reason = err instanceof Error ? err.message : String(err);
-        this.graph.updateSubagentRun(projectId, run.id, { status: "failed", errorMessage: reason });
-        this.graph.logEvent(projectId, "metacog.error", { error: reason });
+        this.graph.updateSubagentRun(projectId, run.id, {
+          status: "completed",
+          outputSummary: `${output.hints.hints.length} hints`,
+        });
+        return output.hints.hints.length > 0;
+      } else if (output.kind === "stop") {
+        this.graph.updateProjectStatus(projectId, "stopped");
+        this.graph.logEvent(projectId, "metacog.stop_request", { reason: output.stop.reason });
+        this.graph.updateSubagentRun(projectId, run.id, {
+          status: "completed",
+          outputSummary: `stop: ${output.stop.reason}`,
+        });
+        return true;
+      } else {
+        this.graph.updateSubagentRun(projectId, run.id, {
+          status: "completed",
+          outputSummary: `unexpected kind: ${output.kind}`,
+        });
+        return false;
       }
-    });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      this.graph.updateSubagentRun(projectId, run.id, { status: "failed", errorMessage: reason });
+      this.graph.logEvent(projectId, "metacog.error", { error: reason });
+      return false;
+    }
   }
 }

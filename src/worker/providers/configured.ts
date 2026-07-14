@@ -33,7 +33,7 @@ export class ConfiguredProvider implements ModelProvider {
     const kind = this.userConfig.kind ?? "openai";
 
     if (kind === "anthropic") {
-      const anthropic = createAnthropic({ apiKey, baseURL });
+      const anthropic = createAnthropic({ apiKey, baseURL, headers: this.userConfig.headers });
       const { text } = await generateText({
         model: anthropic(model),
         prompt: input.prompt,

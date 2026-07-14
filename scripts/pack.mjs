@@ -1,5 +1,5 @@
 /**
- * Production packaging for @jygzyc/decx-agent.
+ * Production packaging for @jygzyc/peak.
  *
  * Pipeline:
  *   1. `tsc --noEmit` for type checking (fail fast on type errors).
@@ -22,6 +22,7 @@ import { createHash } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -32,14 +33,17 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
-const root = join(new URL("..", import.meta.url).pathname);
+// fileURLToPath (not URL.pathname) so the repo root resolves correctly on
+// Windows — pathname yields a malformed "\\E:\\Code\\" drive path there.
+const root = fileURLToPath(new URL("..", import.meta.url));
 const srcEntry = join(root, "src", "cli.ts");
 const distDir = join(root, "dist");
 const distEntry = join(distDir, "index.js");
 const outDir = join(root, "dist-packages");
-const npmCache = mkdtempSync(join(tmpdir(), "decx-agent-npm-cache-"));
+const npmCache = mkdtempSync(join(tmpdir(), "peak-npm-cache-"));
 
 const EXTERNAL = [
   "commander",
@@ -48,12 +52,16 @@ const EXTERNAL = [
   "@ai-sdk/anthropic",
 ];
 
+// Windows: npm/node are .cmd shims that require shell:true to spawn.
+const SHELL = process.platform === "win32";
+
 try {
   await step("typecheck", () => {
     const result = spawnSync("npm", ["run", "typecheck"], {
       cwd: root,
       stdio: "inherit",
       env: npmEnv(),
+      shell: SHELL,
     });
     if (result.status !== 0) {
       process.exit(result.status ?? 1);
@@ -67,6 +75,14 @@ try {
 
   await step("copy dashboard.html", () => {
     copyFileSync(join(root, "src", "server", "dashboard.html"), join(distDir, "dashboard.html"));
+  });
+
+  await step("copy builtin prompts", () => {
+    // The builtin role prompts (planner/explorer/evaluator/metacog) are loaded
+    // at runtime via DIST_ROOT-relative paths, so they must ship inside dist/.
+    cpSync(join(root, "src", "agent", "prompts"), join(distDir, "agent", "prompts"), {
+      recursive: true,
+    });
   });
 
   await step("esbuild bundle", async () => {
@@ -126,12 +142,16 @@ try {
 
     const packed = spawnSync(
       "npm",
-      ["pack", "--pack-destination", outDir, "--json"],
+      // --ignore-scripts: skip the prepack lifecycle hook here, because THIS
+      // script IS the prepack step. Without it, prepack → pack.mjs → npm pack
+      // → prepack would recurse infinitely once a "prepack" script is declared.
+      ["pack", "--pack-destination", outDir, "--ignore-scripts", "--json"],
       {
         cwd: root,
         encoding: "utf-8",
         maxBuffer: 1024 * 1024 * 10,
         env: npmEnv(),
+        shell: SHELL,
       },
     );
 
@@ -142,10 +162,12 @@ try {
 
     const [entry] = JSON.parse(packed.stdout);
     const fileName = entry.filename;
-    const tarball = join(outDir, fileName);
+    // npm usually honors --pack-destination, but in some lifecycle wrappers
+    // (e.g. publish --dry-run) it may write to cwd instead. Check both.
+    const tarball = [join(outDir, fileName), join(root, fileName)].find(existsSync);
 
-    if (!existsSync(tarball)) {
-      process.stderr.write(`expected compressed package at ${tarball}\n`);
+    if (!tarball) {
+      process.stderr.write(`expected compressed package at ${join(outDir, fileName)} (or ${join(root, fileName)})\n`);
       process.exit(1);
     }
 
@@ -185,5 +207,9 @@ async function step(name, fn) {
 }
 
 function npmEnv() {
-  return { ...process.env, npm_config_cache: npmCache };
+  // npm_config_dry_run="" forces the inner `npm pack` to actually write the
+  // tarball even when the outer command was `npm publish --dry-run` (which
+  // propagates dry-run into prepack's env and would make the inner pack a
+  // no-op, leaving no tarball to verify).
+  return { ...process.env, npm_config_cache: npmCache, npm_config_dry_run: "" };
 }

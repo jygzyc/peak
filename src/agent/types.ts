@@ -1,5 +1,5 @@
 /**
- * Core data model for decx-agent.
+ * Core data model for peak.
  *
  * The model is intentionally graph-first and domain-neutral: facts, intents,
  * hints, directives, links, events, subagent runs, workers, and workflow
@@ -15,7 +15,6 @@ export type ProjectId = string;
 export type FactId = string;
 export type IntentId = string;
 export type HintId = string;
-export type LinkId = string;
 export type DirectiveId = string;
 export type RunId = string;
 
@@ -56,7 +55,7 @@ export interface Project {
   updatedAt: ISOTime;
 }
 
-export type FactStatus = "candidate" | "accepted" | "rejected" | "blocked";
+export type FactStatus = "pending" | "pass" | "deny";
 
 export interface Fact {
   id: FactId;
@@ -73,14 +72,7 @@ export interface Fact {
   createdAt: ISOTime;
 }
 
-export type IntentStatus = "open" | "claimed" | "chained" | "done" | "failed";
-
-export interface ChainState {
-  reason: string;
-  subIntentIds: IntentId[];
-  waitMode: "all" | "any";
-  createdAt: ISOTime;
-}
+export type IntentStatus = "open" | "claimed" | "pass" | "deny";
 
 export interface Intent {
   id: IntentId;
@@ -90,7 +82,6 @@ export interface Intent {
   parentFactIds: FactId[];
   status: IntentStatus;
   parentIntentId?: IntentId;
-  chain?: ChainState;
   lease?: {
     workerId: string;
     claimedAt: ISOTime;
@@ -118,16 +109,6 @@ export interface Hint {
   expiresAt?: ISOTime;
 }
 
-export interface Link {
-  id: LinkId;
-  projectId: ProjectId;
-  fromFactId: FactId;
-  toFactId: FactId;
-  kind: string;
-  evidence: string[];
-  createdAt: ISOTime;
-}
-
 export interface GraphEvent {
   seq: number;
   projectId: ProjectId;
@@ -137,7 +118,7 @@ export interface GraphEvent {
 }
 
 export interface Verdict {
-  decision: "accept" | "reject" | "demote" | "block";
+  decision: "pass" | "deny" | "pending";
   reason: string;
   confidence?: number;
   requiredConditions?: string[];
@@ -145,28 +126,14 @@ export interface Verdict {
 
 export interface Progress {
   totalFacts: number;
-  acceptedFacts: number;
-  candidateFacts: number;
-  rejectedFacts: number;
-  blockedFacts: number;
+  passFacts: number;
+  pendingFacts: number;
+  denyFacts: number;
   openIntents: number;
   claimedIntents: number;
-  chainedIntents: number;
   stepsExecuted: number;
   lastActivityAt: ISOTime;
   stagnationLevel: number;
-}
-
-export interface ChainRequest {
-  reason: string;
-  subIntents: SubIntentSpec[];
-  waitMode: "all" | "any";
-}
-
-export interface SubIntentSpec {
-  description: string;
-  role?: RoleId;
-  priority?: number;
 }
 
 export type DirectiveKind = "stop" | "pause" | "resume" | "hint" | "kill-intent" | "spawn-intent";
@@ -212,6 +179,8 @@ export interface SubagentRun {
   errorMessage?: string;
   rotateOf?: RunId;
   usedDelta?: boolean;
+  /** True when the run's output came from a conclude-fallback retry. */
+  usedConclude?: boolean;
   inputTokens?: number;
   outputTokens?: number;
   createdAt: ISOTime;
@@ -276,6 +245,14 @@ export interface PromptSpec {
   rules?: string[];
   knowledge?: string[];
   instructions?: string;
+  /**
+   * Optional conclude-phase prompt file. When set, a profile enables conclude
+   * fallback: if the worker's first output fails to parse into a valid envelope,
+   * the worker is re-invoked (in the same session when the backend supports
+   * resume) with this prompt, which forces it to summarize already-confirmed
+   * findings into the required JSON shape. Modeled on Cairn's conclude phase.
+   */
+  concludeFile?: string;
 }
 
 /**
@@ -290,7 +267,7 @@ export interface ContextSpec {
   includeDeadEnds?: boolean;
   includeProgress?: boolean;
   rotateOnContextFull?: boolean;
-  relevanceScope?: "chain" | "all";
+  relevanceScope?: "linked" | "all";
 }
 
 /**
@@ -316,8 +293,7 @@ export type OutputContract =
   | "candidate_fact"
   | "verdict"
   | "hints"
-  | "stop"
-  | "chain";
+  | "stop";
 
 export interface OutputSpec {
   contract: OutputContract;
@@ -326,6 +302,11 @@ export interface OutputSpec {
 /**
  * A SubagentProfile fully describes one configurable subagent: runtime, prompt,
  * context policy, permissions, output contract, and concurrency bounds.
+ *
+ * Per-agent tuning knobs (no global "workflow" concept):
+ *   - maxActive: concurrent run cap for this profile.
+ *   - cooldownSteps: (planner) min steps between planner runs.
+ *   - triggers: (metacog) when the wall-clock metacog loop fires.
  */
 export interface SubagentProfile {
   role: RoleId;
@@ -336,9 +317,20 @@ export interface SubagentProfile {
   output: OutputSpec;
   maxActive?: number;
   intervalSeconds?: number;
+  /** Planner-only: min steps between planner runs (default 3). */
+  cooldownSteps?: number;
+  /** Metacog-only: when the metacog wall-clock loop fires. */
+  triggers?: MetacogTriggers;
   sessionReuse?: boolean;
   maxOutputTokens?: number;
   promptCache?: boolean;
+}
+
+/** Metacog firing triggers (per-metacog-profile, not global). */
+export interface MetacogTriggers {
+  everySteps?: number;
+  everySeconds?: number;
+  stagnationLevel?: number;
 }
 
 /**
@@ -362,7 +354,8 @@ export interface TaskConfig {
   };
   profiles: BuiltinProfiles & Record<string, SubagentProfile>;
   workers: Record<WorkerName, WorkerConfig>;
-  workflow: WorkflowConfig;
+  /** Scheduler resource knobs (optional; defaults suffice). Not a "workflow". */
+  scheduler?: SchedulerConfig;
   control?: ControlConfig;
 }
 
@@ -373,41 +366,32 @@ export interface ControlConfig {
   globalMaxConcurrent?: number;
 }
 
-export interface WorkflowConfig {
-  limits: {
-    maxSteps?: number;
-    maxConcurrent?: number;
-    refillPerTick?: number;
-    workerLeaseMs?: number;
-    maxStagnation?: number;
-    plannerCooldownSteps?: number;
-  };
-  metacog?: {
-    triggers: {
-      everySteps?: number;
-      everySeconds?: number;
-      stagnationLevel?: number;
-    };
-  };
-  stopGate?: {
-    requireNoOpenIntents?: boolean;
-    minFactConfidence?: number;
-  };
+/**
+ * Scheduler resource parameters — low-level execution knobs only
+ * (concurrency, refill rate, intent-claim lease). These are NOT a workflow:
+ * there is no depth limit, no stop gate, no forced termination. Termination is
+ * natural (planner produces no new intent) with metacog hints as the course-
+ * correction mechanism.
+ */
+export interface SchedulerConfig {
+  maxConcurrent?: number;
+  refillPerTick?: number;
+  workerLeaseMs?: number;
 }
 
-export const DEFAULT_LIMITS = {
-  maxSteps: 1000,
+/** Default scheduler values (used when TaskConfig.scheduler is absent). */
+export const DEFAULT_SCHEDULER = {
   maxConcurrent: 3,
   refillPerTick: 1,
   workerLeaseMs: 300_000,
-  maxStagnation: 8,
 } as const;
 
-export const DEFAULT_METACOG_TRIGGERS = {
+/** Default metacog triggers (used when the metacog profile omits `triggers`). */
+export const DEFAULT_METACOG_TRIGGERS: MetacogTriggers = {
   everySteps: 5,
-  everySeconds: 60,
+  everySeconds: 30,
   stagnationLevel: 3,
-} as const;
+};
 
 /**
  * Permission sets for the built-in roles. Custom profiles declare their own.
