@@ -4,7 +4,7 @@ import { TestGraph } from "./test-graph.ts";
 import { SqliteGraph } from "../dist/graph/sqlite-graph.js";
 import { MockWorker } from "../dist/worker/mock-worker.js";
 import { SessionLoop } from "../dist/session/session-loop.js";
-import { minimalConfig, createProject, env } from "./helper.ts";
+import { agentRecords, minimalConfig, createProject, env } from "./helper.ts";
 
 function decisions(createIntents: unknown[] = []) {
   return env("decisions", { createIntents, failIntents: [], consumeHints: [], concludeRun: null });
@@ -24,7 +24,7 @@ test("dispatch: an open Intent without planner dispatch request does not start a
   await loop.step(p.id);
 
   assert.equal(graph.getIntent(p.id, intent.id)!.status, "open");
-  assert.equal(graph.subagentRuns(p.id).length, 0);
+  assert.equal((await agentRecords(p)).length, 0);
 });
 
 test("session cardinality: SessionLoop rejects multiple tasks in one session-local Graph", () => {
@@ -153,36 +153,24 @@ test("liveness: repeated evaluator failures fail explicitly and keep the candida
   assert.equal(graph.events(p.id).filter((e) => e.type === "evaluator.error").length, 3);
 });
 
-test("recovery: another runtime preserves an unexpired persisted owner", () => {
+test("recovery: another runtime preserves an unexpired claimed Intent", () => {
   const graph = new TestGraph();
   const p = createProject(graph);
   const intent = graph.addIntent(p.id, { description: "orphan", creator: "planner" });
   graph.claimIntent(p.id, intent.id, "old-worker", 300_000);
-  const run = graph.createSubagentRun(p.id, {
-    profileId: "explorer", role: "explorer", workerName: "mock", intentId: intent.id,
-  });
-  graph.claimSubagentRun(p.id, run.id, "old-runner", 300_000);
-
   new SessionLoop(graph, new MockWorker(), minimalConfig());
 
-  assert.equal(graph.getSubagentRun(p.id, run.id)!.status, "running");
   assert.equal(graph.getIntent(p.id, intent.id)!.status, "claimed");
   graph.close();
 });
 
-test("recovery: an expired persisted owner is swept and requeued", () => {
+test("recovery: an expired Intent claim is swept and requeued", () => {
   const graph = new TestGraph();
   const p = createProject(graph);
   const intent = graph.addIntent(p.id, { description: "expired", creator: "planner" });
   graph.claimIntent(p.id, intent.id, "old-worker", -1);
-  const run = graph.createSubagentRun(p.id, {
-    profileId: "explorer", role: "explorer", workerName: "mock", intentId: intent.id,
-  });
-  graph.claimSubagentRun(p.id, run.id, "old-runner", -1);
-
   new SessionLoop(graph, new MockWorker(), minimalConfig());
 
-  assert.equal(graph.getSubagentRun(p.id, run.id)!.status, "pending");
   assert.equal(graph.getIntent(p.id, intent.id)!.status, "open");
   graph.close();
 });
@@ -191,17 +179,13 @@ test("fencing: a late explorer cannot commit after its intent was re-leased", ()
   const graph = new TestGraph();
   const p = createProject(graph);
   const intent = graph.addIntent(p.id, { description: "fenced", creator: "planner" });
-  const run = graph.createSubagentRun(p.id, {
-    profileId: "explorer", role: "explorer", workerName: "mock", intentId: intent.id,
-  });
-  graph.updateSubagentRun(p.id, run.id, { status: "running" });
   const first = graph.claimIntent(p.id, intent.id, "worker-1", 300_000);
   const firstClaim = { workerId: "worker-1", epoch: first.leaseEpoch };
   graph.releaseIntent(p.id, intent.id, firstClaim);
   const second = graph.claimIntent(p.id, intent.id, "worker-2", 300_000);
 
   assert.ok(second.leaseEpoch > firstClaim.epoch);
-  assert.throws(() => graph.commitExplorerResult(p.id, intent.id, run.id, {
+  assert.throws(() => graph.commitExplorerResult(p.id, intent.id, {
     description: "late result",
     source: "explorer",
   }, firstClaim), /stale or expired intent lease/);
@@ -228,5 +212,5 @@ test("cancellation: stop interrupts an in-flight planner and returns stopped", a
 
   assert.equal(result.type, "stopped");
   assert.equal(graph.getProject(p.id)!.status, "stopped");
-  assert.equal(graph.subagentRuns(p.id)[0]?.status, "cancelled");
+  assert.equal((await agentRecords(p))[0]?.status, "cancelled");
 });

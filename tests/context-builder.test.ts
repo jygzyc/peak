@@ -171,12 +171,11 @@ test("context-builder: snapshot and artifact are deterministic and auditable", a
   assert.equal(first.contentHash, second.contentHash);
   assert.equal(first.graphSeq, second.graphSeq);
 
-  const artifact = await materializeGraphContext(p.sessionDir, "run_context_1", first);
+  const artifact = await materializeGraphContext(p.sessionDir, "agent_context_1", first);
   const stored = JSON.parse(readFileSync(artifact.resolvedPath, "utf8"));
   assert.deepEqual(stored, first);
   assert.notEqual(artifact.sha256, first.contentHash);
-  assert.match(artifact.relativePath, /graph-context-\d+-[a-f0-9]{64}\.json$/);
-  assert.match(artifact.relativePath, /^artifacts\/prompts\/run_context_1\//);
+  assert.equal(artifact.relativePath, "agents/agent_context_1/context.json");
 
   const injected = renderGraphContextArtifact(first, artifact);
   assert.match(injected, /Read the referenced JSON file/);
@@ -184,6 +183,6 @@ test("context-builder: snapshot and artifact are deterministic and auditable", a
   assert.doesNotMatch(injected, /artifact fact/);
   await assert.rejects(
     materializeGraphContext(p.sessionDir, "../escape", first),
-    /invalid run id/,
+    /invalid agent id/,
   );
 });

@@ -4,15 +4,15 @@
 
 // Core types
 export type {
-  ProjectId, FactId, IntentId, HintId, DirectiveId, RunId, EndFactId,
+  ProjectId, FactId, IntentId, HintId, DirectiveId, AgentId, EndFactId,
   SessionRole, RoleId, ISOTime,
   Project, ProjectStatus, Fact, FactStatus, EndFact, Intent, IntentStatus,
   Hint, HintKind, GraphEvent, Verdict, Progress,
   Directive, DirectiveInput, DirectiveKind,
-  SubagentRun, SubagentRunInput, RunStatus,
+  AgentRecord, AgentRecordStatus,
   WorkerName, WorkerKind, WorkerConfig, TaskConfig,
   SubagentProfile, RuntimeSpec, PromptSpec, ContextSpec, GraphView,
-  PromptComponentKind, PromptManifestComponent, PromptManifest, ContextArtifact,
+  PromptComponentKind, PromptManifestComponent, PromptManifest, ContextArtifact, RoleOutputArtifact,
   Permission, OutputContract, OutputSpec,
   BuiltinProfiles, ControlConfig,
   SchedulerConfig, MetacogTriggers, FederationConfig, BroadcastAssessment,
@@ -26,7 +26,7 @@ export type {
   FederationOutboxKind, FederationOutboxInput, FederationOutboxItem,
   MetacogCommitInput,
 } from "./graph/graph.js";
-export { routeHash, now, newProjectId, newRunId } from "./graph/graph.js";
+export { routeHash, now, newProjectId } from "./graph/graph.js";
 
 // Graph implementations
 export { SqliteGraph } from "./graph/sqlite-graph.js";
@@ -98,10 +98,11 @@ export type {
 export { buildDynamicContext, ServerSessionGraphReader } from "./server/session-graph-reader.js";
 export type { BuildContextOptions } from "./server/session-graph-reader.js";
 export { GlobalResourceGovernor } from "./worker/resource-governor.js";
-export {
-  runSubagent, runSubagentWithText,
-} from "./agent/subagent-runner.js";
-export type { SubagentRunRequest, SubagentOutput, SubagentRunWithTextResult } from "./agent/subagent-runner.js";
+export { BaseAgent, selectProfileWorker } from "./agent/base-agent.js";
+export type { BaseAgentContext, BaseAgentRunInput, BaseAgentResult, AgentOutput } from "./agent/base-agent.js";
+export { ExplorerAgent, EvaluatorAgent, MetacogAgent } from "./agent/role-agents.js";
+export { AgentRecordStore, newAgentId } from "./agent/agent-record-store.js";
+export type { CreateAgentRecordInput, AgentRecordPatch } from "./agent/agent-record-store.js";
 export { MainAgent } from "./agent/main-agent.js";
 export type { MainAgentContext, MainAgentRunInput, MainAgentResult } from "./agent/main-agent.js";
 export { applyMainDecision } from "./agent/decision-applier.js";

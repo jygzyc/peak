@@ -67,11 +67,6 @@ test("decision-applier: stopExplorer revokes the claim without denying the Inten
   const intent = graph.addIntent(p.id, { description: "running", creator: "planner" });
   const claimed = graph.claimIntent(p.id, intent.id, "worker", 300_000);
   const claimedEpoch = claimed.lease!.epoch;
-  const run = graph.createSubagentRun(p.id, {
-    profileId: "explorer", role: "explorer", workerName: "mock", intentId: intent.id,
-  });
-  graph.updateSubagentRun(p.id, run.id, { status: "running" });
-
   const result = applyMainDecision({
     projectId: p.id,
     graph,
@@ -85,7 +80,6 @@ test("decision-applier: stopExplorer revokes the claim without denying the Inten
   assert.equal(stopped.status, "open");
   assert.equal(stopped.dispatchRequested, false);
   assert.ok(stopped.leaseEpoch > claimedEpoch);
-  assert.equal(graph.getSubagentRun(p.id, run.id)!.status, "cancelled");
 });
 
 test("decision-applier: failing a claimed Intent also requires stop_subagent_explorer", () => {

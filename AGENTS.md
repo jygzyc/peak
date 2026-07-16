@@ -22,14 +22,15 @@ SessionLoop(session)
   -> owns the session-local Graph
   -> owns the session-local MainAgent / Planner
   -> owns the session-local MetacogSupervisor
-  -> creates / cancels session-local SubagentRuns
+  -> controls active role executions in memory
+  -> writes role audit JSON under sessions/<session>/agents
   -> writes back to the session Graph via permission-checked DecisionApplier
 
 SubagentProfile
   = runtime + prompt + context policy + permissions + output contract + maxActive
 
 Graph
-  = single source of truth per session: Fact / Intent / Hint / Directive / Link / Event / SubagentRun
+  = persistent analysis truth per session: Fact / Intent / Hint / Directive / Link / Event
 ```
 
 Core principles:
@@ -38,7 +39,7 @@ Core principles:
 2. Roles, prompts, models, workers, permissions, and context policies come from configuration.
 3. The Graph is the single session-local source of truth.
 4. Main loop is easy to find: `session/session-loop.ts` (per-session) and `session/supervisor.ts` (global).
-5. Explorer / Evaluator / Metacog are trackable, cancellable, configurable SubagentRuns.
+5. Explorer / Evaluator / Metacog extend BaseAgent; live cancellation and concurrency are runtime state, while completed invocation audits are JSON files outside Graph.
 6. Each active session has its own MainAgent/Planner and Metacog; the global layer only supervises.
 7. Session-internal sync goes through Graph/events; cross-session insight goes through FederationBus (read-only summary + refs, never cross-session graph writes).
 
@@ -53,7 +54,7 @@ src/
 ├── session/   # SessionLoop, GlobalSupervisor, MetacogSupervisor, SessionCoordinator, SessionManager
 ├── agent/     # MainAgent, DecisionApplier, contracts, permissions, context-builder, graph-view,
 │              # parse-envelope, prompts/builtins, and role implementations
-├── graph/     # Graph interface, SQLite/InMemory stores, FederatedGraph, FederationBus
+├── graph/     # Graph interface, persistent SQLite store, FederatedGraph, FederationBus
 ├── worker/    # worker runtime, drivers, backends, providers, mock worker
 ├── server/    # HTTP API and embedded dashboard
 ├── cli.ts     # CLI entrypoint
@@ -90,7 +91,7 @@ All persistent state lives under one root (`PEAK_HOME` env overrides; default `~
 ├── config.json          global baseline (default workers/control) — optional
 ├── agents/<name>.json   reusable role configs injected into builtin slots
 ├── tasks/<name>.json    task configs (target/goal/session + agent refs + workers)
-├── sessions/<session>/  per-session execution state (analysis.db)
+├── sessions/<session>/  analysis.db plus agents/<agentId> JSON audit records
 └── providers.json       model provider configs
 ```
 
@@ -105,14 +106,15 @@ All persistent state lives under one root (`PEAK_HOME` env overrides; default `~
 Graph state is session-local and is the source of truth:
 
 - Projects
-- Facts (`pending` -> `pass` / `deny`)
+- Facts (`candidate` -> `pass` / `deny` / `pending`)
 - Intents (`open` -> `claimed` -> `pass` / `deny`)
 - Hints
 - Directives
 - Links
 - Events
-- SubagentRuns (`pending` -> `running` -> `completed` / `failed` / `cancelled`)
 - Dead-end route hashes
+
+Role invocation state is intentionally not part of Graph. Active controllers, cancellation, and concurrency live in the runtime; `agents/<agentId>/record.json` records the invocation after the fact.
 
 Do not introduce domain-specific fact enums. Keep domain meaning in descriptions, evidence, prompts, and references.
 

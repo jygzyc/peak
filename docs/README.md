@@ -1,6 +1,6 @@
 # peak 代码审计文档
 
-> 当前基线：2026-07-16。本文描述当前工作树；各分册中的历史缺陷若与本文或 [修改计划](./12-cairn-inspired-generic-graph-agent-plan.md) 冲突，以本文和计划的滚动进度账本为准。
+> 当前基线：2026-07-16。本文描述当前工作树；目标以 [target.md](./target.md) 为准。
 
 ## 阅读入口
 
@@ -8,7 +8,7 @@
 |---|---|
 | [target.md](./target.md) | 目标状态：GlobalSupervisor、每 session 四角色、图状态与 TaskGroup 结束条件 |
 | [11-session-timing-federation-and-prompts.md](./11-session-timing-federation-and-prompts.md) | session 时序、角色协同、跨 session、恢复与 prompt 注入专题审计 |
-| [12-cairn-inspired-generic-graph-agent-plan.md](./12-cairn-inspired-generic-graph-agent-plan.md) | 参考 Cairn 的取舍、当前实现账本与后续修改顺序 |
+| [12-cairn-inspired-generic-graph-agent-plan.md](./12-cairn-inspired-generic-graph-agent-plan.md) | 已归档设计计划与当前边界 |
 | [02-app.md](./02-app.md) | 组合根、资源所有权与关闭顺序 |
 | [03-agent.md](./03-agent.md) | 类型、输出合同、权限、context 与 prompt 注入 |
 | [04-session.md](./04-session.md) | SessionLoop、Metacog、GlobalSupervisor 与持久协调状态 |
@@ -29,14 +29,14 @@ SessionRuntimeFactory
        ├─ one Graph / one Project
        ├─ one SessionLoop / planner controller
        ├─ one MetacogSupervisor
-       └─ short-lived Explorer/Evaluator SubagentRuns
+       └─ BaseAgent roles + in-memory execution control
 ```
 
-- Graph 是 session 内唯一真相源；角色状态、lease、事件游标、单次 Run 的 worker session id 与 outbox 都持久化。
+- Graph 是 session 内分析真相源；只持久化 Fact/Intent 等语义状态、事件游标与 outbox。单次 Agent 调用不进入 Graph。
 - Intent 是由 `intent_sets` 记录有序输入 Fact 集合的有向超边；Fact 状态为 `candidate/pass/deny/pending`。
 - planner 显式创建 Intent 并决定是否派发 Explorer；Evaluator 是 candidate Fact 和跨 session broadcast 的验证门；Metacog 在 Fact 接受和最终审查时纠偏并通过 outbox 广播。
 - 未显式配置 `federation.scope` 的 session 默认使用自身 session id，互不组成 TaskGroup；只有相同 scope 的关联 session 共享完成屏障。
-- 角色 prompt 固定经过 `ServerSessionGraphReader → GraphContextSnapshot JSON → PromptBuilder(file reference) → output JSON`；角色不持有数据库对象，Run 保存输入/输出 artifact 与 prompt hash。
+- 角色 prompt 固定经过 `ServerSessionGraphReader → agents/<agentId>/context.json → PromptBuilder(file reference) → output.json`；角色不持有数据库对象，`record.json` 保存调用审计。
 
 ## 本轮审计已修复
 
@@ -46,13 +46,14 @@ SessionRuntimeFactory
 4. Federation 注册由 SessionLoop 记录唯一 binding，重复注册幂等；Metacog 不再直接注册 bus；GlobalSupervisor 注册失败会回滚 membership。
 5. standalone federation runtime 使用稳定 supervisor，不再在每次 `run()` 临时注册且遗留幽灵 session。
 6. broadcast evaluator 重复失败达到 profile retry 上限后显式失败 session，避免 delivery 永久 `failed → retry` 的活锁。
-7. 删除跨 Run worker session reuse、delta ContextCheckpoint、ContextLedger、WorkerSessionManager 和 fact tiering；每次角色调用只使用可独立审计的完整 snapshot artifact。
+7. 删除跨调用 worker session reuse、delta ContextCheckpoint、ContextLedger、WorkerSessionManager 和 fact tiering；每次角色调用只使用可独立审计的完整 snapshot artifact。
 8. 删除第一版不使用的配置/协议面：`workflow`、`federation.group/enabled`、`control.metacogIntervalSeconds`、`CONTRACTS` 注册表、`NullWorkerPool`、`expectedPayload`、`supportsConclude`、`partialOutput` 和 `app/version.ts`。
 9. WorkerRequest 现在要求 `workerName + role + projectId + cwd`，不再把缺失角色默认为 explorer；全局并发只接受正整数或 `Infinity`。
 10. Graph/Federation SQLite 仅接受各自 `application_id + user_version=1` 的第一版正式 schema，不包含迁移、回填、双写或旧路由兼容。
 11. supervisor 模式的 idle `run()` 由 runtime close signal 中断，关闭后所有启动/执行入口快速失败。
 12. 持久 AgentRuntime 必须在构造前绑定唯一 session，拒绝 task/options 身份冲突，避免 Project 与 DB 目录分裂。
 13. agent/task 名称拒绝路径成分，不能逃出 `PEAK_HOME`；providers 配置损坏或字段非法时 fail-fast。
+14. 删除 Graph 中的 SubagentRun 表、lease、heartbeat 与 CRUD；运行控制留在内存，BaseAgent 审计写到 session `agents/` JSON。
 
 ## 仍需优先处理
 
@@ -64,7 +65,7 @@ SessionRuntimeFactory
 
 ## 验证基线
 
-- 源码：61 个 TypeScript 文件，45 个 `*.test.ts` 文件。
+- 源码与测试数量以当前工作树为准。
 - `npm run typecheck`、`npm test`、`npm run smoke`、`npm run pack` 是交付门槛。
-- 当前结果：393/393 测试通过；npm 包 SHA-256 为 `4b05d56074c87a88118939b93863f8db1be838249fa4aec5c13efd7ceedae549`。
+- 当前结果：355/355 测试通过；npm 包 SHA-256 为 `763888569d8e571dd081e049bf7dbaa2c7710142ca4fae2c4b9075b347cb5d7d`。
 - 本轮完整自动测试基线将在计划第 1.2 节持续更新；测试通过不能替代上述故障注入和跨平台证据。

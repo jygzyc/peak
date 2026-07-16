@@ -394,49 +394,6 @@
     }
     #node-detail .nd-close:hover { color: var(--text); }
 
-    /* ─── Run rows ─── */
-    .run-row {
-      background: var(--bg-elevated);
-      border: 1px solid var(--border-soft);
-      border-radius: var(--radius-sm);
-      padding: 9px 13px;
-      margin-bottom: 5px;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      font-size: 13px;
-      box-shadow: var(--shadow);
-      transition: border-color 0.12s, transform 0.12s;
-    }
-    .run-row:hover { border-color: var(--border); }
-    .run-row.status-running {
-      border-left: 3px solid var(--green);
-      background: linear-gradient(90deg, var(--green-soft) 0%, var(--bg-elevated) 8%);
-    }
-    .run-row.status-pending { border-left: 3px solid var(--yellow); opacity: 0.85; }
-    .run-row.status-completed { border-left: 3px solid var(--text-faint); opacity: 0.7; }
-    .run-row.status-failed { border-left: 3px solid var(--red); }
-    .run-row.status-cancelled { border-left: 3px solid var(--text-faint); opacity: 0.55; }
-    .run-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-    .run-dot.running { background: var(--green); animation: pulse-dot 1.2s infinite; }
-    .run-dot.pending { background: var(--yellow); }
-    .run-dot.completed { background: var(--text-faint); }
-    .run-dot.failed { background: var(--red); }
-    .run-dot.cancelled { background: var(--text-faint); }
-    @keyframes pulse-dot { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
-    .run-profile {
-      font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.3px;
-      padding: 2px 7px; border-radius: 5px; flex-shrink: 0;
-    }
-    .run-profile.explorer { background: var(--accent-soft); color: var(--accent); }
-    .run-profile.evaluator { background: var(--purple-soft); color: var(--purple); }
-    .run-profile.metacog { background: var(--yellow-soft); color: var(--yellow); }
-    .run-profile.planner { background: var(--bg-soft); color: var(--text-dim); }
-    .run-id { font-family: 'SF Mono', 'Fira Code', ui-monospace, monospace; font-size: 12px; color: var(--text-dim); }
-    .run-ref { color: var(--text-faint); font-size: 12px; font-family: 'SF Mono', 'Fira Code', ui-monospace, monospace; }
-    .run-summary { color: var(--text-dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
-    .run-dur { font-size: 11px; color: var(--text-faint); font-family: 'SF Mono', 'Fira Code', ui-monospace, monospace; flex-shrink: 0; }
-
     /* ─── Fact / Intent / Hint cards ─── */
     .fact-card, .intent-card, .hint-card {
       background: var(--bg-elevated);
@@ -567,15 +524,12 @@
         <div class="concurrency-meter" id="concurrency-meter" style="display:none;">
           <div class="meter-icon"><div class="dot-pulse"></div></div>
           <div class="meter-body">
-            <div class="meter-label">Live Agents · Concurrent Explorers</div>
+            <div class="meter-label">Claimed Intents · Concurrent Explorers</div>
             <div class="meter-value"><span id="conc-running">0</span><span class="sep"> / </span><span id="conc-max">10</span> active</div>
             <div class="meter-bar"><div class="meter-bar-fill" id="conc-fill" style="width:0%"></div></div>
           </div>
         </div>
         <div class="progress-bar" id="progress-bar"></div>
-
-        <div class="section-title">Live Agents <span class="count" id="run-count">0</span></div>
-        <div id="run-list"></div>
 
         <div class="view-toggle">
           <button id="btn-graph" class="active" onclick="setViewMode('graph')"><span class="vicon">isia</span> Graph</button>
@@ -648,7 +602,6 @@
   <script>
     let currentSession = null;
     let detailTimer = null;
-    let runStartTime = {};  // runId -> ms, for live duration ticking
     let viewMode = 'graph';
     // graph state
     let lastGraphData = null;   // {facts, intents}
@@ -718,47 +671,15 @@
         '<span class="progress-item"><span class="label">open</span><strong>' + pr.openIntents + '</strong></span>' +
         '<span class="progress-item"><span class="label">stagnation</span><strong>' + pr.stagnationLevel + '</strong></span>';
 
-      // ─── Runs / live execution panel ───
-      var runs = data.runs || [];
-      var now = Date.now();
-      for (var r of runs) {
-        if (r.status === 'running' && r.startedAt && !runStartTime[r.id]) {
-          runStartTime[r.id] = new Date(r.startedAt).getTime();
-        }
-        if (r.status !== 'running') delete runStartTime[r.id];
-      }
-      var running = runs.filter(function(r){ return r.status === 'running'; });
-      var explorerRunning = running.filter(function(r){ return r.role === 'explorer'; }).length;
+      // ─── Claimed Intent concurrency ───
+      var explorerRunning = data.intents.filter(function(intent){ return intent.status === 'claimed'; }).length;
       var maxConc = (data.project.taskConfig && data.project.taskConfig.scheduler && data.project.taskConfig.scheduler.maxConcurrent) || 10;
 
       var meter = document.getElementById('concurrency-meter');
-      meter.style.display = runs.length > 0 ? '' : 'none';
+      meter.style.display = '';
       document.getElementById('conc-running').textContent = explorerRunning;
       document.getElementById('conc-max').textContent = maxConc;
       document.getElementById('conc-fill').style.width = Math.min(100, (explorerRunning / maxConc) * 100) + '%';
-
-      var order = { running: 0, pending: 1, completed: 2, failed: 3, cancelled: 4 };
-      runs.sort(function(a,b){ return (order[a.status] ?? 9) - (order[b.status] ?? 9); });
-      var shownRuns = runs.slice(0, 30);
-      document.getElementById('run-count').textContent = running.length + ' running · ' + runs.length + ' total';
-      var runList = document.getElementById('run-list');
-      runList.innerHTML = shownRuns.length === 0 ? '<div class="empty">No agent runs yet</div>' : '';
-      for (var r of shownRuns) {
-        var row = document.createElement('div');
-        row.className = 'run-row status-' + safeClass(r.status);
-        var dur = r.status === 'running' ? fmtDur(now - (runStartTime[r.id] || now))
-                : (r.finishedAt && r.startedAt ? fmtDur(new Date(r.finishedAt) - new Date(r.startedAt)) : '');
-        var ref = r.intentId ? ('→ ' + r.intentId) : (r.factId ? ('→ ' + r.factId) : '');
-        var summary = r.inputSummary ? esc(truncate(r.inputSummary, 70)) : '';
-        row.innerHTML =
-          '<div class="run-dot ' + safeClass(r.status) + '"></div>' +
-          '<span class="run-profile ' + safeClass(r.profileId) + '">' + esc(r.profileId) + '</span>' +
-          '<span class="run-id">' + esc(r.id) + '</span>' +
-          (ref ? '<span class="run-ref">' + esc(ref) + '</span>' : '') +
-          '<span class="run-summary">' + summary + '</span>' +
-          '<span class="run-dur">' + dur + '</span>';
-        runList.appendChild(row);
-      }
 
       // ─── Facts / Intents (list view) ───
       document.getElementById('fact-count').textContent = data.facts.length;
@@ -1144,14 +1065,6 @@
     }
     function safeClass(s) { return String(s == null ? '' : s).replace(/[^a-zA-Z0-9_-]/g, '_'); }
     function truncate(s, n) { return s.length > n ? s.slice(0, n - 1) + '…' : s; }
-    function fmtDur(ms) {
-      if (ms < 0) ms = 0;
-      var s = Math.floor(ms / 1000);
-      if (s < 60) return s + 's';
-      var m = Math.floor(s / 60);
-      return m + 'm' + (s % 60) + 's';
-    }
-
     loadProjects();
     setInterval(loadProjects, 5000);
   </script>

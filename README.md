@@ -210,7 +210,7 @@ A fully self-contained task that customizes all roles with inline domain knowled
 **Key points:**
 
 - `prompt.file` may point at a compiled role prompt (`builtin:planner`, `builtin:explorer`, `builtin:evaluator`, or `builtin:metacog`) or an external file. Domain behavior belongs in `knowledge`, `rules`, `skills`, and `instructions`.
-- Roles never receive a Graph/SQLite handle. The server writes a role-scoped graph snapshot JSON, the prompt references that file, and the validated role response is persisted as `artifacts/roles/<runId>/output.json` before any permission-checked Graph commit.
+- Roles never receive a Graph/SQLite handle. The server writes a role-scoped graph snapshot to `sessions/<session>/agents/<agentId>/context.json`; the validated response is written to `output.json` before any permission-checked Graph commit. `record.json` is audit data, not Graph state.
 - Session Graphs and the FederationBus are always on-disk SQLite databases; there is no in-memory or temporary database mode.
 - Swapping backends is the **only** change needed to move a task between agent runtimes — edit `workers` and each profile's `runtime.worker`.
 - Omit any role from `profiles` to keep the builtin default for it. Omit `profiles` entirely for a minimal task.

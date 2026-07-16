@@ -2,7 +2,7 @@
  * Context builder — assembles the dynamic prompt context for a subagent.
  *
  * Given a SubagentProfile's ContextSpec and the current graph state, produces
- * a rendered graph-view section. The caller (SubagentRunner / Stage) prepends
+ * a rendered graph-view section. BaseAgent prepends
  * the profile's static role preamble (loaded by PromptLoader) before this
  * dynamic section.
  *
@@ -16,7 +16,7 @@ import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { relative, resolve, sep } from "node:path";
 import type {
   ContextArtifact, ContextSpec, Fact, GraphView, Hint, Intent, Verdict, ProjectId,
-  RoleId, RoleOutputArtifact, RunId,
+  AgentId, RoleId, RoleOutputArtifact,
 } from "./types.js";
 
 export interface GraphSnapshotRequest {
@@ -86,19 +86,19 @@ export function createGraphContextSnapshot(input: Omit<GraphContextSnapshot, "ve
  * immutable and derived; Graph remains the source of truth. */
 export async function materializeGraphContext(
   sessionDir: string,
-  runId: string,
+  agentId: AgentId,
   snapshot: GraphContextSnapshot,
   delivery: ContextArtifact["delivery"] = "reference",
 ): Promise<ContextArtifact> {
-  if (!/^[A-Za-z0-9_.-]+$/.test(runId)) throw new Error(`invalid run id for context artifact: ${runId}`);
+  if (!/^[A-Za-z0-9_.-]+$/.test(agentId)) throw new Error(`invalid agent id for context artifact: ${agentId}`);
   const root = resolve(sessionDir);
-  const artifactDir = resolve(root, "artifacts", "prompts", runId);
+  const artifactDir = resolve(root, "agents", agentId);
   assertWithin(root, artifactDir);
   await mkdir(artifactDir, { recursive: true });
 
   const artifactPath = resolve(
     artifactDir,
-    `graph-context-${snapshot.graphSeq}-${snapshot.contentHash}.json`,
+    "context.json",
   );
   assertWithin(root, artifactPath);
   const expected = Buffer.from(`${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
@@ -144,13 +144,13 @@ export async function materializeRoleOutput(
   sessionDir: string,
   sessionId: string,
   projectId: ProjectId,
-  runId: RunId,
+  agentId: AgentId,
   role: RoleId,
   output: unknown,
 ): Promise<RoleOutputArtifact> {
-  if (!/^[A-Za-z0-9_.-]+$/.test(runId)) throw new Error(`invalid run id for output artifact: ${runId}`);
+  if (!/^[A-Za-z0-9_.-]+$/.test(agentId)) throw new Error(`invalid agent id for output artifact: ${agentId}`);
   const root = resolve(sessionDir);
-  const artifactDir = resolve(root, "artifacts", "roles", runId);
+  const artifactDir = resolve(root, "agents", agentId);
   assertWithin(root, artifactDir);
   await mkdir(artifactDir, { recursive: true });
   const artifactPath = resolve(artifactDir, "output.json");
@@ -163,7 +163,7 @@ export async function materializeRoleOutput(
     version: 1,
     sessionId,
     projectId,
-    runId,
+    agentId,
     role,
     relativePath: relative(root, artifactPath).split(sep).join("/"),
     resolvedPath: artifactPath,

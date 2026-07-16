@@ -6,7 +6,7 @@ import { TestFederationBus, TestGraph } from "./test-graph.ts";
 import { FederationBus } from "../dist/graph/federation-bus.js";
 import { GlobalSupervisor } from "../dist/session/supervisor.js";
 import { MockWorker } from "../dist/worker/mock-worker.js";
-import { env } from "./helper.ts";
+import { agentRecords, env } from "./helper.ts";
 import {
   attachScenario,
   createScenarioProject,
@@ -91,9 +91,9 @@ test("acceptance scenario 1: one App is analyzed end-to-end in one session", asy
     const combined = graph.intents(project.id).find((intent) => /SINGLE-COMBINE/i.test(intent.description));
     assert.deepEqual(combined?.parentFactIds.length, 2);
     assert.ok(graph.activeEndFact(project.id));
-    assert.ok(graph.subagentRuns(project.id)
-      .filter((run) => run.role === "planner" || run.role === "explorer")
-      .every((run) => run.promptManifest?.components.some((component) => component.kind === "skill")));
+    assert.ok((await agentRecords(project))
+      .filter((record) => record.role === "planner" || record.role === "explorer")
+      .every((record) => record.promptManifest?.components.some((component) => component.kind === "skill")));
     assert.equal(bus.hasPendingDeliveries(scope), false);
     assert.equal(bus.allCursorsAtHead(scope), true);
   } finally {

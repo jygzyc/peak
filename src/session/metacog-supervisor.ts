@@ -1,22 +1,20 @@
 /**
  * Wall-clock metacognition loop.
  *
- * Runs the metacog profile via SubagentRunner, independently of the main
- * SessionLoop step cadence. Tracks active SubagentRuns and honors maxActive
- * to prevent over-spawning.
+ * Runs the metacog BaseAgent independently of the main SessionLoop cadence.
+ * Live control is in memory; execution audit is written as session JSON.
  */
 
 import type { Fact, ProjectId, TaskConfig } from "../agent/types.js";
 import { DEFAULT_METACOG_TRIGGERS } from "../agent/types.js";
 import type { Graph } from "../graph/graph.js";
 import type { WorkerPool } from "../worker/worker-runtime.js";
-import { runSubagent, selectProfileWorker } from "../agent/subagent-runner.js";
+import { selectProfileWorker } from "../agent/base-agent.js";
+import { MetacogAgent } from "../agent/role-agents.js";
 import { metacogExtra } from "../agent/prompt-builder.js";
 import { PromptLoader } from "../config/prompt-loader.js";
 import { PermissionChecker } from "../agent/permissions.js";
 import type { FederationOutboxInput } from "../graph/graph.js";
-import { randomUUID } from "node:crypto";
-import { DEFAULT_SCHEDULER } from "../agent/types.js";
 import type { GlobalResourceGovernor } from "../worker/resource-governor.js";
 import type { SessionGraphReader } from "../agent/context-builder.js";
 import { ServerSessionGraphReader } from "../server/session-graph-reader.js";
@@ -34,10 +32,8 @@ export class MetacogSupervisor {
   private readonly promptLoader: PromptLoader;
   private readonly activeControllers = new Map<ProjectId, {
     controller: AbortController;
-    heartbeatTimer: ReturnType<typeof setInterval>;
   }>();
   private readonly inFlightProjects = new Map<ProjectId, Promise<boolean>>();
-  private readonly coordinatorId = `metacog:${process.pid}:${randomUUID()}`;
   private resourceGovernor?: GlobalResourceGovernor;
   private federation?: { sessionId: string; scope: string };
 
@@ -99,7 +95,6 @@ export class MetacogSupervisor {
     }
     for (const active of this.activeControllers.values()) {
       active.controller.abort(new Error("metacog supervisor stopped"));
-      clearInterval(active.heartbeatTimer);
     }
   }
 
@@ -133,9 +128,7 @@ export class MetacogSupervisor {
     }
   }
 
-  /** Run metacog once per project. Concurrent timer/SessionLoop calls share the
-   * same promise; persistent dispatchKey + Run claim provide cross-process
-   * exclusion, so no project mutex is held while the worker performs I/O. */
+  /** Concurrent timer/SessionLoop calls for one project share the same promise. */
   async runForProject(projectId: ProjectId, scheduled = false): Promise<boolean> {
     if (this.closed) throw new Error("MetacogSupervisor is closed");
     const existing = this.inFlightProjects.get(projectId);
@@ -164,8 +157,11 @@ export class MetacogSupervisor {
       throw new Error(`metacog profile "${metacogProfileId}" must bind role metacog`);
     }
 
-    const completedRuns = this.graph.subagentRuns(projectId, { profileId: metacogProfileId, status: "completed" });
-    const reviewedFactIds = new Set(completedRuns.map((run) => run.factId).filter(Boolean));
+    const metacogEvents = this.graph.events(projectId)
+      .filter((event) => event.type === "metacog.completed" || event.type === "metacog.fact_reviewed");
+    const reviewedFactIds = new Set(metacogEvents
+      .map((event) => typeof event.payload.factId === "string" ? event.payload.factId : undefined)
+      .filter((factId): factId is string => Boolean(factId)));
     const factToReview = this.graph.facts(projectId, "pass")
       .find((fact) => !reviewedFactIds.has(fact.id));
     const finalReview = project.status === "finish_proposed";
@@ -186,62 +182,38 @@ export class MetacogSupervisor {
     const trigger = factToReview ? `fact.accepted:${factToReview.id}`
       : finalReview ? "final-review"
         : `scheduled:${progress.stepsExecuted}:${progress.stagnationLevel}`;
-    if (!factToReview && !finalReview && completedRuns.some((run) => run.inputSummary === trigger)) return false;
+    if (!factToReview && !finalReview && metacogEvents.some((event) => event.payload.trigger === trigger)) return false;
 
     const maxActive = profile.maxActive ?? 1;
-    const activeRuns = this.graph.subagentRuns(projectId, { profileId: metacogProfileId, status: "running" });
-    if (activeRuns.length >= maxActive) return false;
+    if (this.activeControllers.size >= maxActive) return false;
 
-    const run = this.graph.createSubagentRun(projectId, {
+    const workerName = selectProfileWorker(profile, projectId, this.workerPool, this.config);
+    const agent = new MetacogAgent({
       profileId: metacogProfileId,
-      role: profile.role,
-      workerName: selectProfileWorker(profile, projectId, this.workerPool, this.config),
-      factId: factToReview?.id,
-      inputSummary: trigger,
-      dispatchKey: `metacog:${trigger}`,
+      profile,
+      project,
+      workerPool: this.workerPool,
+      config: this.config,
+      promptLoader: this.promptLoader,
+      graphReader: this.graphReader,
     });
-    const leaseMs = this.config.scheduler?.workerLeaseMs ?? DEFAULT_SCHEDULER.workerLeaseMs;
-    const runClaim = this.graph.claimSubagentRun(
-      projectId,
-      run.id,
-      this.coordinatorId,
-      leaseMs,
-    );
-    if (!runClaim) return false;
     const controller = new AbortController();
-    const heartbeatTimer = setInterval(() => {
-      try {
-        this.graph.heartbeatSubagentRun(projectId, run.id, runClaim, leaseMs);
-      } catch (error) {
-        controller.abort(error instanceof Error
-          ? error
-          : new Error(`metacog lease lost: ${String(error)}`));
-      }
-    }, Math.max(5, Math.floor(leaseMs / 3)));
-    heartbeatTimer.unref?.();
-    this.activeControllers.set(projectId, { controller, heartbeatTimer });
+    this.activeControllers.set(projectId, { controller });
 
     try {
       const permissions = new PermissionChecker(profile);
       permissions.require("get_graph");
-      const output = await runSubagent({
-        profile,
-        profileId: metacogProfileId,
-        project,
-        workerPool: this.workerPool, config: this.config,
-        promptLoader: this.promptLoader,
-        graphReader: this.graphReader,
-        runId: run.id,
-        onRunUpdate: (patch) => this.graph.updateSubagentRun(projectId, run.id, patch, runClaim),
-        workerNameOverride: run.workerName,
+      const result = await agent.run({
+        workerName,
         signal: controller.signal,
+        inputSummary: trigger,
         promptExtra: metacogExtra(trigger),
       });
 
-      if (output.kind === "hints") {
+      if (result.output.kind === "hints") {
         permissions.require("create_hint");
         const finalReviewCompleted = finalReview && !factToReview
-          && output.hints.hints.length === 0
+          && result.output.hints.hints.length === 0
           && this.graph.getProject(projectId)?.status === "finish_proposed";
         const broadcast = this.buildOutboxItem(
           projectId,
@@ -249,54 +221,59 @@ export class MetacogSupervisor {
           finalReviewCompleted,
         );
         if (broadcast) permissions.require("send_fact_broadcast");
-        this.graph.commitMetacogResult(projectId, run.id, {
-          hints: output.hints.hints,
-          outputSummary: `${output.hints.hints.length} hints`,
+        this.graph.commitMetacogResult(projectId, {
+          hints: result.output.hints.hints,
+          outputSummary: `${result.output.hints.hints.length} hints`,
           reviewedFactId: factToReview?.id,
           broadcast,
           finalReviewCompleted,
-        }, runClaim);
-        return output.hints.hints.length > 0;
-      } else if (output.kind === "stop") {
+        });
+        await agent.updateRecord(result.agentId, {
+          status: "applied",
+          outputSummary: `${result.output.hints.hints.length} hints`,
+        });
+        this.graph.logEvent(projectId, "metacog.completed", {
+          agentId: result.agentId,
+          trigger,
+          factId: factToReview?.id,
+        });
+        return result.output.hints.hints.length > 0;
+      } else {
         permissions.require("create_hint");
         const hint = {
           creator: profile.role,
           kind: "warning" as const,
-          content: `Metacog recommends ending or redirecting the task: ${output.stop.reason}`,
+          content: `Metacog recommends ending or redirecting the task: ${result.output.stop.reason}`,
         };
         const broadcast = this.buildOutboxItem(projectId, factToReview, false);
         if (broadcast) permissions.require("send_fact_broadcast");
-        this.graph.commitMetacogResult(projectId, run.id, {
+        this.graph.commitMetacogResult(projectId, {
           hints: [hint],
-          outputSummary: `end recommendation: ${output.stop.reason}`,
+          outputSummary: `end recommendation: ${result.output.stop.reason}`,
           reviewedFactId: factToReview?.id,
           broadcast,
-        }, runClaim);
-        this.graph.logEvent(projectId, "metacog.end_recommendation", { reason: output.stop.reason });
+        });
+        await agent.updateRecord(result.agentId, {
+          status: "applied",
+          outputSummary: `end recommendation: ${result.output.stop.reason}`,
+        });
+        this.graph.logEvent(projectId, "metacog.completed", {
+          agentId: result.agentId,
+          trigger,
+          factId: factToReview?.id,
+        });
+        this.graph.logEvent(projectId, "metacog.end_recommendation", { reason: result.output.stop.reason });
         return true;
-      } else {
-        this.graph.updateSubagentRun(projectId, run.id, {
-          status: "completed",
-          outputSummary: `unexpected kind: ${output.kind}`,
-        }, runClaim);
-        return false;
       }
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      try {
-        this.graph.updateSubagentRun(projectId, run.id, {
-          status: controller.signal.aborted ? "cancelled" : "failed",
-          errorMessage: reason,
-        }, runClaim);
-        this.graph.logEvent(projectId, controller.signal.aborted ? "metacog.cancelled" : "metacog.error", {
-          error: reason,
-        });
-      } catch { /* expired/reassigned attempt is fenced */ }
+      this.graph.logEvent(projectId, controller.signal.aborted ? "metacog.cancelled" : "metacog.error", {
+        error: reason,
+      });
       return false;
     } finally {
       const active = this.activeControllers.get(projectId);
       if (active?.controller === controller) {
-        clearInterval(active.heartbeatTimer);
         this.activeControllers.delete(projectId);
       }
     }

@@ -1,10 +1,9 @@
 /**
  * Per-session main loop.
  *
- * Drives project steps: directives → planner (MainAgent) → explorers
- * (SubagentRunner) → evaluators (SubagentRunner) → termination. Scheduling and
- * SubagentRun lifecycle live here; role-specific prompt formatting is delegated
- * to PromptBuilder and execution to SubagentRunner.
+ * Drives project steps: directives → planner → explorers → evaluators →
+ * termination. Live execution control stays here; BaseAgent writes role audit
+ * JSON separately from Graph.
  */
 
 import type {
@@ -13,18 +12,14 @@ import type {
 } from "../agent/types.js";
 import { DEFAULT_SCHEDULER } from "../agent/types.js";
 import type { Graph } from "../graph/graph.js";
-import type { IntentLeaseClaim, RunLeaseClaim } from "../graph/graph.js";
+import type { IntentLeaseClaim } from "../graph/graph.js";
 import type { WorkerPool } from "../worker/worker-runtime.js";
 import { StageError } from "../agent/parse-envelope.js";
 import { MainAgent } from "../agent/main-agent.js";
 import { applyMainDecision } from "../agent/decision-applier.js";
-import {
-  runSubagent,
-  runSubagentWithText,
-  selectProfileWorker,
-} from "../agent/subagent-runner.js";
+import { selectProfileWorker } from "../agent/base-agent.js";
+import { EvaluatorAgent, ExplorerAgent } from "../agent/role-agents.js";
 import { explorerExtra, evaluatorExtra, broadcastEvaluatorExtra } from "../agent/prompt-builder.js";
-import { estimateContextTokens } from "../agent/context-builder.js";
 import { PromptLoader } from "../config/prompt-loader.js";
 import type { FederationBus } from "../graph/federation-bus.js";
 import type { MetacogSupervisor } from "./metacog-supervisor.js";
@@ -66,8 +61,7 @@ export interface SessionLoopOptions {
    * evaluators, before termination). When set, metacog reviews the graph and
    * emits correction hints the planner consumes on the next step. */
   metacog?: MetacogSupervisor;
-  /** Stable only for this coordinator process; persisted Run epochs provide
-   * correctness across restarts. Primarily injectable for deterministic tests. */
+  /** Stable only for this coordinator process. Primarily injectable for tests. */
   coordinatorId?: string;
   graphReader?: SessionGraphReader;
 }
@@ -90,7 +84,8 @@ export class SessionLoop {
   private readonly activeExecutions = new Map<ProjectId, Map<string, {
     controller: AbortController;
     intentId?: IntentId;
-    heartbeatTimer: ReturnType<typeof setInterval>;
+    role: SessionRole;
+    heartbeatTimer?: ReturnType<typeof setInterval>;
   }>>();
   private readonly coordinatorId: string;
   private resourceGovernor?: GlobalResourceGovernor;
@@ -214,10 +209,7 @@ export class SessionLoop {
     }
     if (this.coordinator.recentVerdicts(projectId).length > 0) return false;
     if (this.graph.federationOutbox(projectId, "pending").length > 0) return false;
-    const hasActiveRuns = this.graph.subagentRuns(projectId).some(
-      (run) => run.status === "pending" || run.status === "running",
-    );
-    if (hasActiveRuns) return false;
+    if ((this.activeExecutions.get(projectId)?.size ?? 0) > 0) return false;
 
     if (this.metacog) {
       const events = this.graph.events(projectId);
@@ -259,7 +251,7 @@ export class SessionLoop {
     for (const executions of this.activeExecutions.values()) {
       for (const execution of executions.values()) {
         execution.controller.abort(new Error("session loop closed"));
-        clearInterval(execution.heartbeatTimer);
+        if (execution.heartbeatTimer) clearInterval(execution.heartbeatTimer);
       }
     }
     this.closePromise = (async () => {
@@ -296,18 +288,15 @@ export class SessionLoop {
     const directive = this.graph.addDirective(projectId, input);
     if (input.kind === "stop") {
       this.graph.updateProjectStatus(projectId, "stopped");
-      this.cancelPersistedExecutions(projectId, "session stopped by directive");
       this.abortExecutions(projectId);
       this.metacog?.interrupt(projectId);
     } else if (input.kind === "pause") {
       this.graph.updateProjectStatus(projectId, "paused");
-      this.cancelPersistedExecutions(projectId, "session paused by directive");
       this.abortExecutions(projectId);
       this.metacog?.interrupt(projectId);
     } else if (input.kind === "resume") {
       this.graph.updateProjectStatus(projectId, "active");
     } else if (input.kind === "kill-intent") {
-      this.cancelPersistedExecutions(projectId, "intent killed by directive", input.payload);
       this.abortExecutions(projectId, input.payload);
       try {
         this.graph.failIntent(projectId, input.payload, "killed by directive", false, "directive");
@@ -421,12 +410,12 @@ export class SessionLoop {
       switch (dir.kind) {
         case "stop":
           this.graph.updateProjectStatus(projectId, "stopped");
-          this.cancelPersistedExecutions(projectId, "session stopped by directive");
+          this.abortExecutions(projectId);
           this.graph.logEvent(projectId, "directive.stop", { reason: dir.payload });
           return;
         case "pause":
           this.graph.updateProjectStatus(projectId, "paused");
-          this.cancelPersistedExecutions(projectId, "session paused by directive");
+          this.abortExecutions(projectId);
           this.graph.logEvent(projectId, "directive.pause", { reason: dir.payload });
           return;
         case "resume":
@@ -438,7 +427,7 @@ export class SessionLoop {
           this.graph.logEvent(projectId, "directive.hint", { content: dir.payload });
           break;
         case "kill-intent":
-          this.cancelPersistedExecutions(projectId, "intent killed by directive", dir.payload);
+          this.abortExecutions(projectId, dir.payload);
           try {
             this.graph.failIntent(projectId, dir.payload, "killed by directive", false, "directive");
             this.graph.logEvent(projectId, "directive.kill", { intentId: dir.payload });
@@ -464,38 +453,37 @@ export class SessionLoop {
   private startExecution(
     projectId: ProjectId,
     key: string,
-    runClaim: RunLeaseClaim,
+    role: SessionRole,
     intentId?: IntentId,
     intentClaim?: IntentLeaseClaim,
   ): AbortController {
     const controller = new AbortController();
     const leaseMs = this.config.scheduler?.workerLeaseMs ?? DEFAULT_SCHEDULER.workerLeaseMs;
-    const heartbeatTimer = setInterval(() => {
-      try {
-        this.graph.heartbeatSubagentRun(projectId, key, runClaim, leaseMs);
-        if (intentId && intentClaim) {
+    const heartbeatTimer = intentId && intentClaim
+      ? setInterval(() => {
+        try {
           this.graph.renewIntentLease(projectId, intentId, intentClaim, leaseMs);
+        } catch (error) {
+          controller.abort(error instanceof Error
+            ? error
+            : new Error(`intent lease lost: ${String(error)}`));
         }
-      } catch (error) {
-        controller.abort(error instanceof Error
-          ? error
-          : new Error(`execution lease lost: ${String(error)}`));
-      }
-    }, Math.max(5, Math.floor(leaseMs / 3)));
-    heartbeatTimer.unref?.();
+      }, Math.max(5, Math.floor(leaseMs / 3)))
+      : undefined;
+    heartbeatTimer?.unref?.();
     let active = this.activeExecutions.get(projectId);
     if (!active) {
       active = new Map();
       this.activeExecutions.set(projectId, active);
     }
-    active.set(key, { controller, intentId, heartbeatTimer });
+    active.set(key, { controller, intentId, role, heartbeatTimer });
     return controller;
   }
 
   private finishExecution(projectId: ProjectId, key: string): void {
     const active = this.activeExecutions.get(projectId);
     const execution = active?.get(key);
-    if (execution) clearInterval(execution.heartbeatTimer);
+    if (execution?.heartbeatTimer) clearInterval(execution.heartbeatTimer);
     active?.delete(key);
     if (active?.size === 0) this.activeExecutions.delete(projectId);
   }
@@ -507,20 +495,6 @@ export class SessionLoop {
           ? `intent ${intentId} cancelled by directive`
           : "session execution cancelled by directive"));
       }
-    }
-  }
-
-  /** Revoke persisted leases as well as local AbortControllers. Remote
-   * coordinators discover the epoch/status change on their next heartbeat and
-   * abort without being able to commit a late result. */
-  private cancelPersistedExecutions(projectId: ProjectId, reason: string, intentId?: IntentId): void {
-    for (const run of this.graph.subagentRuns(projectId)) {
-      if (run.status !== "pending" && run.status !== "running") continue;
-      if (intentId && run.intentId !== intentId) continue;
-      this.graph.updateSubagentRun(projectId, run.id, {
-        status: "cancelled",
-        errorMessage: reason,
-      });
     }
   }
 
@@ -547,7 +521,7 @@ export class SessionLoop {
 
     const progress = this.graph.progress(projectId);
     const lastStep = this.coordinator.lastPlannerStep(projectId);
-    const { profileId: plannerProfileId, profile: plannerProfile } = this.profileForRole("planner");
+    const { profile: plannerProfile } = this.profileForRole("planner");
     const cooldown = plannerProfile?.cooldownSteps ?? 3;
     const inCooldown = progress.stepsExecuted - lastStep < cooldown;
 
@@ -564,56 +538,39 @@ export class SessionLoop {
       this.coordinator.lastPlannerDecisionSeq(projectId),
     ) > 0) return true;
 
-    const plannerRun = this.graph.createSubagentRun(projectId, {
-      profileId: plannerProfileId,
-      role: plannerProfile.role,
-      workerName: selectProfileWorker(plannerProfile, projectId, this.workerPool, this.config),
-      inputSummary: "planner graph decision",
-      dispatchKey: "planner",
+    const workerName = selectProfileWorker(plannerProfile, projectId, this.workerPool, this.config);
+    const executionKey = "planner";
+    const controller = this.startExecution(projectId, executionKey, "planner");
+    const agent = new MainAgent({
+      project: this.requireProject(projectId),
+      config: this.config,
+      workerPool: this.workerPool,
+      promptLoader: this.promptLoader,
+      graphReader: this.graphReader,
     });
-    const runClaim = this.graph.claimSubagentRun(
-      projectId,
-      plannerRun.id,
-      this.coordinatorId,
-      this.config.scheduler?.workerLeaseMs ?? DEFAULT_SCHEDULER.workerLeaseMs,
-    );
-    if (!runClaim) return true;
-    const controller = this.startExecution(projectId, plannerRun.id, runClaim);
     try {
-      const agent = new MainAgent({
-        project: this.requireProject(projectId), config: this.config,
-        workerPool: this.workerPool, promptLoader: this.promptLoader,
-        graphReader: this.graphReader,
-      });
-      const { decision, permissions, runId } = await agent.run({
+      const { decision, permissions, agentId } = await agent.run({
         hints: hints.length > 0 ? hints : undefined,
         recentVerdicts: hasRecentVerdict ? recentVerdicts : undefined,
         signal: controller.signal,
-        runId: plannerRun.id,
-        workerName: plannerRun.workerName,
-        onRunUpdate: (patch) => this.graph.updateSubagentRun(projectId, plannerRun.id, patch, runClaim),
+        workerName,
       });
 
+      if (this.graph.getProject(projectId)?.status !== "active") {
+        await agent.updateRecord(agentId, {
+          status: "discarded",
+          errorMessage: "planner result arrived after the project left active state",
+        });
+        this.graph.logEvent(projectId, "planner.result_discarded", { agentId });
+        return false;
+      }
       this.graph.transaction(() => {
-        this.graph.assertSubagentRunClaim(projectId, runId, runClaim);
-        if (this.graph.getProject(projectId)?.status !== "active") {
-          this.graph.updateSubagentRun(projectId, runId, {
-            status: "discarded",
-            errorMessage: "planner result arrived after the project left active state",
-          }, runClaim);
-          this.graph.logEvent(projectId, "planner.result_discarded", { runId });
-          return;
-        }
-
         applyMainDecision({
           projectId, graph: this.graph, config: this.config,
           decision, permissions,
         });
-        this.graph.updateSubagentRun(projectId, runId, {
-          status: "completed",
-          outputSummary: `${decision.createIntents.length} create, ${decision.stopExplorerIntentIds.length} stop, ${decision.failIntents.length} fail, end=${Boolean(decision.concludeRun)}`,
-        }, runClaim);
         this.graph.logEvent(projectId, "planner.decision_applied", {
+          agentId,
           createdIntents: decision.createIntents.length,
           failedIntents: decision.failIntents.length,
           stoppedExplorers: decision.stopExplorerIntentIds.length,
@@ -622,7 +579,10 @@ export class SessionLoop {
           stepsExecuted: this.graph.progress(projectId).stepsExecuted,
         });
       });
-      if (this.graph.getSubagentRun(projectId, runId)?.status === "discarded") return false;
+      await agent.updateRecord(agentId, {
+        status: "applied",
+        outputSummary: `${decision.createIntents.length} create, ${decision.stopExplorerIntentIds.length} stop, ${decision.failIntents.length} fail, end=${Boolean(decision.concludeRun)}`,
+      });
       for (const intentId of decision.stopExplorerIntentIds) {
         this.abortExecutions(projectId, intentId);
       }
@@ -630,24 +590,9 @@ export class SessionLoop {
       return true;
     } catch (err) {
       if (controller.signal.aborted) {
-        try {
-          this.graph.updateSubagentRun(projectId, plannerRun.id, {
-            status: "cancelled",
-            errorMessage: err instanceof Error ? err.message : String(err),
-          }, runClaim);
-          this.graph.logEvent(projectId, "planner.cancelled", { runId: plannerRun.id });
-        } catch { /* expired/reassigned attempts cannot change durable state */ }
+        this.graph.logEvent(projectId, "planner.cancelled", {});
         return false;
       }
-      try {
-        this.graph.assertSubagentRunClaim(projectId, plannerRun.id, runClaim);
-      } catch {
-        return false;
-      }
-      this.graph.updateSubagentRun(projectId, plannerRun.id, {
-        status: "failed",
-        errorMessage: err instanceof Error ? err.message : String(err),
-      }, runClaim);
       const failures = this.coordinator.plannerFailureCount(projectId) + 1;
       this.graph.logEvent(projectId, "planner.error", {
         error: err instanceof Error ? err.message : String(err),
@@ -661,7 +606,7 @@ export class SessionLoop {
       }
       return false;
     } finally {
-      this.finishExecution(projectId, plannerRun.id);
+      this.finishExecution(projectId, executionKey);
     }
   }
 
@@ -694,8 +639,11 @@ export class SessionLoop {
 
     const { profileId: explorerProfileId, profile: explorerProfile } = this.profileForRole("explorer");
     if (explorerProfile.maxActive !== undefined) {
-      const activeRuns = this.graph.subagentRuns(projectId, { profileId: explorerProfileId, status: "running" }).length;
-      const inFlight = Math.max(activeRuns, claimedCount);
+      const inFlight = Math.max(
+        [...this.activeExecutions.get(projectId)?.values() ?? []]
+          .filter((execution) => execution.role === "explorer").length,
+        claimedCount,
+      );
       if (inFlight >= explorerProfile.maxActive) return 0;
       batch = batch.slice(0, explorerProfile.maxActive - inFlight);
       if (batch.length === 0) return 0;
@@ -707,45 +655,32 @@ export class SessionLoop {
 
   private async runOneExplorer(projectId: ProjectId, intent: Intent): Promise<void> {
     const leaseMs = this.config.scheduler?.workerLeaseMs ?? DEFAULT_SCHEDULER.workerLeaseMs;
-
     const { profileId: explorerProfileId, profile: explorerProfile } = this.profileForRole("explorer");
     const explorerWorker = selectProfileWorker(explorerProfile, projectId, this.workerPool, this.config);
-    const run = this.graph.createSubagentRun(projectId, {
-      profileId: explorerProfileId,
-      role: explorerProfile.role,
-      workerName: explorerWorker,
-      intentId: intent.id,
-      inputSummary: intent.description,
-      dispatchKey: `${explorerProfileId}:${intent.id}`,
-    });
-    const runClaim = this.graph.claimSubagentRun(
-      projectId,
-      run.id,
-      this.coordinatorId,
-      leaseMs,
-    );
-    if (!runClaim) return;
-    const workerId = `${this.coordinatorId}:${run.id}:${runClaim.attempt}`;
+    const workerId = `${this.coordinatorId}:${intent.id}:${Date.now()}`;
+    const executionKey = `explorer:${intent.id}`;
     let controller: AbortController | undefined;
     let claim: IntentLeaseClaim | undefined;
+    let agent: ExplorerAgent | undefined;
 
     try {
       const claimed = this.graph.claimIntent(projectId, intent.id, workerId, leaseMs);
       claim = { workerId, epoch: claimed.leaseEpoch };
-      controller = this.startExecution(projectId, run.id, runClaim, intent.id, claim);
-
-      const { output, prompt, rawText, usedConclude } = await runSubagentWithText({
+      controller = this.startExecution(projectId, executionKey, "explorer", intent.id, claim);
+      agent = new ExplorerAgent({
         profile: explorerProfile,
         profileId: explorerProfileId,
         project: this.requireProject(projectId),
-        workerPool: this.workerPool, config: this.config,
+        workerPool: this.workerPool,
+        config: this.config,
         promptLoader: this.promptLoader,
         graphReader: this.graphReader,
-        runId: run.id,
-        onRunUpdate: (patch) => this.graph.updateSubagentRun(projectId, run.id, patch, runClaim),
-        workerNameOverride: run.workerName,
+      });
+      const result = await agent.run({
+        workerName: explorerWorker,
         signal: controller.signal,
         intent,
+        inputSummary: intent.description,
         promptExtra: explorerExtra(
           intent.id,
           intent.description,
@@ -756,50 +691,33 @@ export class SessionLoop {
             .filter((fact): fact is NonNullable<typeof fact> => Boolean(fact)),
         ),
       });
-      const inputTokens = estimateContextTokens(prompt);
-      const outputTokens = estimateContextTokens(rawText);
-
-      if (output.kind !== "fact") {
-        throw new StageError(`explorer returned kind="${output.kind}", expected "fact"`, "explorer");
-      }
-
       const explorerPermissions = new PermissionChecker(explorerProfile);
       explorerPermissions.require("handle_intent");
       explorerPermissions.require("write_candidate_fact");
-      this.graph.updateSubagentRun(projectId, run.id, {
-        usedConclude, inputTokens, outputTokens,
-      }, runClaim);
-      this.graph.commitExplorerResult(projectId, intent.id, run.id, {
-        description: output.fact.description,
-        evidence: output.fact.evidence,
+      const fact = this.graph.commitExplorerResult(projectId, intent.id, {
+        description: result.output.fact.description,
+        evidence: result.output.fact.evidence,
         source: "explorer",
-        confidence: output.fact.confidence,
-      }, claim, runClaim);
+        confidence: result.output.fact.confidence,
+      }, claim);
+      await agent.updateRecord(result.agentId, {
+        status: "applied",
+        factId: fact.id,
+        outputSummary: fact.description.slice(0, 200),
+      });
+      this.graph.logEvent(projectId, "explorer.result_applied", {
+        agentId: result.agentId,
+        intentId: intent.id,
+        factId: fact.id,
+      });
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      if (!controller && !claim) {
-        try {
-          this.graph.updateSubagentRun(projectId, run.id, {
-            status: "discarded",
-            errorMessage: reason,
-          }, runClaim);
-        } catch { /* run was reclaimed while intent claim raced */ }
-        return;
-      }
+      if (!controller && !claim) return;
       if (controller?.signal.aborted) {
         if (claim) {
           try { this.graph.releaseIntent(projectId, intent.id, claim); } catch { /* already concluded/reassigned */ }
         }
-        try {
-          this.graph.updateSubagentRun(projectId, run.id, {
-            status: "cancelled",
-            errorMessage: reason,
-          }, runClaim);
-          this.graph.logEvent(projectId, "explorer.cancelled", {
-            intentId: intent.id,
-            runId: run.id,
-          });
-        } catch { /* expired/reassigned attempt is fenced */ }
+        this.graph.logEvent(projectId, "explorer.cancelled", { intentId: intent.id });
         return;
       }
       const currentIntent = this.graph.getIntent(projectId, intent.id);
@@ -812,31 +730,15 @@ export class SessionLoop {
         if (stillOwnsLease) {
           try { this.graph.releaseIntent(projectId, intent.id, claim); } catch { /* already reassigned */ }
         }
-        try {
-          this.graph.updateSubagentRun(projectId, run.id, {
-            status: "discarded",
-            errorMessage: reason,
-          }, runClaim);
-          this.graph.logEvent(projectId, "explorer.result_discarded", {
-            intentId: intent.id,
-            runId: run.id,
-            leaseEpoch: claim.epoch,
-          });
-        } catch { /* run lease was also reassigned */ }
+        this.graph.logEvent(projectId, "explorer.result_discarded", {
+          intentId: intent.id,
+          leaseEpoch: claim.epoch,
+        });
         return;
       }
-      try {
-        this.graph.assertSubagentRunClaim(projectId, run.id, runClaim);
-      } catch {
-        return;
-      }
-      // Track repeated failures. A persistently-broken explorer (bad output,
-      // flaky backend) would otherwise re-dispatch the same intent forever — no
-      // verdict is produced to wake the planner, so the loop would deadlock.
-      // After MAX_EXPLORER_RETRIES, auto-fail the intent (mechanism, like lease
-      // expiry — not a planner policy decision) and record it as a dead-end so
-      // the planner does not re-open the same path. Below the cap, release the
-      // lease so the next tick may retry.
+      // A persistently broken explorer would otherwise re-dispatch forever.
+      // Release the Intent for retry below the cap; once exhausted, fail the
+      // Project without inventing a semantic dead-end or denying the Intent.
       const fails = this.bumpIntentFailure(projectId, intent.id);
       if (fails >= (explorerProfile.retry?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS)) {
         if (claim) {
@@ -851,10 +753,9 @@ export class SessionLoop {
           try { this.graph.releaseIntent(projectId, intent.id, claim); } catch { /* already concluded/reassigned */ }
         }
       }
-      this.graph.updateSubagentRun(projectId, run.id, { status: "failed", errorMessage: reason }, runClaim);
-      this.graph.logEvent(projectId, "explorer.error", { intentId: intent.id, error: reason, runId: run.id });
+      this.graph.logEvent(projectId, "explorer.error", { intentId: intent.id, error: reason });
     } finally {
-      this.finishExecution(projectId, run.id);
+      this.finishExecution(projectId, executionKey);
     }
   }
 
@@ -869,45 +770,31 @@ export class SessionLoop {
 
     const { profileId: evaluatorProfileId, profile: evaluatorProfile } = this.profileForRole("evaluator");
     if (evaluatorProfile.maxActive !== undefined) {
-      const active = this.graph.subagentRuns(projectId, {
-        profileId: evaluatorProfileId,
-        status: "running",
-      }).length;
+      const active = [...this.activeExecutions.get(projectId)?.values() ?? []]
+        .filter((execution) => execution.role === "evaluator").length;
       candidates = candidates.slice(0, Math.max(0, evaluatorProfile.maxActive - active));
       if (candidates.length === 0) return;
     }
     await Promise.allSettled(
       candidates.map(async (candidate) => {
         const evaluatorWorker = selectProfileWorker(evaluatorProfile, projectId, this.workerPool, this.config);
-        const run = this.graph.createSubagentRun(projectId, {
+        const executionKey = `evaluator:${candidate.id}`;
+        const controller = this.startExecution(projectId, executionKey, "evaluator");
+        const agent = new EvaluatorAgent({
           profileId: evaluatorProfileId,
-          role: evaluatorProfile.role,
-          workerName: evaluatorWorker,
-          factId: candidate.id,
-          inputSummary: candidate.description.slice(0, 200),
-          dispatchKey: `${evaluatorProfileId}:${candidate.id}`,
+          profile: evaluatorProfile,
+          project: this.requireProject(projectId),
+          workerPool: this.workerPool,
+          config: this.config,
+          promptLoader: this.promptLoader,
+          graphReader: this.graphReader,
         });
-        const runClaim = this.graph.claimSubagentRun(
-          projectId,
-          run.id,
-          this.coordinatorId,
-          this.config.scheduler?.workerLeaseMs ?? DEFAULT_SCHEDULER.workerLeaseMs,
-        );
-        if (!runClaim) return;
-        const controller = this.startExecution(projectId, run.id, runClaim);
         try {
-          const output = await runSubagent({
-            profile: evaluatorProfile,
-            profileId: evaluatorProfileId,
-            project: this.requireProject(projectId),
-            workerPool: this.workerPool, config: this.config,
-            promptLoader: this.promptLoader,
-            graphReader: this.graphReader,
-            runId: run.id,
-            onRunUpdate: (patch) => this.graph.updateSubagentRun(projectId, run.id, patch, runClaim),
-            workerNameOverride: run.workerName,
+          const result = await agent.run({
+            workerName: evaluatorWorker,
             signal: controller.signal,
             candidate,
+            inputSummary: candidate.description.slice(0, 200),
             promptExtra: evaluatorExtra(
               candidate,
               undefined,
@@ -926,51 +813,35 @@ export class SessionLoop {
                 : undefined,
             ),
           });
-
-          if (output.kind !== "verdict") {
-            throw new StageError(`evaluator returned kind="${output.kind}", expected "verdict"`, "evaluator");
-          }
-
           const evaluatorPermissions = new PermissionChecker(evaluatorProfile);
           evaluatorPermissions.require("change_fact");
-          this.graph.commitEvaluatorResult(projectId, candidate.id, run.id, output.verdict, runClaim);
+          this.graph.commitEvaluatorResult(projectId, candidate.id, result.output.verdict);
+          await agent.updateRecord(result.agentId, {
+            status: "applied",
+            outputSummary: `${result.output.verdict.decision}: ${result.output.verdict.reason.slice(0, 150)}`,
+          });
 
           // Deferred re-evaluation: an accepted fact may satisfy the
           // requiredConditions of a deferred pending fact in this session.
           // This is a LOCAL mechanism (no bus needed); cross-session
           // reactivation goes through the FederationBus deferred/condition_met
           // insights below.
-          if (output.verdict.decision === "pass") {
+          if (result.output.verdict.decision === "pass") {
             this.tryReactivateDeferred(projectId, candidate.description);
           }
 
         } catch (err) {
           const reason = err instanceof Error ? err.message : String(err);
           if (controller.signal.aborted) {
-            try {
-              this.graph.updateSubagentRun(projectId, run.id, {
-                status: "cancelled",
-                errorMessage: reason,
-              }, runClaim);
-              this.graph.logEvent(projectId, "evaluator.cancelled", {
-                factId: candidate.id,
-                runId: run.id,
-              });
-            } catch { /* expired/reassigned attempt is fenced */ }
-            return;
-          }
-          try {
-            this.graph.assertSubagentRunClaim(projectId, run.id, runClaim);
-          } catch {
+            this.graph.logEvent(projectId, "evaluator.cancelled", { factId: candidate.id });
             return;
           }
           // Do NOT resolve the fact as "deny" on a transient evaluator error
           // (network/timeout/parse). A spurious reject would permanently mark the
           // fact as a dead-end and pollute later planner decisions. Leave it as a
           // candidate so a later step can retry evaluation.
-          this.graph.updateSubagentRun(projectId, run.id, { status: "failed", errorMessage: reason }, runClaim);
           this.graph.logEvent(projectId, "evaluator.error", {
-            factId: candidate.id, error: reason, runId: run.id,
+            factId: candidate.id, error: reason,
             failures: this.bumpEvaluatorFailure(projectId, candidate.id),
           });
           const failures = this.coordinator.evaluatorFailureCount(projectId, candidate.id);
@@ -982,7 +853,7 @@ export class SessionLoop {
             });
           }
         } finally {
-          this.finishExecution(projectId, run.id);
+          this.finishExecution(projectId, executionKey);
         }
       }),
     );
@@ -1004,43 +875,28 @@ export class SessionLoop {
           this.sessionId,
           insight.id,
           prior.payload.decision === "irrelevant" ? "irrelevant" : "evaluated",
-          typeof prior.payload.runId === "string" ? prior.payload.runId : undefined,
+          undefined,
         );
         continue;
       }
 
-      const run = this.graph.createSubagentRun(projectId, {
+      const evaluatorWorker = selectProfileWorker(evaluatorProfile, projectId, this.workerPool, this.config);
+      const executionKey = `broadcast:${insight.id}`;
+      const controller = this.startExecution(projectId, executionKey, "evaluator");
+      const agent = new EvaluatorAgent({
         profileId: evaluatorProfileId,
-        role: evaluatorProfile.role,
-        workerName: selectProfileWorker(evaluatorProfile, projectId, this.workerPool, this.config),
-        inputSummary: `broadcast ${insight.id}: ${insight.summary.slice(0, 160)}`,
-        dispatchKey: `${evaluatorProfileId}:broadcast:${insight.id}`,
+        profile: evaluatorProfile,
+        project: this.requireProject(projectId),
+        workerPool: this.workerPool,
+        config: this.config,
+        promptLoader: this.promptLoader,
+        graphReader: this.graphReader,
       });
-      const runClaim = this.graph.claimSubagentRun(
-        projectId,
-        run.id,
-        this.coordinatorId,
-        this.config.scheduler?.workerLeaseMs ?? DEFAULT_SCHEDULER.workerLeaseMs,
-      );
-      if (!runClaim) continue;
-      const controller = this.startExecution(projectId, run.id, runClaim);
       try {
-        const broadcastProfile = {
-          ...evaluatorProfile,
-          output: { contract: "broadcast_assessment" as const },
-        };
-        const output = await runSubagent({
-          profile: broadcastProfile,
-          profileId: evaluatorProfileId,
-          project: this.requireProject(projectId),
-          workerPool: this.workerPool,
-          config: this.config,
-          promptLoader: this.promptLoader,
-          graphReader: this.graphReader,
-          runId: run.id,
-          onRunUpdate: (patch) => this.graph.updateSubagentRun(projectId, run.id, patch, runClaim),
-          workerNameOverride: run.workerName,
+        const result = await agent.runBroadcast({
+          workerName: evaluatorWorker,
           signal: controller.signal,
+          inputSummary: `broadcast ${insight.id}: ${insight.summary.slice(0, 160)}`,
           promptExtra: broadcastEvaluatorExtra({
             id: insight.id,
             kind: insight.kind,
@@ -1051,13 +907,7 @@ export class SessionLoop {
             confidence: insight.confidence,
           }, this.graph.facts(projectId, "pending")),
         });
-        if (output.kind !== "broadcast_assessment") {
-          throw new StageError(
-            `broadcast evaluator returned kind="${output.kind}", expected "broadcast_assessment"`,
-            "evaluator",
-          );
-        }
-        if (insight.kind === "session_summary" && output.assessment.decision === "condition_satisfied") {
+        if (insight.kind === "session_summary" && result.output.assessment.decision === "condition_satisfied") {
           throw new StageError(
             "session_summary cannot satisfy a pending Fact condition",
             "evaluator",
@@ -1066,43 +916,29 @@ export class SessionLoop {
         this.graph.commitBroadcastAssessment(
           projectId,
           insight.id,
-          run.id,
-          output.assessment,
+          result.output.assessment,
           insight.kind,
-          runClaim,
         );
+        await agent.updateRecord(result.agentId, {
+          status: "applied",
+          outputSummary: `${result.output.assessment.decision}: ${result.output.assessment.reason.slice(0, 150)}`,
+        });
         this.federationBus.acknowledge(
           this.sessionId,
           insight.id,
-          output.assessment.decision === "irrelevant" ? "irrelevant" : "evaluated",
-          run.id,
+          result.output.assessment.decision === "irrelevant" ? "irrelevant" : "evaluated",
+          result.agentId,
         );
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         if (controller.signal.aborted) {
-          try {
-            this.graph.updateSubagentRun(projectId, run.id, {
-              status: "cancelled",
-              errorMessage: reason,
-            }, runClaim);
-            this.graph.logEvent(projectId, "federation.broadcast_cancelled", {
-              broadcastId: insight.id,
-              runId: run.id,
-            });
-          } catch { /* expired/reassigned attempt is fenced */ }
+          this.graph.logEvent(projectId, "federation.broadcast_cancelled", { broadcastId: insight.id });
           return;
         }
-        try {
-          this.graph.assertSubagentRunClaim(projectId, run.id, runClaim);
-        } catch {
-          continue;
-        }
-        this.graph.updateSubagentRun(projectId, run.id, { status: "failed", errorMessage: reason }, runClaim);
-        this.federationBus.markFailed(this.sessionId, insight.id, run.id);
+        this.federationBus.markFailed(this.sessionId, insight.id);
         const failures = this.coordinator.broadcastFailureCount(projectId, insight.id) + 1;
         this.graph.logEvent(projectId, "federation.broadcast_error", {
           broadcastId: insight.id,
-          runId: run.id,
           error: reason,
           failures,
         });
@@ -1117,7 +953,7 @@ export class SessionLoop {
           return;
         }
       } finally {
-        this.finishExecution(projectId, run.id);
+        this.finishExecution(projectId, executionKey);
       }
     }
   }

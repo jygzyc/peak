@@ -12,7 +12,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import type { Graph } from "../graph/graph.js";
-import type { DirectiveInput, Project, ProjectId, RunStatus, Verdict } from "../agent/types.js";
+import type { DirectiveInput, Project, ProjectId, Verdict } from "../agent/types.js";
 import { ServerSessionGraphReader } from "./session-graph-reader.js";
 import type { FederationBus, TaskGroupState } from "../graph/federation-bus.js";
 
@@ -202,7 +202,7 @@ export class HttpServer {
         return this.json(res, directive);
       }
 
-      const sessionCollectionMatch = path.match(/^\/api\/sessions\/([^/]+)\/(facts|intents|end-facts|runs|events)$/);
+      const sessionCollectionMatch = path.match(/^\/api\/sessions\/([^/]+)\/(facts|intents|end-facts|events)$/);
       if (sessionCollectionMatch && method === "POST") {
         const binding = this.sessionBinding(decodeURIComponent(sessionCollectionMatch[1]));
         const project = binding && this.bindingProject(binding);
@@ -212,12 +212,6 @@ export class HttpServer {
           case "facts": return this.json(res, binding.graph.facts(project.id));
           case "intents": return this.json(res, binding.graph.intents(project.id));
           case "end-facts": return this.json(res, binding.graph.endFacts(project.id));
-          case "runs": return this.json(res, {
-            runs: binding.graph.subagentRuns(project.id, {
-              status: stringOrUndefined(body.status) as RunStatus | undefined,
-              profileId: stringOrUndefined(body.profileId),
-            }),
-          });
           case "events": return this.json(res, binding.graph.events(
             project.id,
             numberOrUndefined(body.since),
@@ -307,7 +301,6 @@ export class HttpServer {
       endFacts: graph.endFacts(project.id),
       hints: graph.unconsumedHints(project.id),
       directives: graph.unconsumedDirectives(project.id),
-      runs: graph.subagentRuns(project.id),
       progress: graph.progress(project.id),
     };
   }

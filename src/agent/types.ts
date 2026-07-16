@@ -16,7 +16,7 @@ export type FactId = string;
 export type IntentId = string;
 export type HintId = string;
 export type DirectiveId = string;
-export type RunId = string;
+export type AgentId = string;
 export type EndFactId = string;
 
 export type SessionRole = "planner" | "explorer" | "evaluator" | "metacog";
@@ -190,73 +190,43 @@ export interface DirectiveInput {
   payload: string;
 }
 
-// ─── Subagent runs (first-class trackable, cancellable executions) ───
+// ─── Agent execution records (JSON artifacts, never Graph data) ───
 
-export type RunStatus =
-  | "pending"
+export type AgentRecordStatus =
   | "running"
-  | "completed"
+  | "validated"
+  | "applied"
   | "failed"
   | "cancelled"
-  | "abandoned"
   | "discarded";
 
-/**
- * A SubagentRun tracks one execution of a SubagentProfile against the graph.
- *
- * Explorer, evaluator, and metacog executions are all modeled as runs so they
- * can be observed, cancelled, and quota-limited uniformly. The graph is the
- * source of truth for run state; in-flight process handles live in the worker
- * layer and are correlated back via runId.
- */
-export interface SubagentRun {
-  id: RunId;
+/** Audit record written under sessions/<session>/agents. Runtime scheduling
+ * remains in SessionLoop; this record never participates in Graph state. */
+export interface AgentRecord {
+  version: 1;
+  id: AgentId;
   projectId: ProjectId;
+  sessionId: string;
   profileId: string;
   role: RoleId;
   workerName: WorkerName;
-  status: RunStatus;
-  /** Stable identity of the logical dispatch while it is pending/running. */
-  dispatchKey?: string;
-  /** Current coordinator lease. leaseEpoch fences prior owners after expiry. */
-  ownerId?: string;
-  attempt: number;
-  leaseEpoch: number;
-  heartbeatAt?: ISOTime;
-  leaseExpiresAt?: ISOTime;
+  status: AgentRecordStatus;
   intentId?: IntentId;
   factId?: FactId;
-  parentRunId?: RunId;
   inputSummary?: string;
   outputSummary?: string;
   errorMessage?: string;
-  /** True when the run's output came from a conclude-fallback retry. */
   usedConclude?: boolean;
   inputTokens?: number;
   outputTokens?: number;
-  /** Hash and component provenance of the exact static prompt injected. */
   promptHash?: string;
   promptManifest?: PromptManifest;
-  /** Immutable, derived Graph context file used to build this run's prompt. */
   contextArtifact?: ContextArtifact;
-  /** Validated role JSON captured before the control plane applies it. */
   outputArtifact?: RoleOutputArtifact;
-  /** Opaque backend conversation id, retained only as run provenance. */
   workerSessionId?: string;
   createdAt: ISOTime;
-  startedAt?: ISOTime;
+  startedAt: ISOTime;
   finishedAt?: ISOTime;
-}
-
-export interface SubagentRunInput {
-  profileId: string;
-  role: RoleId;
-  workerName: WorkerName;
-  dispatchKey?: string;
-  intentId?: IntentId;
-  factId?: FactId;
-  parentRunId?: RunId;
-  inputSummary?: string;
 }
 
 // ─── Workers ───
@@ -365,7 +335,7 @@ export interface RoleOutputArtifact {
   version: 1;
   sessionId: string;
   projectId: ProjectId;
-  runId: RunId;
+  agentId: AgentId;
   role: RoleId;
   relativePath: string;
   resolvedPath: string;
@@ -435,8 +405,8 @@ export interface RetryPolicy {
  * context policy, permissions, output contract, and concurrency bounds.
  *
  * Per-agent tuning knobs (no global "workflow" concept):
- *   - maxActive: concurrent run cap for this profile.
- *   - cooldownSteps: (planner) min steps between planner runs.
+ *   - maxActive: concurrent invocation cap for this profile.
+ *   - cooldownSteps: (planner) min steps between planner invocations.
  *   - triggers: (metacog) when the wall-clock metacog loop fires.
  */
 export interface SubagentProfile {

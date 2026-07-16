@@ -14,7 +14,7 @@ import { MetacogSupervisor } from "../dist/session/metacog-supervisor.js";
 import { GlobalSupervisor } from "../dist/session/supervisor.js";
 import type { Graph, ProjectInput } from "../dist/graph/graph.js";
 import type { TaskConfig } from "../dist/agent/types.js";
-import { env } from "./helper.ts";
+import { agentRecords, env } from "./helper.ts";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const CASE_DIR = join(ROOT, "examples", "app-vuln-analysis");
@@ -32,6 +32,7 @@ function asMockConfig(path: string): ReturnType<typeof loadConfig> {
 function createCaseProject(
   graph: Graph,
   loaded: ReturnType<typeof loadConfig>,
+  sessionDir = (graph as Graph & { sessionDir?: string }).sessionDir ?? loaded.sessionDir,
 ): ReturnType<Graph["createProject"]> {
   const input: ProjectInput = {
     session: loaded.session,
@@ -39,7 +40,7 @@ function createCaseProject(
     target: loaded.config.task.target,
     goal: loaded.config.task.goal,
     worker: "mock",
-    sessionDir: loaded.sessionDir,
+    sessionDir,
     workspaceDir: loaded.workspaceDir,
     configPath: loaded.configPath,
     taskConfig: loaded.config,
@@ -302,12 +303,13 @@ test("acceptance: dual-session App analysis converges through evaluated broadcas
   assert.equal(bus.cursor(entryLoaded.session), bus.headSeq("app-vuln-demo"));
   assert.equal(bus.cursor(dataLoaded.session), bus.headSeq("app-vuln-demo"));
 
-  const skillInjected = [...entryGraph.subagentRuns(entryProject.id), ...dataGraph.subagentRuns(dataProject.id)]
-    .filter((run) => run.role === "planner" || run.role === "explorer")
-    .every((run) => run.promptManifest?.components.some((component) => component.kind === "skill"));
+  const records = [...await agentRecords(entryProject), ...await agentRecords(dataProject)];
+  const skillInjected = records
+    .filter((record) => record.role === "planner" || record.role === "explorer")
+    .every((record) => record.promptManifest?.components.some((component) => component.kind === "skill"));
   assert.equal(skillInjected, true, "planner/explorer runs must record the configured skill component");
-  assert.ok(dataGraph.subagentRuns(dataProject.id).every((run) =>
-    typeof run.promptHash === "string" && run.promptHash.length === 64));
+  assert.ok((await agentRecords(dataProject)).every((record) =>
+    typeof record.promptHash === "string" && record.promptHash.length === 64));
 
   bus.close();
 });
@@ -322,8 +324,8 @@ test("acceptance: dual-session App analysis resumes after both graphs and Federa
 
   let entryGraph = new SqliteGraph(entryDb);
   let dataGraph = new SqliteGraph(dataDb);
-  const entryProject = createCaseProject(entryGraph, entryLoaded);
-  const dataProject = createCaseProject(dataGraph, dataLoaded);
+  const entryProject = createCaseProject(entryGraph, entryLoaded, join(stateDir, "entry"));
+  const dataProject = createCaseProject(dataGraph, dataLoaded, join(stateDir, "data"));
   let bus = new FederationBus({ dbPath: busDb });
 
   const firstEntryWorker = new MockWorker();
@@ -384,8 +386,8 @@ test("acceptance: dual-session App analysis resumes after both graphs and Federa
     && event.payload.decision === "condition_satisfied"));
   assert.equal(bus.hasPendingDeliveries("app-vuln-demo"), false);
   assert.equal(bus.allCursorsAtHead("app-vuln-demo"), true);
-  assert.ok([...entryGraph.subagentRuns(entryProject.id), ...dataGraph.subagentRuns(dataProject.id)]
-    .every((run) => run.status !== "pending" && run.status !== "running"));
+  assert.ok([...await agentRecords(entryProject), ...await agentRecords(dataProject)]
+    .every((record) => record.status !== "running"));
 
   entryGraph.close();
   dataGraph.close();

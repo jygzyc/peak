@@ -15,12 +15,11 @@
 | 方法 | 路径 | 含义 |
 |---|---|---|
 | POST | `/api/sessions` | session、project、状态与 TaskGroup 摘要 |
-| POST | `/api/sessions/:sessionId` | Project、Fact、Intent、EndFact、Hint、Directive、Run 与 progress |
+| POST | `/api/sessions/:sessionId` | Project、Fact、Intent、EndFact、Hint、Directive 与 progress |
 | POST | `/api/sessions/:sessionId/graph/snapshot` | 按 profile 权限、view/throughSeq 读取一致性 Graph snapshot |
 | POST | `/api/sessions/:sessionId/facts` | 当前 session 的 Facts |
 | POST | `/api/sessions/:sessionId/intents` | 当前 session 的 Intents；parent 顺序来自 `intent_sets.ordinal` |
 | POST | `/api/sessions/:sessionId/end-facts` | 当前和 superseded EndFacts |
-| POST | `/api/sessions/:sessionId/runs` | 可按 status/profile 过滤的 SubagentRuns |
 | POST | `/api/sessions/:sessionId/events` | 按 event seq 增量读取事件 |
 | POST | `/api/sessions/:sessionId/directives` | 注入可审计控制指令 |
 | POST | `/api/task-groups` | TaskGroup 列表 |
@@ -36,13 +35,13 @@
 HttpSessionGraphReader (HTTP) / ServerSessionGraphReader (embedded server)
   -> POST snapshot(sessionId, profileId, projectId, throughSeq)
   -> GraphContextSnapshot(contentHash)
-  -> immutable graph-context-<seq>-<contentHash>.json
+  -> agents/<agentId>/context.json
   -> PromptBuilder(file reference + assignment + output-contract)
   -> validated role output.json
-  -> permission-checked Graph commit + SubagentRun provenance
+  -> permission-checked Graph commit + record.json audit
 ```
 
-Server 根据 session 中的真实 `profile.context` 生成角色所需视图，不接受客户端自报 view。只有 metacog 的显式能力包含 `get_graph`；其他角色读取的是 server 主动生成的职责范围 JSON，而不是 Graph API。两种 reader 使用同一 snapshot 编码。输入和输出 artifact 都以标准 JSON 写入 session 目录；Run 保存 graph seq、输入/输出 artifact hash、PromptManifest、最终 prompt hash 与 backend session id。
+Server 根据 session 中的真实 `profile.context` 生成角色所需视图，不接受客户端自报 view。只有 metacog 的显式能力包含 `get_graph`；其他角色读取的是 server 主动生成的职责范围 JSON，而不是 Graph API。两种 reader 使用同一 snapshot 编码。BaseAgent 将输入、输出与 `record.json` 写入 `sessions/<session>/agents/<agentId>/`；记录保存 graph seq、artifact hash、PromptManifest、最终 prompt hash 与 backend session id，但不参与 Graph 调度。
 
 ## 10.4 安全边界
 
@@ -58,7 +57,7 @@ Server 根据 session 中的真实 `profile.context` 生成角色所需视图，
 
 1. 常驻 server 启动时扫描持久 session 目录并重建 runtime registry。
 2. 对 snapshot 截断、artifact rename/hash、HTTP 中断等提交点做表驱动故障注入。
-3. 在 Dashboard 增加 owner/epoch、PromptManifest 组件 hash 与 terminal reason 的细粒度运维视图。
+3. 在 Dashboard 增加 AgentRecord、PromptManifest 组件 hash 与 terminal reason 的细粒度运维视图。
 
 `start()` 会拒绝重复启动和端口占用，并在失败后复位为可再次启动状态；`stop()` 关闭 listener 和连接并复位 port/token。注销 session 只删除 server binding。
 

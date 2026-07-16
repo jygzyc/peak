@@ -2,7 +2,7 @@
  * Graph interface shared by all peak storage backends.
  *
  * Defines the state protocol for projects, facts, intents, hints, directives,
- * events, leases, and progress. SessionLoops and stages depend on this
+ * events, intent claims, and progress. SessionLoops depend on this
  * interface instead of a specific in-memory or SQLite implementation.
  */
 
@@ -26,10 +26,6 @@ import type {
   Project,
   ProjectId,
   ProjectStatus,
-  RunId,
-  RunStatus,
-  SubagentRun,
-  SubagentRunInput,
   TaskConfig,
   Verdict,
   WorkerName,
@@ -76,14 +72,6 @@ export interface IntentInput {
 export interface IntentLeaseClaim {
   workerId: string;
   epoch: number;
-}
-
-/** Fencing token for one claimed SubagentRun attempt. All worker-originated
- * graph commits must present it; expiry/requeue increments the epoch. */
-export interface RunLeaseClaim {
-  ownerId: string;
-  epoch: number;
-  attempt: number;
 }
 
 export type FederationOutboxKind = "fact" | "session_summary";
@@ -152,39 +140,31 @@ export interface Graph {
   activeEndFact(projectId: ProjectId): EndFact | undefined;
   endFacts(projectId: ProjectId): EndFact[];
 
-  /** Atomic explorer protocol commit: candidate Fact + Intent pass + Run terminal. */
+  /** Atomic explorer protocol commit: candidate Fact + Intent pass. */
   commitExplorerResult(
     projectId: ProjectId,
     intentId: IntentId,
-    runId: RunId,
     input: FactInput,
     expected: IntentLeaseClaim,
-    expectedRun?: RunLeaseClaim,
   ): Fact;
-  /** Atomic evaluator protocol commit: Fact verdict + Run terminal. */
+  /** Atomic evaluator protocol commit: Fact verdict. */
   commitEvaluatorResult(
     projectId: ProjectId,
     factId: FactId,
-    runId: RunId,
     verdict: Verdict,
-    expectedRun?: RunLeaseClaim,
   ): void;
   /** Atomic broadcast evaluator commit. External broadcasts remain references;
    * this records the assessment and may only reactivate an existing pending Fact. */
   commitBroadcastAssessment(
     projectId: ProjectId,
     broadcastId: string,
-    runId: RunId,
     assessment: BroadcastAssessment,
     broadcastKind?: string,
-    expectedRun?: RunLeaseClaim,
   ): void;
-  /** Atomically commits metacog hints/run state and a durable federation outbox item. */
+  /** Atomically commits metacog hints and a durable federation outbox item. */
   commitMetacogResult(
     projectId: ProjectId,
-    runId: RunId,
     input: MetacogCommitInput,
-    expectedRun?: RunLeaseClaim,
   ): void;
   federationOutbox(projectId: ProjectId, status?: FederationOutboxItem["status"]): FederationOutboxItem[];
   markFederationOutboxPublished(
@@ -201,29 +181,6 @@ export interface Graph {
   addDirective(projectId: ProjectId, input: DirectiveInput): Directive;
   unconsumedDirectives(projectId: ProjectId): Directive[];
   consumeDirective(projectId: ProjectId, directiveId: DirectiveId): void;
-
-  createSubagentRun(projectId: ProjectId, input: SubagentRunInput): SubagentRun;
-  claimSubagentRun(
-    projectId: ProjectId,
-    runId: RunId,
-    ownerId: string,
-    leaseMs: number,
-  ): RunLeaseClaim | undefined;
-  heartbeatSubagentRun(
-    projectId: ProjectId,
-    runId: RunId,
-    expected: RunLeaseClaim,
-    leaseMs: number,
-  ): void;
-  assertSubagentRunClaim(projectId: ProjectId, runId: RunId, expected: RunLeaseClaim): void;
-  updateSubagentRun(projectId: ProjectId, runId: RunId, patch: Partial<Pick<SubagentRun,
-    "status" | "outputSummary" | "errorMessage" | "factId" | "startedAt" | "finishedAt"
-    | "usedConclude" | "inputTokens" | "outputTokens"
-    | "promptHash" | "promptManifest" | "contextArtifact" | "outputArtifact" | "workerSessionId">>,
-    expected?: RunLeaseClaim,
-  ): void;
-  getSubagentRun(projectId: ProjectId, runId: RunId): SubagentRun | undefined;
-  subagentRuns(projectId: ProjectId, filter?: { profileId?: string; status?: RunStatus }): SubagentRun[];
 
   logEvent(projectId: ProjectId, type: string, payload?: Record<string, unknown>): GraphEvent;
   events(projectId: ProjectId, sinceSeq?: number, limit?: number): GraphEvent[];
@@ -248,8 +205,4 @@ export function now(): ISOTime {
 
 export function newProjectId(): ProjectId {
   return `proj_${Math.random().toString(16).slice(2, 10)}`;
-}
-
-export function newRunId(): RunId {
-  return `run_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 6)}`;
 }

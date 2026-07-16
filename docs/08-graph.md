@@ -4,7 +4,9 @@
 
 ## Session-local Graph
 
-每个 session 只使用落盘的 `SqliteGraph`，数据库固定在 session 状态目录；源码没有 `:memory:`、临时数据库或第二套 Graph 实现。Graph 保存 Project、Fact、Intent、`intent_sets`、Hint、Directive、EndFact、Event、SubagentRun、dead-end、role coordinator cursor 和 federation outbox。跨 session 的 FederationBus 同样使用持久化 `federation.db`。
+每个 session 只使用落盘的 `SqliteGraph`，数据库固定在 session 状态目录；源码没有 `:memory:`、临时数据库或第二套 Graph 实现。Graph 保存 Project、Fact、Intent、`intent_sets`、Hint、Directive、EndFact、Event、dead-end、role coordinator cursor 和 federation outbox。跨 session 的 FederationBus 同样使用持久化 `federation.db`。
+
+单次 Agent 调用不是分析图数据：活动 controller、取消和并发只存在于运行时内存；输入、输出和审计状态写入 `sessions/<session>/agents/<agentId>/` 的标准 JSON 文件。
 
 一个 runtime 只允许一个 session/task/Project。Intent 的全部 parent Fact 只以 `intent_sets(project_id, intent_id, fact_id, ordinal)` 保存和读取，创建 Intent 与写入 parent 集合在同一事务中完成；不存在 JSON 镜像或第二套来源字段。
 
@@ -13,23 +15,22 @@
 ```text
 Intent: open -> claimed -> pass | deny
 Fact:   candidate -> pass | deny | pending
-Run:    pending -> running -> completed | failed | cancelled
 Project: active -> completed | stopped | failed | paused
 ```
 
 关键角色结果通过 Graph 的原子方法提交：
 
 - planner decision 与 intent dispatch request；
-- Explorer candidate Fact + Intent/Run terminal；
-- Evaluator verdict + Fact/Run terminal；
-- Metacog hints/outbox + Run terminal；
-- owner/attempt/leaseEpoch/heartbeat 的 claim、renew 与 fenced commit。
+- Explorer candidate Fact + Intent terminal；
+- Evaluator verdict + Fact terminal；
+- Metacog hints/outbox；
+- Intent 的 owner/attempt/leaseEpoch/heartbeat claim、renew 与 fenced commit。
 
 SQLite 使用 WAL 和事务；Graph DB 只接受正式 `application_id + user_version=1`。文件已有用户表但标识不匹配时，在建表前拒绝打开。源码没有 schema migration、回填、双写或旧状态改写。
 
 ## Event 与恢复
 
-Event seq 是 planner/evaluator/metacog 唤醒的持久游标。恢复时 coordinator 从 Graph 重建 verdict cursor、broadcast wake、retry/backoff 与 cooldown；不会通过“构造时把所有 running run 判失败”的方式抢夺另一个 owner。
+Event seq 是 planner/evaluator/metacog 唤醒的持久游标。恢复时 coordinator 从 Graph 重建 verdict cursor、broadcast wake、retry/backoff 与 cooldown；未完成的进程内 Agent 调用不会被误当成 Graph 状态恢复。
 
 Graph close 是显式生命周期的一部分。runtime 先 abort/join 角色执行，再关闭 Graph，避免 worker 在 SQLite 关闭后提交。
 

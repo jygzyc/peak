@@ -5,8 +5,8 @@ import { MockWorker } from "../dist/worker/mock-worker.js";
 import { SessionLoop } from "../dist/session/session-loop.js";
 import { MetacogSupervisor } from "../dist/session/metacog-supervisor.js";
 import { FederationBus } from "../dist/graph/federation-bus.js";
-import { broadcastEvaluatorExtra } from "../dist/agent/subagent-runner.js";
-import { minimalConfig, createProject, env } from "./helper.ts";
+import { broadcastEvaluatorExtra } from "../dist/agent/prompt-builder.js";
+import { agentRecords, minimalConfig, createProject, env } from "./helper.ts";
 
 function decisions(createIntents: unknown[] = [], concludeRun: unknown = null) {
   return env("decisions", { createIntents, failIntents: [], consumeHints: [], concludeRun });
@@ -75,7 +75,7 @@ test("broadcastEvaluatorExtra distinguishes a final session summary from a Fact"
   assert.match(prompt, /cannot satisfy a pending Fact condition/);
 });
 
-test("received broadcast creates a tracked evaluator run and advances the durable cursor", async () => {
+test("received broadcast writes an evaluator JSON record and advances the durable cursor", async () => {
   const bus = new TestFederationBus();
   bus.registerSession("source", "app-group");
 
@@ -114,8 +114,8 @@ test("received broadcast creates a tracked evaluator run and advances the durabl
   assert.ok(event);
   assert.equal(event!.payload.decision, "relevant");
   assert.equal(event!.payload.broadcastKind, "fact");
-  const runs = graph.subagentRuns(project.id, { profileId: "evaluator" });
-  assert.ok(runs.some((run) => run.inputSummary?.includes(insight.id) && run.status === "completed"));
+  const records = await agentRecords(project);
+  assert.ok(records.some((record) => record.inputSummary?.includes(insight.id) && record.status === "applied"));
   assert.equal(graph.facts(project.id).length, 0, "external broadcast must not become a local Fact");
   assert.equal(bus.pendingForSession("target").length, 0);
   assert.equal(bus.cursor("target"), bus.headSeq("app-group"));

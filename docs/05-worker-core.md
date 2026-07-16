@@ -20,7 +20,7 @@
 
 ## 外部 worker session
 
-每个 Run 都收到完整 Graph artifact，不跨 Run resume 外部 worker session。backend 返回的 session id 会写入 `SubagentRun.workerSessionId` 作为审计信息；只有同一次 explorer 调用的 conclude 兜底会把该 id 传回 backend。第一版没有 session cache、delta checkpoint 或 rotation manager。
+每次 Agent 调用都收到完整 Graph artifact，不跨调用 resume 外部 worker session。backend 返回的 session id 会写入 `agents/<agentId>/record.json`；只有同一次 explorer 调用的 conclude 兜底会把该 id 传回 backend。第一版没有 session cache、delta checkpoint 或 rotation manager。
 
 ## 已删除的死协议
 

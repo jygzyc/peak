@@ -6,7 +6,7 @@ import { TestFederationBus, TestGraph } from "./test-graph.ts";
 import { FederationBus } from "../dist/graph/federation-bus.js";
 import { GlobalSupervisor } from "../dist/session/supervisor.js";
 import { MockWorker } from "../dist/worker/mock-worker.js";
-import { env } from "./helper.ts";
+import { agentRecords, env } from "./helper.ts";
 import {
   attachScenario,
   createScenarioProject,
@@ -97,10 +97,11 @@ test("acceptance scenario 3: an idea is deeply analyzed before recommendation", 
     assert.match(recommendation!.description, /idempotent sync/i);
     assert.match(recommendation!.description, /under 30%|guardrails regress/i);
     assert.ok(graph.activeEndFact(project.id)?.fromFactIds.includes(recommendation!.id));
-    assert.ok(graph.subagentRuns(project.id)
-      .filter((run) => run.role === "planner" || run.role === "explorer")
-      .every((run) => {
-        const kinds = new Set(run.promptManifest?.components.map((component) => component.kind));
+    const records = await agentRecords(project);
+    assert.ok(records
+      .filter((record) => record.role === "planner" || record.role === "explorer")
+      .every((record) => {
+        const kinds = new Set(record.promptManifest?.components.map((component) => component.kind));
         return kinds.has("knowledge") && kinds.has("rule") && kinds.has("skill");
       }));
   } finally {

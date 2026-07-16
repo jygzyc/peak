@@ -11,12 +11,14 @@ const openBuses = new Set<TestFederationBus>();
 /** On-disk SQLite fixture. Production and tests share the same storage mode. */
 export class TestGraph extends SqliteGraph {
   private readonly directory: string;
+  readonly sessionDir: string;
   private closed = false;
 
   constructor() {
     const directory = mkdtempSync(join(tmpdir(), "peak-test-graph-"));
     super(join(directory, "analysis.db"));
     this.directory = directory;
+    this.sessionDir = directory;
     openGraphs.add(this);
   }
 

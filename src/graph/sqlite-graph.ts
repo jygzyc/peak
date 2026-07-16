@@ -11,18 +11,16 @@ import type {
   BroadcastAssessment, Directive, DirectiveId, DirectiveInput,
   Fact, FactId, FactStatus, EndFact, GraphEvent, Hint, HintId,
   Intent, IntentId, IntentStatus, ISOTime,
-  Progress, Project, ProjectId, ProjectStatus, RunId, RunStatus,
-  SubagentRun, SubagentRunInput, TaskConfig, Verdict,
+  Progress, Project, ProjectId, ProjectStatus, TaskConfig, Verdict,
 } from "../agent/types.js";
 import {
   type FactInput, type HintInput, type IntentInput, type ProjectInput,
   type IntentLeaseClaim,
-  type RunLeaseClaim,
   type FederationOutboxItem, type Graph, type MetacogCommitInput,
-  newProjectId, newRunId, now, routeHash,
+  newProjectId, now, routeHash,
 } from "./graph.js";
 
-const GRAPH_APPLICATION_ID = 1346715980;
+const GRAPH_APPLICATION_ID = 1346715981;
 
 const SCHEMA = `
 PRAGMA journal_mode=WAL;
@@ -155,44 +153,6 @@ CREATE TABLE IF NOT EXISTS directives (
   created_at TEXT NOT NULL,
   PRIMARY KEY (project_id, id)
 );
-
-CREATE TABLE IF NOT EXISTS subagent_runs (
-  id TEXT NOT NULL,
-  project_id TEXT NOT NULL,
-  profile_id TEXT NOT NULL,
-  role TEXT NOT NULL,
-  worker_name TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
-  intent_id TEXT,
-  fact_id TEXT,
-  parent_run_id TEXT,
-  input_summary TEXT,
-  output_summary TEXT,
-  error_message TEXT,
-  used_conclude INTEGER,
-  input_tokens INTEGER,
-  output_tokens INTEGER,
-  prompt_hash TEXT,
-  prompt_manifest_json TEXT,
-  context_artifact_json TEXT,
-  output_artifact_json TEXT,
-  worker_session_id TEXT,
-  dispatch_key TEXT,
-  owner_id TEXT,
-  attempt INTEGER NOT NULL DEFAULT 0,
-  lease_epoch INTEGER NOT NULL DEFAULT 0,
-  heartbeat_at TEXT,
-  lease_expires_at TEXT,
-  created_at TEXT NOT NULL,
-  started_at TEXT,
-  finished_at TEXT,
-  PRIMARY KEY (project_id, id)
-);
-CREATE INDEX IF NOT EXISTS idx_runs_project_status ON subagent_runs(project_id, status);
-CREATE INDEX IF NOT EXISTS idx_runs_project_profile ON subagent_runs(project_id, profile_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_active_dispatch
-  ON subagent_runs(project_id, dispatch_key)
-  WHERE dispatch_key IS NOT NULL AND status IN ('pending', 'running');
 
 CREATE TABLE IF NOT EXISTS events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -479,17 +439,6 @@ export class SqliteGraph implements Graph {
         projectId,
         intentId,
       );
-      const activeRuns = this.all(
-        "SELECT id FROM subagent_runs WHERE project_id = ? AND role = 'explorer' AND intent_id = ? AND status IN ('pending', 'running')",
-        projectId,
-        intentId,
-      );
-      for (const run of activeRuns) {
-        this.updateSubagentRun(projectId, String(run.id), {
-          status: "cancelled",
-          errorMessage: reason,
-        });
-      }
       this.logEvent(projectId, "planner.explorer_stopped", {
         intentId,
         reason,
@@ -637,33 +586,6 @@ export class SqliteGraph implements Graph {
         });
       }
 
-      const runs = this.all(
-        `SELECT project_id, id, owner_id, lease_epoch
-         FROM subagent_runs
-         WHERE status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`,
-        nowIso,
-      );
-      for (const row of runs) {
-        const result = this.run(
-          `UPDATE subagent_runs
-           SET status = 'pending', owner_id = NULL, heartbeat_at = NULL, lease_expires_at = NULL,
-               lease_epoch = lease_epoch + 1
-           WHERE project_id = ? AND id = ? AND status = 'running' AND lease_epoch = ?
-             AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`,
-          row.project_id,
-          row.id,
-          row.lease_epoch,
-          nowIso,
-        );
-        if (result.changes !== 1) continue;
-        swept += 1;
-        this.logEvent(String(row.project_id), "run.lease_expired", {
-          runId: String(row.id),
-          ownerId: row.owner_id ? String(row.owner_id) : undefined,
-          epoch: Number(row.lease_epoch ?? 0),
-          nextEpoch: Number(row.lease_epoch ?? 0) + 1,
-        });
-      }
       return swept;
     });
   }
@@ -720,10 +642,8 @@ export class SqliteGraph implements Graph {
   commitExplorerResult(
     projectId: ProjectId,
     intentId: IntentId,
-    runId: RunId,
     input: FactInput,
     expected: IntentLeaseClaim,
-    expectedRun?: RunLeaseClaim,
   ): Fact {
     return this.transaction(() => {
       const project = this.get("SELECT status FROM projects WHERE id = ?", projectId);
@@ -735,24 +655,14 @@ export class SqliteGraph implements Graph {
         projectId,
         intentId,
       );
-      const run = this.get("SELECT * FROM subagent_runs WHERE project_id = ? AND id = ?", projectId, runId);
       if (!intent || intent.status !== "claimed") throw new Error(`intent is not claimed: ${intentId}`);
       if (intent.lease_worker_id !== expected.workerId
         || Number(intent.lease_epoch) !== expected.epoch
         || String(intent.lease_expires_at ?? "") <= now()) {
         throw new Error(`stale or expired intent lease: ${intentId}`);
       }
-      if (!run || run.status !== "running" || run.intent_id !== intentId) {
-        throw new Error(`explorer run is not running for intent: ${runId}`);
-      }
-      this.assertRunClaimIfRequired(projectId, runFromRow(run), expectedRun);
       const fact = this.addFact(projectId, { ...input, parentIntentId: intentId });
       this.concludeIntent(projectId, intentId, fact.id);
-      this.updateSubagentRun(projectId, runId, {
-        status: "completed",
-        factId: fact.id,
-        outputSummary: fact.description.slice(0, 200),
-      }, expectedRun);
       return fact;
     });
   }
@@ -760,50 +670,28 @@ export class SqliteGraph implements Graph {
   commitEvaluatorResult(
     projectId: ProjectId,
     factId: FactId,
-    runId: RunId,
     verdict: Verdict,
-    expectedRun?: RunLeaseClaim,
   ): void {
     this.transaction(() => {
       const project = this.get("SELECT status FROM projects WHERE id = ?", projectId);
       if (!project || project.status !== "active") {
         throw new Error("evaluator result cannot commit after project leaves active state");
       }
-      const run = this.get("SELECT * FROM subagent_runs WHERE project_id = ? AND id = ?", projectId, runId);
-      if (!run || run.status !== "running" || run.fact_id !== factId) {
-        throw new Error(`evaluator run is not running for fact: ${runId}`);
-      }
-      this.assertRunClaimIfRequired(projectId, runFromRow(run), expectedRun);
       this.resolveFact(projectId, factId, verdict);
-      this.updateSubagentRun(projectId, runId, {
-        status: "completed",
-        outputSummary: `${verdict.decision}: ${verdict.reason.slice(0, 150)}`,
-      }, expectedRun);
     });
   }
 
   commitBroadcastAssessment(
     projectId: ProjectId,
     broadcastId: string,
-    runId: RunId,
     assessment: BroadcastAssessment,
     broadcastKind?: string,
-    expectedRun?: RunLeaseClaim,
   ): void {
     this.transaction(() => {
       const project = this.get("SELECT status FROM projects WHERE id = ?", projectId);
       if (!project || (project.status !== "active" && project.status !== "finish_proposed")) {
         throw new Error("broadcast result cannot commit after project stops");
       }
-      const run = this.get(
-        "SELECT * FROM subagent_runs WHERE project_id = ? AND id = ?",
-        projectId,
-        runId,
-      );
-      if (!run || run.status !== "running") {
-        throw new Error(`broadcast evaluator run is not running: ${runId}`);
-      }
-      this.assertRunClaimIfRequired(projectId, runFromRow(run), expectedRun);
       if (assessment.decision === "condition_satisfied") {
         const fact = assessment.targetFactId
           ? this.get("SELECT status FROM facts WHERE project_id = ? AND id = ?", projectId, assessment.targetFactId)
@@ -818,38 +706,22 @@ export class SqliteGraph implements Graph {
       this.logEvent(projectId, "federation.broadcast_assessed", {
         broadcastId,
         broadcastKind,
-        runId,
         decision: assessment.decision,
         reason: assessment.reason,
         targetFactId: assessment.targetFactId,
       });
-      this.updateSubagentRun(projectId, runId, {
-        status: "completed",
-        outputSummary: `${assessment.decision}: ${assessment.reason.slice(0, 150)}`,
-      }, expectedRun);
     });
   }
 
   commitMetacogResult(
     projectId: ProjectId,
-    runId: RunId,
     input: MetacogCommitInput,
-    expectedRun?: RunLeaseClaim,
   ): void {
     this.transaction(() => {
       const project = this.get("SELECT status FROM projects WHERE id = ?", projectId);
       if (!project || (project.status !== "active" && project.status !== "finish_proposed")) {
         throw new Error("metacog result cannot commit after project stops");
       }
-      const run = this.get(
-        "SELECT * FROM subagent_runs WHERE project_id = ? AND id = ?",
-        projectId,
-        runId,
-      );
-      if (!run || run.status !== "running") {
-        throw new Error(`metacog run is not running: ${runId}`);
-      }
-      this.assertRunClaimIfRequired(projectId, runFromRow(run), expectedRun);
       for (const hint of input.hints) this.addHint(projectId, hint);
       if (input.broadcast) {
         const createdAt = now();
@@ -874,10 +746,6 @@ export class SqliteGraph implements Graph {
           });
         }
       }
-      this.updateSubagentRun(projectId, runId, {
-        status: "completed",
-        outputSummary: input.outputSummary,
-      }, expectedRun);
       if (input.reviewedFactId) {
         this.logEvent(projectId, "metacog.fact_reviewed", {
           factId: input.reviewedFactId,
@@ -886,7 +754,6 @@ export class SqliteGraph implements Graph {
       }
       if (input.finalReviewCompleted && this.getProject(projectId)?.status === "finish_proposed") {
         this.logEvent(projectId, "metacog.final_review_completed", {
-          runId,
           outboxEventId: input.broadcast?.eventId,
         });
       }
@@ -1003,200 +870,6 @@ export class SqliteGraph implements Graph {
     });
   }
 
-  // ─── SubagentRun ───
-
-  createSubagentRun(projectId: ProjectId, input: SubagentRunInput): SubagentRun {
-    return this.transaction(() => {
-      const id = newRunId();
-      const ts = now();
-      const inserted = this.run(
-        `INSERT OR IGNORE INTO subagent_runs
-         (id, project_id, profile_id, role, worker_name, status, dispatch_key, intent_id, fact_id,
-          parent_run_id, input_summary, attempt, lease_epoch, created_at)
-         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, 0, 0, ?)`,
-        id, projectId, input.profileId, input.role, input.workerName,
-        input.dispatchKey ?? null,
-        input.intentId ?? null, input.factId ?? null,
-        input.parentRunId ?? null, input.inputSummary ?? null,
-        ts,
-      );
-      if (inserted.changes !== 1 && input.dispatchKey) {
-        const active = this.get(
-          `SELECT * FROM subagent_runs
-           WHERE project_id = ? AND dispatch_key = ? AND status IN ('pending', 'running')`,
-          projectId,
-          input.dispatchKey,
-        );
-        if (active) return runFromRow(active);
-      }
-      const run = this.get("SELECT * FROM subagent_runs WHERE project_id = ? AND id = ?", projectId, id);
-      if (!run) throw new Error(`failed to read back subagent run: ${id}`);
-      const parsed = runFromRow(run);
-      this.logEvent(projectId, "run.created", {
-        runId: id, profileId: input.profileId, role: input.role,
-        intentId: input.intentId,
-        dispatchKey: input.dispatchKey,
-      });
-      return parsed;
-    });
-  }
-
-  claimSubagentRun(
-    projectId: ProjectId,
-    runId: RunId,
-    ownerId: string,
-    leaseMs: number,
-  ): RunLeaseClaim | undefined {
-    return this.transaction(() => {
-      const heartbeatAt = now();
-      const result = this.run(
-        `UPDATE subagent_runs
-         SET status = 'running', owner_id = ?, attempt = attempt + 1,
-             lease_epoch = lease_epoch + 1, heartbeat_at = ?, lease_expires_at = ?,
-             started_at = COALESCE(started_at, ?), finished_at = NULL
-         WHERE project_id = ? AND id = ? AND status = 'pending'`,
-        ownerId,
-        heartbeatAt,
-        new Date(Date.now() + leaseMs).toISOString(),
-        heartbeatAt,
-        projectId,
-        runId,
-      );
-      if (result.changes !== 1) {
-        const row = this.get("SELECT status FROM subagent_runs WHERE project_id = ? AND id = ?", projectId, runId);
-        if (!row) throw new Error(`subagent run not found: ${runId}`);
-        return undefined;
-      }
-      const row = this.get(
-        "SELECT attempt, lease_epoch FROM subagent_runs WHERE project_id = ? AND id = ?",
-        projectId,
-        runId,
-      )!;
-      const claim = {
-        ownerId,
-        epoch: Number(row.lease_epoch),
-        attempt: Number(row.attempt),
-      };
-      this.logEvent(projectId, "run.claimed", { runId, ...claim });
-      return claim;
-    });
-  }
-
-  heartbeatSubagentRun(
-    projectId: ProjectId,
-    runId: RunId,
-    expected: RunLeaseClaim,
-    leaseMs: number,
-  ): void {
-    const heartbeatAt = now();
-    const result = this.run(
-      `UPDATE subagent_runs
-       SET heartbeat_at = ?, lease_expires_at = ?
-       WHERE project_id = ? AND id = ? AND status = 'running'
-         AND owner_id = ? AND lease_epoch = ? AND attempt = ?
-         AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`,
-      heartbeatAt,
-      new Date(Date.now() + leaseMs).toISOString(),
-      projectId,
-      runId,
-      expected.ownerId,
-      expected.epoch,
-      expected.attempt,
-      heartbeatAt,
-    );
-    if (result.changes !== 1) throw new Error(`stale or expired subagent run lease: ${runId}`);
-  }
-
-  assertSubagentRunClaim(projectId: ProjectId, runId: RunId, expected: RunLeaseClaim): void {
-    const row = this.get(
-      `SELECT 1 FROM subagent_runs
-       WHERE project_id = ? AND id = ? AND status = 'running'
-         AND owner_id = ? AND lease_epoch = ? AND attempt = ?
-         AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`,
-      projectId,
-      runId,
-      expected.ownerId,
-      expected.epoch,
-      expected.attempt,
-      now(),
-    );
-    if (!row) throw new Error(`stale or expired subagent run lease: ${runId}`);
-  }
-
-  updateSubagentRun(
-    projectId: ProjectId,
-    runId: RunId,
-    patch: Partial<Pick<SubagentRun,
-      "status" | "outputSummary" | "errorMessage" | "factId" | "startedAt" | "finishedAt"
-      | "usedConclude" | "inputTokens" | "outputTokens"
-      | "promptHash" | "promptManifest" | "contextArtifact" | "outputArtifact" | "workerSessionId">>,
-    expected?: RunLeaseClaim,
-  ): void {
-    this.transaction(() => {
-      const existing = this.get("SELECT * FROM subagent_runs WHERE project_id = ? AND id = ?", projectId, runId);
-      if (!existing) throw new Error(`subagent run not found: ${runId}`);
-      if (expected) this.assertSubagentRunClaim(projectId, runId, expected);
-      const prevStatus = String(existing.status);
-      const sets: string[] = [];
-      const params: unknown[] = [];
-      if (patch.status !== undefined) { sets.push("status = ?"); params.push(patch.status); }
-      if (patch.outputSummary !== undefined) { sets.push("output_summary = ?"); params.push(patch.outputSummary); }
-      if (patch.errorMessage !== undefined) { sets.push("error_message = ?"); params.push(patch.errorMessage); }
-      if (patch.factId !== undefined) { sets.push("fact_id = ?"); params.push(patch.factId); }
-      if (patch.usedConclude !== undefined) { sets.push("used_conclude = ?"); params.push(patch.usedConclude ? 1 : 0); }
-      if (patch.inputTokens !== undefined) { sets.push("input_tokens = ?"); params.push(patch.inputTokens); }
-      if (patch.outputTokens !== undefined) { sets.push("output_tokens = ?"); params.push(patch.outputTokens); }
-      if (patch.promptHash !== undefined) { sets.push("prompt_hash = ?"); params.push(patch.promptHash); }
-      if (patch.promptManifest !== undefined) {
-        sets.push("prompt_manifest_json = ?");
-        params.push(JSON.stringify(patch.promptManifest));
-      }
-      if (patch.contextArtifact !== undefined) {
-        sets.push("context_artifact_json = ?");
-        params.push(JSON.stringify(patch.contextArtifact));
-      }
-      if (patch.outputArtifact !== undefined) {
-        sets.push("output_artifact_json = ?");
-        params.push(JSON.stringify(patch.outputArtifact));
-      }
-      if (patch.workerSessionId !== undefined) { sets.push("worker_session_id = ?"); params.push(patch.workerSessionId); }
-      if (patch.startedAt !== undefined) { sets.push("started_at = ?"); params.push(patch.startedAt); }
-      if (patch.finishedAt !== undefined) { sets.push("finished_at = ?"); params.push(patch.finishedAt); }
-
-      const wantRunning = patch.status === "running";
-      const wantTerminal = patch.status === "completed" || patch.status === "failed" || patch.status === "cancelled"
-        || patch.status === "abandoned" || patch.status === "discarded";
-      if (wantRunning) { sets.push("started_at = COALESCE(started_at, ?)"); params.push(now()); }
-      if (wantTerminal) {
-        sets.push("finished_at = COALESCE(finished_at, ?)"); params.push(now());
-        sets.push("owner_id = NULL", "heartbeat_at = NULL", "lease_expires_at = NULL");
-        if (!expected && existing.owner_id) sets.push("lease_epoch = lease_epoch + 1");
-      }
-
-      if (sets.length === 0) return;
-      params.push(projectId, runId);
-      this.run(`UPDATE subagent_runs SET ${sets.join(", ")} WHERE project_id = ? AND id = ?`, ...params);
-      this.logEvent(projectId, "run.updated", {
-        runId, prevStatus: prevStatus,
-        status: patch.status, outputSummary: patch.outputSummary, errorMessage: patch.errorMessage,
-      });
-    });
-  }
-
-  getSubagentRun(projectId: ProjectId, runId: RunId): SubagentRun | undefined {
-    const row = this.get("SELECT * FROM subagent_runs WHERE project_id = ? AND id = ?", projectId, runId);
-    return row ? runFromRow(row) : undefined;
-  }
-
-  subagentRuns(projectId: ProjectId, filter?: { profileId?: string; status?: RunStatus }): SubagentRun[] {
-    let sql = "SELECT * FROM subagent_runs WHERE project_id = ?";
-    const params: unknown[] = [projectId];
-    if (filter?.profileId) { sql += " AND profile_id = ?"; params.push(filter.profileId); }
-    if (filter?.status) { sql += " AND status = ?"; params.push(filter.status); }
-    sql += " ORDER BY created_at, id";
-    return this.all(sql, ...params).map(runFromRow);
-  }
-
   // ─── Event ───
 
   logEvent(projectId: ProjectId, type: string, payload: Record<string, unknown> = {}): GraphEvent {
@@ -1305,17 +978,6 @@ export class SqliteGraph implements Graph {
       now(), cause, projectId,
     );
     this.logEvent(projectId, "project.finish_superseded", { cause });
-  }
-
-  private assertRunClaimIfRequired(
-    projectId: ProjectId,
-    run: SubagentRun,
-    expected?: RunLeaseClaim,
-  ): void {
-    if (run.ownerId || expected) {
-      if (!expected) throw new Error(`subagent run lease required: ${run.id}`);
-      this.assertSubagentRunClaim(projectId, run.id, expected);
-    }
   }
 
   private findProject(idOrSession: string): Project | undefined {
@@ -1433,46 +1095,6 @@ function eventFromRow(row: Record<string, unknown>): GraphEvent {
     type: String(row.type),
     payload: JSON.parse(String(row.payload_json ?? "{}")),
     timestamp: String(row.timestamp),
-  };
-}
-
-function runFromRow(row: Record<string, unknown>): SubagentRun {
-  return {
-    id: String(row.id),
-    projectId: String(row.project_id),
-    profileId: String(row.profile_id),
-    role: String(row.role) as SubagentRun["role"],
-    workerName: String(row.worker_name),
-    status: String(row.status) as SubagentRun["status"],
-    dispatchKey: row.dispatch_key ? String(row.dispatch_key) : undefined,
-    ownerId: row.owner_id ? String(row.owner_id) : undefined,
-    attempt: Number(row.attempt ?? 0),
-    leaseEpoch: Number(row.lease_epoch ?? 0),
-    heartbeatAt: row.heartbeat_at ? String(row.heartbeat_at) : undefined,
-    leaseExpiresAt: row.lease_expires_at ? String(row.lease_expires_at) : undefined,
-    intentId: row.intent_id ? String(row.intent_id) : undefined,
-    factId: row.fact_id ? String(row.fact_id) : undefined,
-    parentRunId: row.parent_run_id ? String(row.parent_run_id) : undefined,
-    inputSummary: row.input_summary ? String(row.input_summary) : undefined,
-    outputSummary: row.output_summary ? String(row.output_summary) : undefined,
-    errorMessage: row.error_message ? String(row.error_message) : undefined,
-    usedConclude: row.used_conclude !== undefined && row.used_conclude !== null ? Boolean(row.used_conclude) : undefined,
-    inputTokens: row.input_tokens !== undefined && row.input_tokens !== null ? Number(row.input_tokens) : undefined,
-    outputTokens: row.output_tokens !== undefined && row.output_tokens !== null ? Number(row.output_tokens) : undefined,
-    promptHash: row.prompt_hash ? String(row.prompt_hash) : undefined,
-    promptManifest: row.prompt_manifest_json
-      ? JSON.parse(String(row.prompt_manifest_json)) as SubagentRun["promptManifest"]
-      : undefined,
-    contextArtifact: row.context_artifact_json
-      ? JSON.parse(String(row.context_artifact_json)) as SubagentRun["contextArtifact"]
-      : undefined,
-    outputArtifact: row.output_artifact_json
-      ? JSON.parse(String(row.output_artifact_json)) as SubagentRun["outputArtifact"]
-      : undefined,
-    workerSessionId: row.worker_session_id ? String(row.worker_session_id) : undefined,
-    createdAt: String(row.created_at),
-    startedAt: row.started_at ? String(row.started_at) : undefined,
-    finishedAt: row.finished_at ? String(row.finished_at) : undefined,
   };
 }
 

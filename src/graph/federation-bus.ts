@@ -53,7 +53,7 @@ export interface TaskGroupState {
 const SCHEMA = `
 PRAGMA journal_mode=WAL;
 PRAGMA busy_timeout=5000;
-PRAGMA application_id=1346784049;
+PRAGMA application_id=1346784050;
 PRAGMA user_version=1;
 CREATE TABLE IF NOT EXISTS federation_groups (
   scope TEXT PRIMARY KEY,
@@ -102,7 +102,7 @@ CREATE TABLE IF NOT EXISTS federation_deliveries (
   insight_id TEXT NOT NULL,
   target_session TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
-  evaluated_run_id TEXT,
+  evaluated_agent_id TEXT,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (insight_id, target_session),
   FOREIGN KEY (insight_id) REFERENCES federation_insights(id) ON DELETE CASCADE
@@ -126,7 +126,7 @@ export class FederationBus {
     mkdirSync(dirname(options.dbPath), { recursive: true });
     this.db = new DatabaseSync(options.dbPath);
     try {
-      assertDatabaseIdentity(this.db, 1346784049, "peak federation");
+      assertDatabaseIdentity(this.db, 1346784050, "peak federation");
       this.db.exec("PRAGMA foreign_keys=ON");
       this.db.exec(SCHEMA);
     } catch (error) {
@@ -583,28 +583,28 @@ export class FederationBus {
     sessionId: string,
     insightId: string,
     status: Exclude<DeliveryStatus, "pending">,
-    evaluatedRunId?: string,
+    evaluatedAgentId?: string,
   ): void {
     const scope = this.sessionScope(sessionId);
     if (!scope) throw new Error(`federation session not registered: ${sessionId}`);
     const result = this.db.prepare(
       `UPDATE federation_deliveries
-       SET status = ?, evaluated_run_id = ?, updated_at = ?
+       SET status = ?, evaluated_agent_id = ?, updated_at = ?
        WHERE target_session = ? AND insight_id = ?
          AND EXISTS (
            SELECT 1 FROM federation_insights i
            WHERE i.id = federation_deliveries.insight_id AND i.scope = ?
          )`,
-    ).run(status, evaluatedRunId ?? null, Date.now(), sessionId, insightId, scope);
+    ).run(status, evaluatedAgentId ?? null, Date.now(), sessionId, insightId, scope);
     if (result.changes !== 1) throw new Error(`federation delivery not found: ${sessionId}/${insightId}`);
     this.refreshCursor(sessionId, scope);
   }
 
-  markFailed(sessionId: string, insightId: string, evaluatedRunId?: string): void {
+  markFailed(sessionId: string, insightId: string, evaluatedAgentId?: string): void {
     this.db.prepare(
-      `UPDATE federation_deliveries SET status = 'failed', evaluated_run_id = ?, updated_at = ?
+      `UPDATE federation_deliveries SET status = 'failed', evaluated_agent_id = ?, updated_at = ?
        WHERE target_session = ? AND insight_id = ?`,
-    ).run(evaluatedRunId ?? null, Date.now(), sessionId, insightId);
+    ).run(evaluatedAgentId ?? null, Date.now(), sessionId, insightId);
   }
 
   headSeq(scope: string): number {

@@ -102,14 +102,7 @@ test("SqliteGraph: metacog outbox commit is durable and idempotently publishable
     session: "outbox", name: "n", target: "T", goal: "G",
     worker: "w", sessionDir: dir, configPath: "/tmp", taskConfig: config(),
   });
-  const run = graph.createSubagentRun(project.id, {
-    profileId: "metacog",
-    role: "metacog",
-    workerName: "w",
-    inputSummary: "fact.accepted:f001",
-  });
-  graph.updateSubagentRun(project.id, run.id, { status: "running" });
-  graph.commitMetacogResult(project.id, run.id, {
+  graph.commitMetacogResult(project.id, {
     hints: [],
     outputSummary: "0 hints",
     broadcast: {
@@ -121,7 +114,6 @@ test("SqliteGraph: metacog outbox commit is durable and idempotently publishable
       confidence: 0.9,
     },
   });
-  assert.equal(graph.getSubagentRun(project.id, run.id)?.status, "completed");
   assert.equal(graph.federationOutbox(project.id, "pending").length, 1);
   graph.close();
 
@@ -188,67 +180,6 @@ test("SqliteGraph: EndFact cannot bypass unfinished graph work", () => {
   g.resolveFact(p.id, candidate.id, { decision: "deny", reason: "invalid" });
   assert.equal(g.createEndFact(p.id, "done", []).status, "active");
   g.close();
-});
-
-test("SqliteGraph: SubagentRun prompt provenance survives reopen", () => {
-  const dir = tempDir();
-  const dbPath = join(dir, "test.db");
-  const g = new SqliteGraph(dbPath);
-  const p = g.createProject({
-    session: "s1", name: "n", target: "T", goal: "G",
-    worker: "w", sessionDir: dir, configPath: "/tmp", taskConfig: config(),
-  });
-  const run = g.createSubagentRun(p.id, {
-    profileId: "planner", role: "planner", workerName: "w",
-  });
-  g.updateSubagentRun(p.id, run.id, {
-    promptHash: "a".repeat(64),
-    promptManifest: {
-      version: 1,
-      hash: "b".repeat(64),
-      components: [{
-        kind: "primary", index: 0, source: "planner.md",
-        resolvedPath: join(dir, "planner.md"), sha256: "c".repeat(64), bytes: 7,
-      }],
-    },
-    contextArtifact: {
-      version: 1,
-      sessionId: "prompt-run",
-      projectId: p.id,
-      graphSeq: 7,
-      view: "full",
-      relativePath: "artifacts/prompts/run/context.md",
-      resolvedPath: join(dir, "context.md"),
-      sha256: "d".repeat(64),
-      bytes: 42,
-      delivery: "reference",
-      createdAt: new Date().toISOString(),
-    },
-    outputArtifact: {
-      version: 1,
-      sessionId: "s1",
-      projectId: p.id,
-      runId: run.id,
-      role: "planner",
-      relativePath: `artifacts/roles/${run.id}/output.json`,
-      resolvedPath: join(dir, "output.json"),
-      sha256: "e".repeat(64),
-      bytes: 24,
-      createdAt: new Date().toISOString(),
-    },
-  });
-  g.close();
-
-  const reopened = new SqliteGraph(dbPath);
-  const loaded = reopened.getSubagentRun(p.id, run.id)!;
-  assert.equal(loaded.promptHash, "a".repeat(64));
-  assert.equal(loaded.promptManifest?.components[0]?.kind, "primary");
-  assert.equal(loaded.promptManifest?.components[0]?.resolvedPath, join(dir, "planner.md"));
-  assert.equal(loaded.contextArtifact?.graphSeq, 7);
-  assert.equal(loaded.contextArtifact?.sha256, "d".repeat(64));
-  assert.equal(loaded.outputArtifact?.runId, run.id);
-  assert.equal(loaded.outputArtifact?.sha256, "e".repeat(64));
-  reopened.close();
 });
 
 test("SqliteGraph: failIntent with killedBy", () => {
@@ -325,12 +256,15 @@ test("SqliteGraph: intent_sets is the canonical ordered source store", () => {
   g1.close();
 
   const raw = new DatabaseSync(dbPath);
-  assert.equal((raw.prepare("PRAGMA application_id").get() as { application_id: number }).application_id, 1346715980);
+  assert.equal((raw.prepare("PRAGMA application_id").get() as { application_id: number }).application_id, 1346715981);
   assert.equal((raw.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 1);
   const intentColumns = raw.prepare("PRAGMA table_info(intents)").all()
     .map((row) => String((row as { name: string }).name));
   assert.equal(intentColumns.includes("parent_fact_ids_json"), false);
   assert.equal(intentColumns.includes("chain_json"), false);
+  assert.equal(raw.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'subagent_runs'",
+  ).get(), undefined);
   const removedTable = raw.prepare(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'intent_sources'",
   ).get();

@@ -2,7 +2,7 @@
 
 ## 顶层角色
 
-顶层 supervisor 负责不同 session 的分派，每一个 session 即一个任务，由 当前session 的planner 进行任务规划与执行。创建 session 时初始化planner，metacog，和对应 session 的图数据库
+顶层 supervisor 负责不同 session 的分派，每一个 session 即一个任务，由 当前session 的planner 进行任务规划与执行。创建 session 时初始化planner，metacog，和对应 session 的图数据库。
 
 ## server 端
 
@@ -27,6 +27,8 @@ planner、explorer、evaluator、metacog 均不得获得数据库对象或数据
 
 每一个角色都能够通过配置文件注入特定 prompt，从而执行指定领域的任务，同时也支持接入指定领域知识/规范/skill。
 每一个角色都有初始化的 system prompt，并以最简洁明了的方式说明职责，能够进行高度化定制，例如，能够多开 explorer_gather，explorer_analysis 等
+
+每一个角色都继承 base agent，能够配置应该访问的端口数据，prompt，注入的 skill等。运行过程中，base agent 会在 sessions/agents 目录下生成对应的 json 记录
 
 ## 状态流转
 

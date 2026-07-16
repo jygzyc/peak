@@ -3,7 +3,7 @@ import { strict as assert } from "node:assert";
 import { TestGraph } from "./test-graph.ts";
 import { MockWorker } from "../dist/worker/mock-worker.js";
 import { SessionLoop } from "../dist/session/session-loop.js";
-import { createProject, env, minimalConfig } from "./helper.ts";
+import { agentRecords, createProject, env, minimalConfig } from "./helper.ts";
 
 test("SessionLoop dispatches configured custom explorer/evaluator profile bindings", async () => {
   const graph = new TestGraph();
@@ -36,8 +36,9 @@ test("SessionLoop dispatches configured custom explorer/evaluator profile bindin
 
   await new SessionLoop(graph, worker, config).step(project.id);
 
-  assert.equal(graph.subagentRuns(project.id, { profileId: "source-finder" }).length, 1);
-  assert.equal(graph.subagentRuns(project.id, { profileId: "strict-reviewer" }).length, 1);
+  const records = await agentRecords(project);
+  assert.equal(records.filter((record) => record.profileId === "source-finder").length, 1);
+  assert.equal(records.filter((record) => record.profileId === "strict-reviewer").length, 1);
   assert.equal(graph.facts(project.id, "pass").length, 1);
 });
 

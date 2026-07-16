@@ -19,15 +19,15 @@ sweep leases
   -> local/TaskGroup completion check
 ```
 
-角色不直接互发消息。planner verdict inbox、失败次数、cooldown 和 broadcast wake 均由 Graph events 经 `SessionCoordinator` 重建；进程内只有 in-flight Promise、AbortController、heartbeat timer 和 context/session cache。
+角色不直接互发消息。planner verdict inbox、失败次数、cooldown 和 broadcast wake 均由 Graph events 经 `SessionCoordinator` 重建；进程内只有 in-flight Promise、AbortController、Intent heartbeat timer 和活动执行表。
 
 ## 并发与排他
 
 - `inFlightSteps` 合并同 Project 的进程内重入，不在 worker I/O 期间持 mutex。
-- Intent claim 与 SubagentRun claim 都有持久 `ownerId/epoch/attempt/leaseExpiresAt`；heartbeat 丢失后旧 owner 不能提交。
-- Explorer/Evaluator/Planner/Metacog 的结果提交由 Graph transaction + fencing token 保护。
+- 只有 Intent claim 持久化 `ownerId/epoch/attempt/leaseExpiresAt`；heartbeat 丢失后旧 explorer 不能提交。
+- Planner/Evaluator/Metacog 没有 Graph Run 或 lease；同进程排他由活动执行表保证，语义结果由 Graph transaction 提交。
 - GlobalResourceGovernor 在 WorkerPool.execute 边界发 FIFO permit，限制实际 worker 调用，而非只限制 session tick。
-- stop/pause/kill 会先改变持久状态、撤销 run/intent lease，再 abort 本地 worker；远端 coordinator 在 heartbeat 时发现 epoch/status 变化。
+- stop/pause/kill 会先改变持久状态；kill-intent 同时终止 Intent，再 abort 对应本地 worker。
 
 未发现两个互斥锁形成环路的传统死锁，因为核心路径不再持有项目锁等待外部 I/O。活性风险主要来自外部 WorkerPool 不遵守 AbortSignal；正式 backend 已传播 signal 并终止进程树，第三方 WorkerPool 必须遵守同一合同。
 

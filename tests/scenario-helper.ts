@@ -18,7 +18,7 @@ export function loadMockScenario(path: string): ReturnType<typeof loadConfig> {
 }
 
 export function createScenarioProject(
-  graph: Graph,
+  graph: Graph & { sessionDir: string },
   loaded: ReturnType<typeof loadConfig>,
   workspaceDir = loaded.workspaceDir,
 ): ReturnType<Graph["createProject"]> {
@@ -28,7 +28,7 @@ export function createScenarioProject(
     target: loaded.config.task.target,
     goal: loaded.config.task.goal,
     worker: "mock",
-    sessionDir: loaded.sessionDir,
+    sessionDir: graph.sessionDir,
     workspaceDir,
     configPath: loaded.configPath,
     taskConfig: loaded.config,

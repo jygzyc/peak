@@ -3,7 +3,7 @@ import { strict as assert } from "node:assert";
 import { TestGraph } from "./test-graph.ts";
 import { MockWorker } from "../dist/worker/mock-worker.js";
 import { MetacogSupervisor } from "../dist/session/metacog-supervisor.js";
-import { minimalConfig, createProject, env } from "./helper.ts";
+import { agentRecords, minimalConfig, createProject, env } from "./helper.ts";
 
 function makeSupervisor(graph: TestGraph, worker: MockWorker, intervalMs = 50) {
   return new MetacogSupervisor(graph, worker, minimalConfig(), intervalMs);
@@ -74,7 +74,7 @@ test("metacog-supervisor: stop recommendation becomes a planner hint", async () 
   assert.ok(graph.unconsumedHints(p.id).some((hint) => /recommends ending/i.test(hint.content)));
 });
 
-test("metacog-supervisor: runOnce creates tracked SubagentRun", async () => {
+test("metacog-supervisor: runOnce writes an applied agent JSON record", async () => {
   const graph = new TestGraph();
   const worker = new MockWorker();
   const p = createProject(graph);
@@ -85,12 +85,12 @@ test("metacog-supervisor: runOnce creates tracked SubagentRun", async () => {
   const sup = makeSupervisor(graph, worker);
   await sup.runOnce();
 
-  const runs = graph.subagentRuns(p.id, { profileId: "metacog" });
-  assert.equal(runs.length, 1);
-  assert.equal(runs[0]!.status, "completed");
+  const records = await agentRecords(p);
+  assert.equal(records.length, 1);
+  assert.equal(records[0]!.status, "applied");
 });
 
-test("metacog-supervisor: runOnce worker error marks run as failed", async () => {
+test("metacog-supervisor: runOnce worker error marks the JSON record failed", async () => {
   const graph = new TestGraph();
   const worker = new MockWorker();
   const p = createProject(graph);
@@ -101,9 +101,9 @@ test("metacog-supervisor: runOnce worker error marks run as failed", async () =>
   const sup = makeSupervisor(graph, worker);
   await sup.runOnce();
 
-  const failedRuns = graph.subagentRuns(p.id, { profileId: "metacog", status: "failed" });
-  assert.equal(failedRuns.length, 1);
-  assert.ok(failedRuns[0]!.errorMessage);
+  const failed = (await agentRecords(p)).filter((record) => record.status === "failed");
+  assert.equal(failed.length, 1);
+  assert.ok(failed[0]!.errorMessage);
 });
 
 test("metacog-supervisor: runOnce does NOT run for inactive projects", async () => {
@@ -120,31 +120,7 @@ test("metacog-supervisor: runOnce does NOT run for inactive projects", async () 
   await sup.runOnce();
 
   assert.equal(metacogCalled, false);
-  assert.equal(graph.subagentRuns(p.id).length, 0);
-});
-
-test("metacog-supervisor: maxActive=1 skips when a run is already running", async () => {
-  const graph = new TestGraph();
-  const worker = new MockWorker();
-  const config = minimalConfig();
-  config.profiles.metacog.maxActive = 1;
-
-  const p = createProject(graph);
-  primeForMetacog(graph, p);
-
-  graph.createSubagentRun(p.id, {
-    profileId: "metacog", role: "metacog", workerName: "mock",
-    inputSummary: "pre-existing run",
-  });
-  graph.updateSubagentRun(p.id, graph.subagentRuns(p.id, { profileId: "metacog" })[0]!.id, { status: "running" });
-
-  worker.register(/Metacog Role/i, env("hints", { hints: [{ content: "should not run" }] }));
-
-  const sup = new MetacogSupervisor(graph, worker, config, 1);
-  await sup.runOnce();
-
-  assert.equal(graph.subagentRuns(p.id, { profileId: "metacog" }).length, 1, "should not create a second run");
-  assert.equal(graph.unconsumedHints(p.id).length, 0, "should not have written hints");
+  assert.equal((await agentRecords(p)).length, 0);
 });
 
 test("metacog-supervisor: unchanged trigger state is coalesced", async () => {
@@ -160,7 +136,7 @@ test("metacog-supervisor: unchanged trigger state is coalesced", async () => {
   await sup.runOnce();
   await sup.runOnce();
 
-  assert.equal(graph.subagentRuns(p.id, { profileId: "metacog" }).length, 1);
+  assert.equal((await agentRecords(p)).filter((record) => record.profileId === "metacog").length, 1);
 });
 
 test("metacog-supervisor: concurrent triggers share one lock-free in-flight execution", async () => {
@@ -182,15 +158,14 @@ test("metacog-supervisor: concurrent triggers share one lock-free in-flight exec
 
   const first = sup.runOnce();
   const second = sup.runOnce();
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(
-    graph.subagentRuns(p.id, { profileId: "metacog", status: "running" }).length,
-    1,
-    "both triggers must share one persisted in-flight run before worker I/O",
-  );
   for (let attempt = 0; attempt < 100 && calls === 0; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 1));
   }
+  assert.equal(
+    (await agentRecords(p)).filter((record) => record.profileId === "metacog" && record.status === "running").length,
+    1,
+    "both triggers must share one in-flight execution",
+  );
   assert.equal(calls, 1);
   release();
   await Promise.all([first, second]);

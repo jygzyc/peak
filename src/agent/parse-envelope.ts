@@ -7,7 +7,7 @@
  * accessors used by the contract validators.
  *
  * Extracted from the original shared module so that contracts.ts,
- * SubagentRunner, MainAgent, and the decision applier share one parsing
+ * BaseAgent, MainAgent, and the decision applier share one parsing
  * implementation.
  */
 

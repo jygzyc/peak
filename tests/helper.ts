@@ -1,11 +1,12 @@
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { TaskConfig, WorkerConfig, SubagentProfile, MetacogTriggers } from "../dist/agent/types.js";
+import type { AgentRecord, Project, TaskConfig, WorkerConfig, SubagentProfile, MetacogTriggers } from "../dist/agent/types.js";
 import { BUILTIN_PERMISSIONS, DEFAULT_METACOG_TRIGGERS } from "../dist/agent/types.js";
 import { TestGraph } from "./test-graph.ts";
 import { MockWorker } from "../dist/worker/mock-worker.js";
 import type { Graph } from "../dist/graph/graph.js";
+import { AgentRecordStore } from "../dist/agent/agent-record-store.js";
 
 const TEMP_DIRS: string[] = [];
 let sessionCounter = 0;
@@ -71,6 +72,10 @@ export function createProject(graph: Graph, overrides: Partial<{
     configPath: "/tmp/task.json",
     taskConfig: overrides.taskConfig ?? minimalConfig(),
   });
+}
+
+export function agentRecords(project: Project): Promise<AgentRecord[]> {
+  return new AgentRecordStore(project.sessionDir).list();
 }
 
 export function env(kind: string, data: unknown): string {
