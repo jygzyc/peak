@@ -56,6 +56,11 @@ export function configFile(): string {
   return peakPath("config.json");
 }
 
+/** ~/.peak/federation.db — durable cross-session broadcast/task-group state. */
+export function federationFile(): string {
+  return peakPath("federation.db");
+}
+
 /**
  * Idempotently ensure the peak home subdirectories exist. Safe to call on every
  * run; creates {agents,tasks,sessions} if missing, never throws on existing.
@@ -70,10 +75,19 @@ export function ensurePeakLayout(): void {
 
 /** Path to a named agent config: ~/.peak/agents/<name>.json. */
 export function agentFile(name: string): string {
+  assertConfigEntryName(name, "agent");
   return join(agentsDir(), `${name}.json`);
 }
 
 /** Path to a named task config: ~/.peak/tasks/<name>.json. */
 export function taskFile(name: string): string {
+  assertConfigEntryName(name, "task");
   return join(tasksDir(), `${name}.json`);
+}
+
+/** Named configs are direct children of their PEAK_HOME directory. */
+export function assertConfigEntryName(name: string, kind = "config"): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || name === "." || name === "..") {
+    throw new Error(`${kind} name must contain only letters, digits, dot, underscore, or hyphen and must not contain a path`);
+  }
 }

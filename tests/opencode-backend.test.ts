@@ -16,22 +16,20 @@ test("opencode-cli: extractResponseText parses NDJSON part.text format (opencode
   assert.equal(text, '{"kind":"fact","data":{"description":"found X"}}');
 });
 
-test("opencode-cli: extractResponseText handles flat text events", () => {
+test("opencode-cli: extractResponseText rejects non-schema flat text events", () => {
   const ndjson = [
     JSON.stringify({ type: "text", text: "hello" }),
     JSON.stringify({ type: "text", text: "world" }),
   ].join("\n");
 
   const text = backend.extractResponseText(ndjson, "");
-  assert.equal(text, "hello\nworld");
+  assert.equal(text, "");
 });
 
-test("opencode-cli: extractResponseText returns plain text when no JSON events", () => {
-  // Non-JSON stdout (plain assistant text with no event stream) is returned
-  // verbatim so callers still get the content.
+test("opencode-cli: extractResponseText rejects plain text output", () => {
   const raw = "just plain text output, no JSON";
   const text = backend.extractResponseText(raw, "");
-  assert.equal(text, raw);
+  assert.equal(text, "");
 });
 
 test("opencode-cli: extractResponseText returns empty for step-only NDJSON (no text, no tool)", () => {
@@ -83,7 +81,7 @@ test("opencode-cli: extractResponseText skips non-JSON lines", () => {
 });
 
 test("opencode-cli: extractSession finds ses_ id in output", () => {
-  const output = 'session created: ses_abc123def456';
+  const output = JSON.stringify({ type: "step_start", sessionID: "ses_abc123def456" });
   const sid = backend.extractSession(output, "");
   assert.equal(sid, "ses_abc123def456");
 });

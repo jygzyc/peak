@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
-import { InMemoryGraph } from "../dist/graph/in-memory-graph.js";
+import { TestFederationBus, TestGraph } from "./test-graph.ts";
 import { MockWorker } from "../dist/worker/mock-worker.js";
 import { SessionLoop } from "../dist/session/session-loop.js";
+import { GlobalSupervisor } from "../dist/session/supervisor.js";
 import { minimalConfig, createProject, env } from "./helper.ts";
 
 function decisions(createIntents: unknown[], failIntents: unknown[] = [], concludeRun: unknown = null) {
@@ -10,7 +11,7 @@ function decisions(createIntents: unknown[], failIntents: unknown[] = [], conclu
 }
 
 test("e2e: planner creates intent, explorer executes, evaluator accepts, stopGate fires", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph, { goal: "ACHIEVE_X" });
@@ -28,7 +29,7 @@ test("e2e: planner creates intent, explorer executes, evaluator accepts, stopGat
 });
 
 test("e2e: planner fails intent (kills explorer) in response to stop-explorer hint", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
@@ -46,7 +47,15 @@ test("e2e: planner fails intent (kills explorer) in response to stop-explorer hi
   worker.register(/## Hints Requiring Response/i, () => {
     // First hint-triggered call fails i001 per the hint; subsequent calls have
     // nothing new — conclude so the run terminates (no maxSteps safety net).
-    if (!hintBlockDone) { hintBlockDone = true; return decisions([], [{ intentId: "i001", reason: "hint says stop" }]); }
+    if (!hintBlockDone) {
+      hintBlockDone = true;
+      return env("decisions", {
+        createIntents: [],
+        failIntents: [{ intentId: "i001", reason: "hint says stop" }],
+        consumeHints: ["h001"],
+        concludeRun: null,
+      });
+    }
     return decisions([], [], { description: "hint handled" });
   });
   const loop = new SessionLoop(graph, worker, config);
@@ -62,7 +71,7 @@ test("e2e: planner fails intent (kills explorer) in response to stop-explorer hi
 });
 
 test("e2e: explorer blocked → candidate describing obstacle → evaluator rejects → planner fails intent", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
@@ -87,7 +96,7 @@ test("e2e: explorer blocked → candidate describing obstacle → evaluator reje
 });
 
 test("e2e: planner can conclude the run via concludeRun decision", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
@@ -101,24 +110,23 @@ test("e2e: planner can conclude the run via concludeRun decision", async () => {
   assert.equal(graph.getProject(p.id)!.status, "completed");
 });
 
-test("tick: multiple projects step concurrently", async () => {
-  const graph = new InMemoryGraph();
-  const worker = new MockWorker();
-  const config = minimalConfig();
-  const p1 = createProject(graph, { session: "s1" });
-  const p2 = createProject(graph, { session: "s2" });
-  let round = 0;
-  worker.register(/automated planning module/i, () => {
-    round++;
-    return round <= 2 ? decisions([{ description: "TASK-Z" }]) : decisions([], [], { description: "goal met" });
-  });
-  worker.register(/TASK-Z/i, env("fact", { description: "done", confidence: 0.9 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
-  const loop = new SessionLoop(graph, worker, config);
+test("GlobalSupervisor ticks separate one-task session runtimes concurrently", async () => {
+  const graph1 = new TestGraph();
+  const graph2 = new TestGraph();
+  const config1 = minimalConfig();
+  const config2 = minimalConfig();
+  const p1 = createProject(graph1, { session: "s1" });
+  const p2 = createProject(graph2, { session: "s2" });
+  const loop1 = new SessionLoop(graph1, new MockWorker().registerDefaults(), config1);
+  const loop2 = new SessionLoop(graph2, new MockWorker().registerDefaults(), config2);
+  const supervisor = new GlobalSupervisor({ federationBus: new TestFederationBus() });
+  supervisor.register("s1", loop1, { projectId: p1.id, scope: "pair" });
+  supervisor.register("s2", loop2, { projectId: p2.id, scope: "pair" });
   for (let i = 0; i < 10; i++) {
-    await loop.tick();
-    if (graph.listProjects("active").length === 0) break;
+    await supervisor.tick();
+    if (graph1.getProject(p1.id)?.status === "completed"
+      && graph2.getProject(p2.id)?.status === "completed") break;
   }
-  assert.equal(graph.getProject(p1.id)!.status, "completed");
-  assert.equal(graph.getProject(p2.id)!.status, "completed");
+  assert.equal(graph1.getProject(p1.id)!.status, "completed");
+  assert.equal(graph2.getProject(p2.id)!.status, "completed");
 });

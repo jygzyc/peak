@@ -12,8 +12,6 @@
 import type { WorkerConfig } from "../../agent/types.js";
 import { SubprocessBackend, type BuildArgvOptions } from "./subprocess.js";
 
-const SESSION_RE = /(ses_[0-9a-zA-Z]{10,})/;
-
 export class OpencodeCliBackend extends SubprocessBackend {
   readonly id = "opencode";
 
@@ -40,9 +38,16 @@ export class OpencodeCliBackend extends SubprocessBackend {
     };
   }
 
-  extractSession(stdout: string, stderr: string): string | undefined {
-    const m = SESSION_RE.exec(stderr) ?? SESSION_RE.exec(stdout);
-    return m ? m[1] : undefined;
+  extractSession(stdout: string, _stderr: string): string | undefined {
+    for (const line of stdout.split(/\r?\n/)) {
+      try {
+        const event = JSON.parse(line) as Record<string, unknown>;
+        if (typeof event.sessionID === "string" && /^ses_[0-9a-zA-Z]{10,}$/.test(event.sessionID)) {
+          return event.sessionID;
+        }
+      } catch { /* ignore non-event diagnostics */ }
+    }
+    return undefined;
   }
 
   /**
@@ -50,9 +55,6 @@ export class OpencodeCliBackend extends SubprocessBackend {
    * Each line is a JSON event. The assistant's text is in events of type
    * "text", nested under `part.text`:
    *   {"type":"text","part":{"type":"text","text":"response"}}
-   * Also handles the message-event shape {type:"message",parts:[...]} as a
-   * fallback for other opencode versions.
-   *
    * Recovery paths (opencode `run -` is non-deterministic and the model
    * sometimes returns its answer in a tool-call step instead of a final text
    * step):
@@ -67,7 +69,6 @@ export class OpencodeCliBackend extends SubprocessBackend {
   extractResponseText(stdout: string, _stderr: string): string {
     const texts: string[] = [];
     const toolOutputs: string[] = [];
-    let sawAnyEvent = false; // distinguish NDJSON streams from plain-text stdout
     for (const line of stdout.split("\n")) {
       const trimmed = line.trim();
       if (!trimmed) continue;
@@ -78,27 +79,12 @@ export class OpencodeCliBackend extends SubprocessBackend {
         continue; // not JSON, skip (opencode may print non-JSON diagnostics)
       }
       const obj = evt as Record<string, unknown>;
-      sawAnyEvent = true;
 
-      // Primary format (opencode 1.17+): { type: "text", part: { text: "..." } }
+      // OpenCode NDJSON format: { type: "text", part: { text: "..." } }
       if (obj.type === "text" && typeof obj.part === "object" && obj.part !== null) {
         const part = obj.part as Record<string, unknown>;
         if (typeof part.text === "string") {
           texts.push(part.text);
-        }
-      }
-
-      // Fallback format: { type: "text", text: "..." } (flat)
-      if (obj.type === "text" && typeof obj.text === "string") {
-        texts.push(obj.text);
-      }
-
-      // Fallback format: { type: "message", role: "assistant", parts: [...] }
-      if (obj.type === "message" && obj.role === "assistant" && Array.isArray(obj.parts)) {
-        for (const part of obj.parts as Array<Record<string, unknown>>) {
-          if (part.type === "text" && typeof part.text === "string") {
-            texts.push(part.text);
-          }
         }
       }
 
@@ -122,12 +108,6 @@ export class OpencodeCliBackend extends SubprocessBackend {
     if (fromTools) {
       return fromTools;
     }
-    // No text and no tool output. Two cases:
-    //  - stdout was an NDJSON event stream (sawAnyEvent): the model stopped
-    //    early with empty output. Return "" so parseEnvelope reports a clear
-    //    "empty output" error instead of leaking {"type":"step_start",...}.
-    //  - stdout was plain non-JSON text (no events recognized): older opencode
-    //    versions or non-JSON output — return it verbatim as the answer.
-    return sawAnyEvent ? "" : stdout.trim();
+    return "";
   }
 }

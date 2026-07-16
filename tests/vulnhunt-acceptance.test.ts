@@ -15,11 +15,10 @@
  */
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
-import { InMemoryGraph } from "../dist/graph/in-memory-graph.js";
+import { TestGraph } from "./test-graph.ts";
 import { MockWorker } from "../dist/worker/mock-worker.js";
 import { SessionLoop } from "../dist/session/session-loop.js";
-import { minimalConfig, createProject, env, PROMPTS_DIR } from "./helper.ts";
-import { join } from "node:path";
+import { minimalConfig, createProject, env } from "./helper.ts";
 
 // ─── Domain knowledge (adapted from decx, inline) ──────────────────────────
 
@@ -64,17 +63,17 @@ Rejection rules: reject when the exact sink path is rebuilt from trusted constan
 function vulnhuntConfig() {
   const config = minimalConfig();
   config.profiles.planner.prompt = {
-    file: join(PROMPTS_DIR, "planner.md"),
+    file: "builtin:planner",
     knowledge: [APP_VULNHUNT_KNOWLEDGE],
     instructions: "Collect the attack surface first, then decompose along composite chains into bounded intents. Fail intents whose evidence the evaluator rejects.",
   };
   config.profiles.explorer.prompt = {
-    file: join(PROMPTS_DIR, "explorer.md"),
+    file: "builtin:explorer",
     knowledge: [APP_VULNHUNT_KNOWLEDGE],
     instructions: "Probe-first: inspect manifest, exported components, deep links before reading source. Cite concrete evidence (manifest line, source location) in every fact.",
   };
   config.profiles.evaluator.prompt = {
-    file: join(PROMPTS_DIR, "evaluator.md"),
+    file: "builtin:evaluator",
     knowledge: [EVIDENCE_GATE],
     instructions: "Apply the four-element gate (reachable/controllable/deeply-traced/impactful) and reject facts with inline-only evidence.",
   };
@@ -98,7 +97,7 @@ function candidateEvidence(prompt: string): string {
 // ─── Acceptance test ───────────────────────────────────────────────────────
 
 test("acceptance: app-vulnhunt — attack-surface collection → trace → evidence-gated promotion", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = vulnhuntConfig();
   const p = createProject(graph, { target: "target.apk", goal: "prove exploitable APK attack paths" });
@@ -147,12 +146,12 @@ test("acceptance: app-vulnhunt — attack-surface collection → trace → evide
 
   // Stateful planner (registered LAST → highest match priority for planner prompts).
   // With replan-on-verdict (accept OR reject), the planner runs multiple rounds.
-  // The response function can inspect the graph (via closure) so it only fails
-  // an intent once its candidate has actually been rejected, and opens the trace
-  // intent only once (avoiding duplicate work on each re-plan).
+  // The response function waits for all three collection Intents to finish,
+  // then opens the trace exactly once from the verified collection Facts.
   //   round 1 (empty): open three attack-surface-collection intents
-  //   round 2+ (verdicts seen): open the trace intent (once), fail rejected
-  //     intents, then conclude once no new work remains.
+  //   round 2+ (verdicts seen): open the trace intent (once), then conclude
+  //     once the trace Fact is accepted. A denied candidate does not rewrite
+  //     its already-completed producing Intent from pass to deny.
   let plannerRound = 0;
   let traceOpened = false;
   worker.register(/automated planning module/i, () => {
@@ -164,20 +163,28 @@ test("acceptance: app-vulnhunt — attack-surface collection → trace → evide
         { description: "COLLECT-SURFACE-C: enumerate deep links", from: [], priority: 1 },
       ]);
     }
-    const createIntents = traceOpened ? [] : [{ description: "TRACE-CONTROL-SINK: follow the url extra through control flow to its sink", from: [], priority: 1 }];
-    if (!traceOpened) traceOpened = true;
-    // Fail the AIDL intent only after its evidence was actually rejected.
-    const denyFacts = graph.facts(p.id, "deny");
-    const failIntents = denyFacts.some((f) => /AIDL service/i.test(f.description))
-      ? [{ intentId: "i002", reason: "evaluator rejected: inline-only evidence" }]
+    const surfaceDone = ["i001", "i002", "i003"].every(
+      (intentId) => graph.getIntent(p.id, intentId)?.status === "pass",
+    );
+    const verifiedSourceIds = graph.facts(p.id, "pass").map((fact) => fact.id);
+    const createIntents = !traceOpened && surfaceDone
+      ? [{
+          description: "TRACE-CONTROL-SINK: follow the url extra through control flow to its sink",
+          from: verifiedSourceIds,
+          priority: 1,
+        }]
       : [];
+    if (createIntents.length > 0) traceOpened = true;
     // Conclude once the trace chain is verified and no new intent is pending.
     const verifiedDescs = graph.facts(p.id, "pass").map((f) => f.description);
     const traceProven = verifiedDescs.some((d) => /control\+sink\+guard/i.test(d));
-    const concludeRun = (traceOpened && traceProven && createIntents.length === 0 && failIntents.length === 0)
-      ? { description: "attack surface exhausted: entrypoint + trace chain proven" }
+    const concludeRun = (traceOpened && traceProven && createIntents.length === 0)
+      ? {
+          description: "attack surface exhausted: entrypoint + trace chain proven",
+          from: graph.facts(p.id, "pass").map((fact) => fact.id),
+        }
       : null;
-    return decisions(createIntents, failIntents, concludeRun);
+    return decisions(createIntents, [], concludeRun);
   });
 
   const loop = new SessionLoop(graph, worker, config);
@@ -186,7 +193,11 @@ test("acceptance: app-vulnhunt — attack-surface collection → trace → evide
   // ── Acceptance criteria ──────────────────────────────────────────────────
 
   // 1. The run completes.
-  assert.equal(result.type, "completed", "vulnhunt run should complete");
+  assert.equal(
+    result.type,
+    "completed",
+    `vulnhunt run should complete; result=${JSON.stringify(result)}; tail=${JSON.stringify(graph.events(p.id).slice(-12))}`,
+  );
   assert.equal(graph.getProject(p.id)!.status, "completed");
 
   const verified = graph.facts(p.id, "pass");
@@ -209,7 +220,13 @@ test("acceptance: app-vulnhunt — attack-surface collection → trace → evide
     assert.ok(f.confidence >= 0.5, `verified fact should meet confidence band: ${f.description} (got ${f.confidence})`);
   }
 
-  // 5. The rejected path's intent was failed by the planner in response.
-  const failedByPlanner = allIntents.find((i) => i.status === "deny" && i.killedBy === "planner");
-  assert.ok(failedByPlanner, "the evaluator-rejected intent should be failed (killedBy=planner)");
+  // 5. Producing Intent completion and Fact validation remain independent.
+  assert.equal(graph.getIntent(p.id, "i002")?.status, "pass");
+
+  // 6. The trace Intent records the two accepted surface Facts as its ordered
+  // input set; the rejected AIDL candidate cannot become a parent.
+  const traceIntent = allIntents.find((intent) => /TRACE-CONTROL-SINK/.test(intent.description));
+  assert.ok(traceIntent);
+  assert.equal(traceIntent!.parentFactIds.length, 2);
+  assert.ok(traceIntent!.parentFactIds.every((id) => graph.getFact(p.id, id)?.status === "pass"));
 });

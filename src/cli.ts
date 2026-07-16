@@ -17,13 +17,11 @@ import { SqliteGraph } from "./graph/sqlite-graph.js";
 import { SessionManager } from "./session/session-manager.js";
 import { FederatedGraph } from "./graph/federated-graph.js";
 import { FederationBus } from "./graph/federation-bus.js";
-import { SessionLoop } from "./session/session-loop.js";
-import { HttpServer } from "./server/http-server.js";
 import { AgentDriverPool } from "./worker/agent-driver-pool.js";
 import { MockWorker } from "./worker/mock-worker.js";
 import { workerCapabilities } from "./worker/registry.js";
 import { defaultConfig } from "./config/default-config.js";
-import { ensurePeakLayout, sessionsDir, agentsDir, tasksDir } from "./config/peak-home.js";
+import { ensurePeakLayout, sessionsDir, agentsDir, tasksDir, federationFile } from "./config/peak-home.js";
 
 /**
  * Process-level singleton for cross-session federation. When `--federation` is
@@ -47,12 +45,13 @@ program
   .option("-s, --session <session>", "session name override")
   .option("-P, --port <port>", "HTTP server port", "25429")
   .option("--host <host>", "HTTP server host", "127.0.0.1")
+  .option("--http-token <token>", "protect HTTP control endpoints (or set PEAK_HTTP_TOKEN)", process.env.PEAK_HTTP_TOKEN)
   .option("--no-http", "disable HTTP server")
   .option("--no-metacog", "disable metacog loop")
   .option("--mock", "use MockWorker instead of real backends")
   .option("--federation", "share verified facts across sessions (cross-session corroboration)")
   .action(async (configPath: string, opts: {
-    session?: string; port: string; host: string;
+    session?: string; port: string; host: string; httpToken?: string;
     http: boolean; metacog: boolean; mock: boolean; federation: boolean;
   }) => {
     // Ensure the ~/.peak/{agents,tasks,sessions} layout exists before running,
@@ -74,12 +73,12 @@ program
     // sessions. The bus is a process-level singleton so multiple runtimes in one
     // process cross-validate; a single-session run gains nothing but the flag is
     // harmless and ready for the multi-session mode.
-    const federationBus = opts.federation ? (sharedFederationBus ??= new FederationBus()) : undefined;
+    const federationBus = opts.federation
+      ? (sharedFederationBus ??= new FederationBus({ dbPath: federationFile() }))
+      : undefined;
 
     const runtime = new AgentRuntime(config, {
       baseDir,
-      host: opts.host,
-      port: parseInt(opts.port),
       workerPool,
       useHttp: opts.http,
       useMetacogSupervisor: opts.metacog,
@@ -98,7 +97,7 @@ program
     console.log(`[peak] goal: ${config.task.goal}`);
 
     if (opts.http) {
-      await runtime.startHttp({ host: opts.host, port: parseInt(opts.port) });
+      await runtime.startHttp({ host: opts.host, port: parseInt(opts.port), token: opts.httpToken });
       console.log(`[peak] dashboard: http://${opts.host}:${opts.port}`);
     }
     if (opts.metacog) {
@@ -121,16 +120,17 @@ program
       }
     }
 
-    if (!opts.http) runtime.close();
+    if (!opts.http) await runtime.close();
   });
 
 program
   .command("resume <session>")
   .description("Resume a stopped/paused session")
   .option("-P, --port <port>", "HTTP server port", "25429")
+  .option("--http-token <token>", "protect HTTP control endpoints (or set PEAK_HTTP_TOKEN)", process.env.PEAK_HTTP_TOKEN)
   .option("--no-http", "disable HTTP server")
   .option("--federation", "share verified facts across sessions (cross-session corroboration)")
-  .action(async (session: string, opts: { port: string; http: boolean; federation: boolean }) => {
+  .action(async (session: string, opts: { port: string; httpToken?: string; http: boolean; federation: boolean }) => {
     const sm = new SessionManager(sessionsDir());
     const info = sm.info(session);
     if (!info.exists) {
@@ -147,28 +147,36 @@ program
     graph.updateProjectStatus(project.id, "active");
 
     const config = project.taskConfig;
+    config.task.session = session;
+    (graph as { close?: () => void }).close?.();
     const pool = new AgentDriverPool();
-    const federationBus = opts.federation ? (sharedFederationBus ??= new FederationBus()) : undefined;
-    const loop = new SessionLoop(graph, pool, config, {
+    const federationBus = opts.federation
+      ? (sharedFederationBus ??= new FederationBus({ dbPath: federationFile() }))
+      : undefined;
+    const runtime = new AgentRuntime(config, {
+      baseDir: sessionsDir(),
+      workerPool: pool,
+      useHttp: opts.http,
+      useMetacogSupervisor: true,
       federationBus,
       sessionId: federationBus ? session : undefined,
     });
-
-    let server: HttpServer | undefined;
+    const projectId = runtime.createProject({
+      session,
+      configPath: project.configPath,
+    });
     if (opts.http) {
-      const { HttpServer } = await import("./server/http-server.js");
-      server = new HttpServer(graph, loop);
-      await server.start({ port: parseInt(opts.port) });
+      await runtime.startHttp({ port: parseInt(opts.port), token: opts.httpToken });
       console.log(`[peak] dashboard: http://127.0.0.1:${opts.port}`);
     }
 
-    console.log(`[peak] resuming project: ${project.id}`);
+    console.log(`[peak] resuming project: ${projectId}`);
     if (opts.federation) {
       console.log(`[peak] federation: sharing verified facts as session "${session}"`);
     }
-    const result = await loop.run(project.id);
+    const result = await runtime.run(projectId);
     console.log(`[peak] finished: ${result.type}`);
-    await server?.stop();
+    await runtime.close();
   });
 
 program
@@ -191,6 +199,7 @@ program
       console.log(`  goal: ${p.goal}`);
       console.log(`  steps: ${progress.stepsExecuted}`);
       console.log(`  passed: ${progress.passFacts}`);
+      console.log(`  candidate: ${progress.candidateFacts}`);
       console.log(`  pending: ${progress.pendingFacts}`);
       console.log(`  denied: ${progress.denyFacts}`);
       console.log(`  open intents: ${progress.openIntents}`);
@@ -241,7 +250,7 @@ program
     }
     const results = fed.searchFactsAcrossSessions(sessions, {
       query,
-      status: opts.status as "pass" | "pending" | "deny" | undefined,
+      status: opts.status as "candidate" | "pass" | "pending" | "deny" | undefined,
       minConfidence: opts.minConfidence,
       limit: opts.limit,
     });

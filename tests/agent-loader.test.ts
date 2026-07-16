@@ -36,9 +36,25 @@ test("loadAgent: reads and validates an agent file", () => {
   });
 });
 
+test("loadAgent: prompt paths resolve relative to the agent file", () => {
+  withAgents({
+    foo: { slot: "explorer", prompt: { file: "prompts/agent.md", rules: ["inline rule"] } },
+  }, (dir) => {
+    const loaded = loadAgent("foo", { agentsDir: dir });
+    assert.equal(loaded.file.prompt?.file, join(dir, "prompts", "agent.md"));
+    assert.deepEqual(loaded.file.prompt?.rules, ["inline rule"]);
+  });
+});
+
 test("loadAgent: throws on missing file", () => {
   withAgents({}, (dir) => {
     assert.throws(() => loadAgent("nope", { agentsDir: dir }), /agent config not found/);
+  });
+});
+
+test("loadAgent: rejects path traversal even with an injected agents directory", () => {
+  withAgents({}, (dir) => {
+    assert.throws(() => loadAgent("../outside", { agentsDir: dir }), /must not contain a path/);
   });
 });
 
@@ -72,10 +88,26 @@ test("applyAgentPatch: declared fields override, omitted fields keep builtin", (
   assert.equal(merged.output.contract, baseExplorer.output.contract);
 });
 
-test("applyAgentPatch: permissions are replaced wholesale when declared", () => {
-  const agent: AgentFile = { slot: "explorer", permissions: ["write_hint"] };
+test("applyAgentPatch: permissions may narrow the explorer role", () => {
+  const agent: AgentFile = { slot: "explorer", permissions: ["handle_intent"] };
   const merged = applyAgentPatch(baseExplorer, agent);
-  assert.deepEqual(merged.permissions, ["write_hint"], "permissions replaced, not concatenated");
+  assert.deepEqual(merged.permissions, ["handle_intent"], "permissions replaced, not concatenated");
+});
+
+test("applyAgentPatch: permissions cannot expand across role boundaries", () => {
+  const agent: AgentFile = { slot: "explorer", permissions: ["change_fact"] };
+  assert.throws(
+    () => applyAgentPatch(baseExplorer, agent),
+    /cannot declare permissions: change_fact/,
+  );
+});
+
+test("applyAgentPatch: output contract must match the role", () => {
+  const agent: AgentFile = { slot: "explorer", output: { contract: "verdict" } };
+  assert.throws(
+    () => applyAgentPatch(baseExplorer, agent),
+    /cannot use output contract "verdict"/,
+  );
 });
 
 test("applyAgentPatch: metacog triggers attach to the metacog slot", () => {
@@ -86,6 +118,21 @@ test("applyAgentPatch: metacog triggers attach to the metacog slot", () => {
   assert.equal(merged.triggers?.everySeconds, 60);
   // base triggers replaced wholesale (declared object wins)
   assert.equal(merged.triggers?.stagnationLevel, undefined);
+});
+
+test("applyAgentPatch: preserves typed skills and merges retry policy", () => {
+  const base: SubagentProfile = {
+    ...baseExplorer,
+    prompt: { ...baseExplorer.prompt, skills: ["base-skill.md"] },
+    retry: { maxAttempts: 3, backoffMs: 10 },
+  };
+  const merged = applyAgentPatch(base, {
+    slot: "explorer",
+    prompt: { skills: ["agent-skill.md"] },
+    retry: { maxAttempts: 5 },
+  });
+  assert.deepEqual(merged.prompt.skills, ["agent-skill.md"]);
+  assert.deepEqual(merged.retry, { maxAttempts: 5, backoffMs: 10 });
 });
 
 test("injectAgents: patches the declared slot and collects workers", () => {

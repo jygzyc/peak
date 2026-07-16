@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
-import { InMemoryGraph } from "../dist/graph/in-memory-graph.js";
+import { TestGraph } from "./test-graph.ts";
 import { MockWorker } from "../dist/worker/mock-worker.js";
 import { SessionLoop } from "../dist/session/session-loop.js";
 import { minimalConfig, createProject, env } from "./helper.ts";
@@ -9,8 +9,8 @@ function decisions(createIntents: unknown[] = []) {
   return env("decisions", { createIntents, failIntents: [], consumeHints: [], concludeRun: null });
 }
 
-test("directive stop: project moves to stopped, step returns completed", async () => {
-  const graph = new InMemoryGraph();
+test("directive stop: project moves to stopped, step returns stopped", async () => {
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
@@ -22,12 +22,12 @@ test("directive stop: project moves to stopped, step returns completed", async (
   const loop = new SessionLoop(graph, worker, config);
   const result = await loop.step(p.id);
 
-  assert.equal(result.type, "completed");
+  assert.equal(result.type, "stopped");
   assert.equal(graph.getProject(p.id)!.status, "stopped");
 });
 
 test("directive pause: project moves to paused, step returns idle", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
@@ -41,7 +41,7 @@ test("directive pause: project moves to paused, step returns idle", async () => 
 });
 
 test("directive resume: paused project returns to active via directive", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
@@ -61,12 +61,14 @@ test("directive resume: paused project returns to active via directive", async (
 });
 
 test("directive hint: adds hint to graph, consumed by planner", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
   worker.register(/automated planning module/i, decisions([{ description: "INITIAL" }]));
-  worker.register(/## Hints Requiring Response/i, decisions([]));
+  worker.register(/## Hints Requiring Response/i, env("decisions", {
+    createIntents: [], failIntents: [], consumeHints: ["h001"], concludeRun: null,
+  }));
   worker.register(/INITIAL/i, env("fact", { description: "done", confidence: 0.9 }));
   worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
 
@@ -82,7 +84,7 @@ test("directive hint: adds hint to graph, consumed by planner", async () => {
 });
 
 test("directive kill-intent: fails the targeted intent", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
@@ -107,7 +109,7 @@ test("directive kill-intent: fails the targeted intent", async () => {
 });
 
 test("directive spawn-intent: adds new intent to graph", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
@@ -125,7 +127,7 @@ test("directive spawn-intent: adds new intent to graph", async () => {
 });
 
 test("directive: multiple directives consumed in order", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);

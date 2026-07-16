@@ -40,6 +40,7 @@ export class ConfiguredProvider implements ModelProvider {
         system: input.system,
         temperature: input.temperature,
         maxOutputTokens: input.maxTokens ?? config.maxTokens ?? 4096,
+        abortSignal: input.signal,
         ...(input.system ? { experimental_providerMetadata: { anthropic: { cacheControl: { type: "ephemeral" } } } } : {}),
       });
       return { text };
@@ -52,6 +53,7 @@ export class ConfiguredProvider implements ModelProvider {
       system: input.system,
       temperature: input.temperature,
       maxOutputTokens: input.maxTokens ?? config.maxTokens,
+      abortSignal: input.signal,
     });
     return { text };
   }

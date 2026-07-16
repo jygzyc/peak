@@ -22,7 +22,6 @@ import { createHash } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
-  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -32,7 +31,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
@@ -52,16 +51,14 @@ const EXTERNAL = [
   "@ai-sdk/anthropic",
 ];
 
-// Windows: npm/node are .cmd shims that require shell:true to spawn.
-const SHELL = process.platform === "win32";
-
 try {
   await step("typecheck", () => {
-    const result = spawnSync("npm", ["run", "typecheck"], {
+    const npm = npmInvocation(["run", "typecheck"]);
+    const result = spawnSync(npm.command, npm.args, {
       cwd: root,
       stdio: "inherit",
       env: npmEnv(),
-      shell: SHELL,
+      shell: false,
     });
     if (result.status !== 0) {
       process.exit(result.status ?? 1);
@@ -75,14 +72,6 @@ try {
 
   await step("copy dashboard.html", () => {
     copyFileSync(join(root, "src", "server", "dashboard.html"), join(distDir, "dashboard.html"));
-  });
-
-  await step("copy builtin prompts", () => {
-    // The builtin role prompts (planner/explorer/evaluator/metacog) are loaded
-    // at runtime via DIST_ROOT-relative paths, so they must ship inside dist/.
-    cpSync(join(root, "src", "agent", "prompts"), join(distDir, "agent", "prompts"), {
-      recursive: true,
-    });
   });
 
   await step("esbuild bundle", async () => {
@@ -114,7 +103,7 @@ try {
       process.stderr.write(`bundle did not produce ${distEntry}\n`);
       process.exit(1);
     }
-    const verify = spawnSync("node", [distEntry, "workers"], {
+    const verify = spawnSync(process.execPath, [distEntry, "workers"], {
       cwd: root,
       encoding: "utf-8",
       maxBuffer: 1024 * 1024 * 10,
@@ -140,18 +129,21 @@ try {
     rmSync(outDir, { recursive: true, force: true });
     mkdirSync(outDir, { recursive: true });
 
-    const packed = spawnSync(
-      "npm",
+    const npm = npmInvocation(
       // --ignore-scripts: skip the prepack lifecycle hook here, because THIS
       // script IS the prepack step. Without it, prepack → pack.mjs → npm pack
       // → prepack would recurse infinitely once a "prepack" script is declared.
       ["pack", "--pack-destination", outDir, "--ignore-scripts", "--json"],
+    );
+    const packed = spawnSync(
+      npm.command,
+      npm.args,
       {
         cwd: root,
         encoding: "utf-8",
         maxBuffer: 1024 * 1024 * 10,
         env: npmEnv(),
-        shell: SHELL,
+        shell: false,
       },
     );
 
@@ -212,4 +204,19 @@ function npmEnv() {
   // propagates dry-run into prepack's env and would make the inner pack a
   // no-op, leaving no tarball to verify).
   return { ...process.env, npm_config_cache: npmCache, npm_config_dry_run: "" };
+}
+
+function npmInvocation(args) {
+  const fromLifecycle = process.env.npm_execpath;
+  if (fromLifecycle && existsSync(fromLifecycle)) {
+    return { command: process.execPath, args: [fromLifecycle, ...args] };
+  }
+  if (process.platform === "win32") {
+    const bundled = join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
+    if (existsSync(bundled)) {
+      return { command: process.execPath, args: [bundled, ...args] };
+    }
+    throw new Error("npm CLI path not found; run this script through `npm run pack`");
+  }
+  return { command: "npm", args };
 }

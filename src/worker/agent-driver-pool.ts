@@ -14,9 +14,12 @@ import { executeWorker } from "./registry.js";
 
 export class AgentDriverPool implements WorkerPool {
   private runningPerProject = new Map<ProjectId, Set<string>>();
-  private workerCallCounter = 0;
+  private workerPickCounter = 0;
 
   async execute(request: WorkerRequest): Promise<WorkerResult> {
+    if (!request.workerName || !request.role || !request.projectId || !request.cwd) {
+      throw new Error("worker request requires workerName, role, projectId, and cwd");
+    }
     const config = request.config;
     const backendConfig = {
       kind: config.kind === "mock" ? "agent" : (config.kind as "agent" | "api"),
@@ -35,20 +38,21 @@ export class AgentDriverPool implements WorkerPool {
       timeoutMs: config.timeoutMs,
     } as const;
 
-    const workerName = request.workerName ?? `agent-${this.workerCallCounter++}`;
-    if (request.projectId) this.markRunning(request.projectId, workerName);
+    const workerName = request.workerName;
+    this.markRunning(request.projectId, workerName);
     const result = await Promise.resolve(executeWorker({
       worker: workerName,
-      role: request.role ?? "explorer",
-      projectId: request.projectId ?? "project",
-      sessionDir: request.cwd ?? process.cwd(),
+      role: request.role,
+      projectId: request.projectId,
+      sessionDir: request.cwd,
       prompt: request.prompt,
       config: backendConfig,
       cwd: request.cwd,
       sessionId: request.sessionId,
       conclude: request.conclude,
+      signal: request.signal,
     })).finally(() => {
-      if (request.projectId) this.unmarkRunning(request.projectId, workerName);
+      this.unmarkRunning(request.projectId, workerName);
     });
 
     return {
@@ -57,11 +61,14 @@ export class AgentDriverPool implements WorkerPool {
       returncode: result.returncode,
       stderr: result.stderr,
       sessionId: result.sessionId,
+      timedOut: result.timedOut,
+      aborted: result.aborted,
     };
   }
 
-  pickWorker(projectId: ProjectId, config: TaskConfig): WorkerName {
-    const candidates = Object.keys(config.workers);
+  pickWorker(projectId: ProjectId, config: TaskConfig, allowed?: WorkerName[]): WorkerName {
+    const candidates = (allowed?.length ? allowed : Object.keys(config.workers))
+      .filter((name) => config.workers[name]);
     if (candidates.length === 0) return "noop";
 
     // Heterogeneous preference: pick the first worker not currently running
@@ -71,7 +78,7 @@ export class AgentDriverPool implements WorkerPool {
       const idle = candidates.find((w) => !running.has(w));
       if (idle) return idle;
     }
-    return candidates[this.workerCallCounter % candidates.length];
+    return candidates[this.workerPickCounter++ % candidates.length];
   }
 
   runningCount(projectId: ProjectId): number {

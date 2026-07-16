@@ -19,6 +19,7 @@ export interface WorkerRequest {
   sessionId?: string;
   /** Marks this invocation as a conclude-phase call (force-summarize, no further work). */
   conclude?: boolean;
+  signal?: AbortSignal;
 }
 
 export interface WorkerResult {
@@ -27,6 +28,8 @@ export interface WorkerResult {
   stdout: string;
   stderr: string;
   sessionId?: string;
+  timedOut?: boolean;
+  aborted?: boolean;
 }
 
 export interface WorkerDriver {

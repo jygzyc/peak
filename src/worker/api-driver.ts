@@ -39,11 +39,18 @@ export class ApiDriver implements WorkerDriver {
         maxTokens: this.config.maxTokens,
         model: this.config.model,
         temperature: this.config.temperature,
+        signal: request.signal,
       };
       const result: ModelCallResult = await provider.complete(callInput, this.config);
       return { worker: this.name, returncode: 0, stdout: result.text, stderr: "" };
     } catch (error) {
-      return { worker: this.name, returncode: 1, stdout: "", stderr: error instanceof Error ? error.message : String(error) };
+      return {
+        worker: this.name,
+        returncode: 1,
+        stdout: "",
+        stderr: error instanceof Error ? error.message : String(error),
+        aborted: request.signal?.aborted || undefined,
+      };
     }
   }
 }

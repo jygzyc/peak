@@ -42,10 +42,7 @@ test("loadConfig: overrides workers and scheduler", () => {
   assert.equal(config.workers.opencode.model, "claude-sonnet-4");
 });
 
-test("loadConfig: legacy workflow.limits maps to scheduler (backward compat)", () => {
-  // Old task.json files used workflow.limits for scheduler knobs. The loader
-  // maps maxConcurrent/refillPerTick/workerLeaseMs forward; maxSteps/stopGate/
-  // maxStagnation are ignored (no depth limit, natural termination).
+test("loadConfig: rejects workflow because scheduler is the only execution config", () => {
   const dir = mkdtempSync(join(tmpdir(), "peak-cfg-"));
   const cfg = {
     task: { target: "T", goal: "G" },
@@ -53,9 +50,29 @@ test("loadConfig: legacy workflow.limits maps to scheduler (backward compat)", (
   };
   writeFileSync(join(dir, "task.json"), JSON.stringify(cfg));
 
-  const { config } = loadConfig(join(dir, "task.json"));
-  assert.equal(config.scheduler!.maxConcurrent, 5, "legacy maxConcurrent maps to scheduler");
-  assert.equal(config.scheduler!.refillPerTick, 2, "legacy refillPerTick maps to scheduler");
+  assert.throws(() => loadConfig(join(dir, "task.json")), /unknown field "workflow"/);
+});
+
+test("loadConfig: rejects removed federation and metacog aliases", () => {
+  const dir = mkdtempSync(join(tmpdir(), "peak-cfg-"));
+  const path = join(dir, "task.json");
+  writeFileSync(path, JSON.stringify({
+    task: { target: "T", goal: "G" },
+    federation: { group: "old-name", enabled: true },
+  }));
+  assert.throws(
+    () => loadConfig(path, undefined, { skipBaseline: true }),
+    /federation.*unknown field "group"/,
+  );
+
+  writeFileSync(path, JSON.stringify({
+    task: { target: "T", goal: "G" },
+    control: { metacogIntervalSeconds: 10 },
+  }));
+  assert.throws(
+    () => loadConfig(path, undefined, { skipBaseline: true }),
+    /control.*unknown field "metacogIntervalSeconds"/,
+  );
 });
 
 test("loadConfig: explorer can declare a worker pool", () => {
@@ -76,19 +93,48 @@ test("loadConfig: explorer can declare a worker pool", () => {
   assert.deepEqual(config.profiles.explorer.runtime.workers, ["codex", "claude-code"]);
 });
 
-test("loadConfig: non-array agents field is ignored (legacy object shape no longer throws)", () => {
-  // `agents` as an ARRAY is the new injection feature. A legacy OBJECT-shaped
-  // `agents` (the old removed field) is now silently ignored rather than
-  // rejected, so old configs that happened to use the key won't hard-fail.
+test("loadConfig: task prompt paths resolve relative to the task file", () => {
+  const dir = mkdtempSync(join(tmpdir(), "peak-cfg-"));
+  mkdirSync(join(dir, "prompts"), { recursive: true });
+  writeFileSync(join(dir, "prompts", "explorer.md"), "# Task Explorer");
+  writeFileSync(join(dir, "prompts", "rules.md"), "task rule");
+  writeFileSync(join(dir, "task.json"), JSON.stringify({
+    task: { target: "T", goal: "G" },
+    profiles: {
+      explorer: {
+        runtime: { worker: "opencode" },
+        prompt: { file: "prompts/explorer.md", rules: ["prompts/rules.md", "inline rule"] },
+      },
+    },
+  }));
+
+  const { config } = loadConfig(join(dir, "task.json"), undefined, { skipBaseline: true });
+  assert.equal(config.profiles.explorer.prompt.file, join(dir, "prompts", "explorer.md"));
+  assert.deepEqual(config.profiles.explorer.prompt.rules, [
+    join(dir, "prompts", "rules.md"),
+    "inline rule",
+  ]);
+});
+
+test("loadConfig: workspace resolves relative to task config and stays separate from state", () => {
+  const dir = mkdtempSync(join(tmpdir(), "peak-cfg-"));
+  mkdirSync(join(dir, "fixture"), { recursive: true });
+  writeFileSync(join(dir, "task.json"), JSON.stringify({
+    task: { target: "fixture/app", goal: "analyze", workspace: "fixture" },
+  }));
+  const loaded = loadConfig(join(dir, "task.json"), undefined, { skipBaseline: true });
+  assert.equal(loaded.workspaceDir, join(dir, "fixture"));
+  assert.equal(loaded.config.task.workspace, join(dir, "fixture"));
+  assert.equal(loaded.sessionDir, dir);
+});
+
+test("loadConfig: rejects a non-array agents field", () => {
   const dir = mkdtempSync(join(tmpdir(), "peak-cfg-"));
   writeFileSync(join(dir, "task.json"), JSON.stringify({
     task: { target: "T", goal: "G" },
     agents: { explorer: { worker: "opencode" } },
   }));
-  const { config } = loadConfig(join(dir, "task.json"));
-  assert.equal(config.task.target, "T");
-  // builtin profiles are untouched (object agents ignored, not injected)
-  assert.equal(config.profiles.explorer.runtime.worker, "opencode");
+  assert.throws(() => loadConfig(join(dir, "task.json")), /agents must be an array/);
 });
 
 
@@ -127,15 +173,10 @@ test("defaultConfig: returns valid config with opencode as default worker", () =
   assert.equal(config.workers.opencode.kind, "agent");
 });
 
-test("metacog everySeconds default is consistent across all sources", () => {
-  // DEFAULT_METACOG_TRIGGERS, the metacog profile's triggers, and
-  // control.metacogIntervalSeconds must all agree on the wall-clock metacog
-  // interval. Triggers now live on the metacog profile (per-agent), not a
-  // global workflow block.
+test("metacog cadence has one source of truth on the profile", () => {
   const config = defaultConfig();
   assert.equal(DEFAULT_METACOG_TRIGGERS.everySeconds, 30);
   assert.equal(config.profiles.metacog?.triggers?.everySeconds, 30);
-  assert.equal(config.control?.metacogIntervalSeconds, 30);
 });
 
 test("loadConfig: agents array injects ~/.peak/agents/ configs into builtin slots", () => {

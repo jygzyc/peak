@@ -1,0 +1,58 @@
+{
+  "task": {
+    "name": "Receiver App token-to-WebView vulnerability analysis",
+    "session": "app-receiver",
+    "target": "Receiver App exported broadcast receiver and WebView bridge",
+    "goal": "Prove or reject the cross-App auth-token broadcast to JavaScript disclosure chain",
+    "workspace": "../apps/receiver"
+  },
+  "profiles": {
+    "planner": {
+      "role": "planner",
+      "runtime": { "worker": "codex" },
+      "prompt": {
+        "file": "builtin:planner",
+        "knowledge": ["../knowledge/cross-app-broadcast.md"],
+        "rules": ["../../app-vuln-analysis/rules/evidence-gate.md"],
+        "skills": ["../skills/cross-app-static-analysis.md"],
+        "instructions": "Analyze only the Receiver App. Keep token impact pending until an evaluated Sender App broadcast proves the upstream sensitive token source."
+      },
+      "context": { "graphView": "full", "maxFacts": 80 }
+    },
+    "explorer": {
+      "role": "explorer",
+      "runtime": { "worker": "codex" },
+      "prompt": {
+        "file": "builtin:explorer",
+        "knowledge": ["../knowledge/cross-app-broadcast.md"],
+        "rules": ["../../app-vuln-analysis/rules/evidence-gate.md"],
+        "skills": ["../skills/cross-app-static-analysis.md"]
+      },
+      "context": { "graphView": "focused", "maxFacts": 60 }
+    },
+    "evaluator": {
+      "role": "evaluator",
+      "runtime": { "worker": "codex" },
+      "prompt": {
+        "file": "builtin:evaluator",
+        "knowledge": ["../knowledge/cross-app-broadcast.md"],
+        "rules": ["../../app-vuln-analysis/rules/evidence-gate.md"]
+      },
+      "context": { "graphView": "evidence-only", "maxFacts": 80 }
+    },
+    "metacog": {
+      "role": "metacog",
+      "runtime": { "worker": "codex" },
+      "prompt": {
+        "file": "builtin:metacog",
+        "knowledge": ["../knowledge/cross-app-broadcast.md"],
+        "rules": ["../../app-vuln-analysis/rules/evidence-gate.md"]
+      },
+      "context": { "graphView": "summary", "maxFacts": 100 }
+    }
+  },
+  "workers": { "codex": { "kind": "agent", "backend": "codex", "timeoutMs": 300000 } },
+  "scheduler": { "maxConcurrent": 2, "refillPerTick": 2, "workerLeaseMs": 300000 },
+  "control": { "mainProfile": "planner", "metacogProfile": "metacog", "globalMaxConcurrent": 2 },
+  "federation": { "scope": "two-app-vuln", "members": ["app-sender", "app-receiver"] }
+}

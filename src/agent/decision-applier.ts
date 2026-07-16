@@ -8,13 +8,14 @@
  * The applier does NOT call workers; it only mutates the graph.
  */
 
-import type { ProjectId, TaskConfig, Verdict } from "./types.js";
+import type { ProjectId, TaskConfig } from "./types.js";
 import type { Graph } from "../graph/graph.js";
 import type { MainDecision } from "./contracts.js";
 import { PermissionChecker } from "./permissions.js";
 
 export interface DecisionApplierResult {
   intentsCreated: number;
+  explorersStopped: number;
   intentsFailed: number;
   hintsConsumed: number;
   concluded: boolean;
@@ -25,7 +26,6 @@ export interface ApplyDecisionContext {
   graph: Graph;
   config: TaskConfig;
   decision: MainDecision;
-  hintIdsToConsume?: string[];
   permissions: PermissionChecker;
 }
 
@@ -33,6 +33,7 @@ export function applyMainDecision(ctx: ApplyDecisionContext): DecisionApplierRes
   const { projectId, graph, decision, permissions } = ctx;
   const result: DecisionApplierResult = {
     intentsCreated: 0,
+    explorersStopped: 0,
     intentsFailed: 0,
     hintsConsumed: 0,
     concluded: false,
@@ -50,6 +51,8 @@ export function applyMainDecision(ctx: ApplyDecisionContext): DecisionApplierRes
 
     for (const spec of decision.createIntents) {
       permissions.require("create_intent");
+      const dispatchExplorer = spec.dispatchExplorer ?? true;
+      if (dispatchExplorer) permissions.require("create_subagent_explorer");
       if (graph.isDeadEnd(projectId, spec.description)) {
         graph.logEvent(projectId, "planner.dead_end_skipped", { description: spec.description });
         continue;
@@ -67,13 +70,30 @@ export function applyMainDecision(ctx: ApplyDecisionContext): DecisionApplierRes
         creator: "planner",
         parentFactIds: spec.parentFactIds,
         priority: spec.priority,
+        dispatchRequested: dispatchExplorer,
       });
       activeGoals.push(spec.description);
       result.intentsCreated += 1;
     }
 
+    for (const intentId of decision.dispatchExplorerIntentIds ?? []) {
+      permissions.require("create_subagent_explorer");
+      graph.requestExplorerDispatch(projectId, intentId);
+    }
+
+    for (const intentId of decision.stopExplorerIntentIds ?? []) {
+      permissions.require("stop_subagent_explorer");
+      try {
+        graph.stopExplorer(projectId, intentId, "stopped by planner");
+        result.explorersStopped += 1;
+      } catch { /* intent may already be terminal */ }
+    }
+
     for (const fail of decision.failIntents) {
       permissions.require("fail_intent");
+      if (graph.getIntent(projectId, fail.intentId)?.status === "claimed") {
+        permissions.require("stop_subagent_explorer");
+      }
       try {
         graph.failIntent(projectId, fail.intentId, fail.reason, false, "planner");
         graph.logEvent(projectId, "planner.kill_explorer", { intentId: fail.intentId, reason: fail.reason });
@@ -81,7 +101,7 @@ export function applyMainDecision(ctx: ApplyDecisionContext): DecisionApplierRes
       } catch { /* intent may already be concluded */ }
     }
 
-    for (const hintId of decision.consumeHintIds.length > 0 ? decision.consumeHintIds : (ctx.hintIdsToConsume ?? [])) {
+    for (const hintId of decision.consumeHintIds) {
       try {
         graph.consumeHint(projectId, hintId);
         result.hintsConsumed += 1;
@@ -89,20 +109,14 @@ export function applyMainDecision(ctx: ApplyDecisionContext): DecisionApplierRes
     }
 
     if (decision.concludeRun) {
-      permissions.require("conclude_run");
-      graph.updateProjectStatus(projectId, "completed");
-      graph.logEvent(projectId, "planner.conclude", { description: decision.concludeRun.description });
+      permissions.require("create_end_fact");
+      const fromFactIds = decision.concludeRun.fromFactIds ?? graph.facts(projectId, "pass").map((fact) => fact.id);
+      graph.createEndFact(projectId, decision.concludeRun.description, fromFactIds);
       result.concluded = true;
     }
 
     return result;
   });
-}
-
-export interface VerdictTrigger {
-  factId: string;
-  verdict: Verdict;
-  intentId?: string;
 }
 
 // ─── intent near-duplicate detection (planner backstop) ───

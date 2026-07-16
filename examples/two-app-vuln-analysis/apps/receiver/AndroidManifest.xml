@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.peakdemo.receiver">
+    <application android:label="Peak Receiver Fixture">
+        <receiver android:name=".TokenReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="com.peakdemo.AUTH_TOKEN" />
+            </intent-filter>
+        </receiver>
+        <activity android:name=".TokenWebViewActivity" android:exported="true" />
+    </application>
+</manifest>

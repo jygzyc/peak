@@ -15,7 +15,8 @@ function env(kind: string, data: unknown): ReturnType<typeof parseEnvelope> {
 
 test("contracts: validateMainDecision parses createIntents with from+priority", () => {
   const d = validateMainDecision(env("decisions", {
-    createIntents: [{ description: "do X", from: ["f001"], priority: 2 }],
+    createIntents: [{ description: "do X", from: ["f001"], priority: 2, dispatchExplorer: false }],
+    dispatchExplorerIntentIds: ["i001"],
     failIntents: [{ intentId: "i002", reason: "wrong" }],
     concludeRun: null,
   }));
@@ -23,8 +24,17 @@ test("contracts: validateMainDecision parses createIntents with from+priority", 
   assert.equal(d.createIntents[0].description, "do X");
   assert.deepEqual(d.createIntents[0].parentFactIds, ["f001"]);
   assert.equal(d.createIntents[0].priority, 2);
+  assert.equal(d.createIntents[0].dispatchExplorer, false);
+  assert.deepEqual(d.dispatchExplorerIntentIds, ["i001"]);
   assert.equal(d.failIntents[0].intentId, "i002");
   assert.equal(d.concludeRun, undefined);
+});
+
+test("contracts: createIntents require an explicit explorer dispatch decision", () => {
+  assert.throws(() => validateMainDecision(env("decisions", {
+    createIntents: [{ description: "missing dispatch flag" }],
+    failIntents: [],
+  })), /dispatchExplorer.*boolean/);
 });
 
 test("contracts: validateMainDecision parses concludeRun", () => {

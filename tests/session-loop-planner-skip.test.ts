@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
-import { InMemoryGraph } from "../dist/graph/in-memory-graph.js";
+import { TestGraph } from "./test-graph.ts";
 import { MockWorker } from "../dist/worker/mock-worker.js";
 import { SessionLoop } from "../dist/session/session-loop.js";
 import { minimalConfig, createProject, env } from "./helper.ts";
@@ -10,7 +10,7 @@ function decisions(createIntents: unknown[] = [], concludeRun: unknown = null) {
 }
 
 test("planner-skip: accept verdict DOES re-trigger planner (to chain downstream work)", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
 
@@ -32,7 +32,7 @@ test("planner-skip: accept verdict DOES re-trigger planner (to chain downstream 
 });
 
 test("planner-skip: reject verdict DOES trigger planner with verdicts", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
 
@@ -59,7 +59,7 @@ test("planner-skip: reject verdict DOES trigger planner with verdicts", async ()
 });
 
 test("planner-skip: defer verdict DOES trigger planner", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
 
@@ -79,7 +79,7 @@ test("planner-skip: defer verdict DOES trigger planner", async () => {
 });
 
 test("planner-skip: stop-explorer hint triggers planner even during cooldown", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   config.profiles.planner.cooldownSteps = 0;
@@ -102,7 +102,7 @@ test("planner-skip: stop-explorer hint triggers planner even during cooldown", a
 });
 
 test("planner-skip: empty graph always runs planner", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
@@ -122,7 +122,7 @@ test("planner-skip: empty graph always runs planner", async () => {
 });
 
 test("planner-skip: accept verdict re-plans (to chain downstream), but cooldown still gates idle re-runs", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   config.profiles.planner.cooldownSteps = 5;
@@ -149,7 +149,7 @@ test("planner-skip: accept verdict re-plans (to chain downstream), but cooldown 
 });
 
 test("planner-skip: reject bypasses cooldown and triggers planner", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   config.profiles.planner.cooldownSteps = 99;

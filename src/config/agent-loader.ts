@@ -13,7 +13,7 @@
  */
 
 import { readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type {
   SubagentProfile,
   BuiltinProfiles,
@@ -26,8 +26,11 @@ import type {
   GraphView,
   OutputContract,
   MetacogTriggers,
+  RetryPolicy,
 } from "../agent/types.js";
-import { agentFile } from "./peak-home.js";
+import { agentFile, assertConfigEntryName } from "./peak-home.js";
+import { BUILTIN_PERMISSIONS } from "../agent/types.js";
+import { resolvePromptPaths } from "./prompt-loader.js";
 
 export const BUILTIN_SLOTS = ["planner", "explorer", "evaluator", "metacog"] as const;
 export type BuiltinSlot = (typeof BUILTIN_SLOTS)[number];
@@ -45,9 +48,8 @@ export interface AgentFile {
   cooldownSteps?: number;
   triggers?: MetacogTriggers;
   intervalSeconds?: number;
-  sessionReuse?: boolean;
   maxOutputTokens?: number;
-  promptCache?: boolean;
+  retry?: RetryPolicy;
   /** Worker definitions this role brings; merged into the task workers. */
   workers?: Record<WorkerName, WorkerConfig>;
 }
@@ -68,6 +70,7 @@ export interface InjectionOptions {
  * not an object, or declares an invalid slot.
  */
 export function loadAgent(name: string, opts: InjectionOptions = {}): LoadedAgent {
+  assertConfigEntryName(name, "agent");
   const path = opts.agentsDir ? join(opts.agentsDir, `${name}.json`) : agentFile(name);
   if (!existsSync(path)) {
     throw new Error(`agent config not found: ${name} (looked for ${path})`);
@@ -81,7 +84,14 @@ export function loadAgent(name: string, opts: InjectionOptions = {}): LoadedAgen
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error(`agent config "${name}" must be a JSON object`);
   }
+  const unknown = Object.keys(parsed).find((key) => ![
+    "slot", "runtime", "prompt", "context", "permissions", "output",
+    "maxActive", "cooldownSteps", "triggers", "intervalSeconds",
+    "maxOutputTokens", "retry", "workers",
+  ].includes(key));
+  if (unknown) throw new Error(`agent config "${name}" contains unknown field "${unknown}"`);
   const file = parsed as AgentFile;
+  if (file.prompt) file.prompt = resolvePromptPaths(file.prompt, dirname(path));
   if (!file.slot || typeof file.slot !== "string") {
     throw new Error(`agent config "${name}" must declare a string \`slot\``);
   }
@@ -100,6 +110,28 @@ export function loadAgent(name: string, opts: InjectionOptions = {}): LoadedAgen
  * so an agent can narrow a builtin's capabilities.
  */
 export function applyAgentPatch(base: SubagentProfile, agent: AgentFile): SubagentProfile {
+  if (agent.permissions) {
+    const allowed = new Set(BUILTIN_PERMISSIONS[base.role]);
+    const forbidden = agent.permissions.filter((permission) => !allowed.has(permission));
+    if (forbidden.length > 0) {
+      throw new Error(
+        `agent slot "${base.role}" cannot declare permissions: ${forbidden.join(", ")}`,
+      );
+    }
+  }
+  if (agent.output?.contract) {
+    const allowedContracts: Record<SubagentProfile["role"], OutputContract[]> = {
+      planner: ["main_decision"],
+      explorer: ["candidate_fact"],
+      evaluator: ["verdict"],
+      metacog: ["hints", "stop"],
+    };
+    if (!allowedContracts[base.role].includes(agent.output.contract)) {
+      throw new Error(
+        `agent slot "${base.role}" cannot use output contract "${agent.output.contract}"`,
+      );
+    }
+  }
   const merged: SubagentProfile = {
     role: base.role,
     runtime: mergeRuntime(base.runtime, agent.runtime),
@@ -116,11 +148,8 @@ export function applyAgentPatch(base: SubagentProfile, agent: AgentFile): Subage
   }
   if (agent.triggers) merged.triggers = agent.triggers;
   else if (base.triggers) merged.triggers = base.triggers;
-  for (const key of ["sessionReuse", "promptCache"] as const) {
-    const v = agent[key];
-    if (typeof v === "boolean") merged[key] = v;
-    else if (base[key] !== undefined) merged[key] = base[key];
-  }
+  if (agent.retry) merged.retry = { ...base.retry, ...agent.retry };
+  else if (base.retry) merged.retry = base.retry;
   return merged;
 }
 
@@ -140,6 +169,7 @@ function mergePrompt(base: PromptSpec, patch?: Partial<PromptSpec>): PromptSpec 
     file: patch.file ?? base.file,
     ...(patch.rules ? { rules: patch.rules } : base.rules ? { rules: base.rules } : {}),
     ...(patch.knowledge ? { knowledge: patch.knowledge } : base.knowledge ? { knowledge: base.knowledge } : {}),
+    ...(patch.skills ? { skills: patch.skills } : base.skills ? { skills: base.skills } : {}),
     ...(patch.instructions ? { instructions: patch.instructions } : base.instructions ? { instructions: base.instructions } : {}),
     ...(patch.concludeFile ? { concludeFile: patch.concludeFile } : base.concludeFile ? { concludeFile: base.concludeFile } : {}),
   };
@@ -154,8 +184,6 @@ function mergeContext(base: ContextSpec, patch?: Partial<ContextSpec>): ContextS
   else if (base.includeDeadEnds !== undefined) merged.includeDeadEnds = base.includeDeadEnds;
   if (patch.includeProgress !== undefined) merged.includeProgress = patch.includeProgress;
   else if (base.includeProgress !== undefined) merged.includeProgress = base.includeProgress;
-  if (patch.rotateOnContextFull !== undefined) merged.rotateOnContextFull = patch.rotateOnContextFull;
-  else if (base.rotateOnContextFull !== undefined) merged.rotateOnContextFull = base.rotateOnContextFull;
   if (patch.relevanceScope !== undefined) merged.relevanceScope = patch.relevanceScope;
   else if (base.relevanceScope !== undefined) merged.relevanceScope = base.relevanceScope;
   return merged;

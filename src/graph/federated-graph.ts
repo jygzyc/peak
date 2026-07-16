@@ -90,6 +90,9 @@ export class FederatedGraph {
         sql += " ORDER BY created_at LIMIT ?";
         params.push(limit);
         const rows = db.prepare(sql).all(...params);
+        const sourceQuery = db.prepare(
+          "SELECT fact_id FROM intent_sets WHERE project_id = ? AND intent_id = ? ORDER BY ordinal",
+        );
         for (const row of rows) {
           results.push({
             sessionId: sid,
@@ -97,9 +100,12 @@ export class FederatedGraph {
               id: String(row.id), projectId: String(row.project_id),
               description: String(row.description),
               creator: String(row.creator) as Intent["creator"],
-              parentFactIds: JSON.parse(String(row.parent_fact_ids_json ?? "[]")),
+              parentFactIds: sourceQuery.all(row.project_id, row.id)
+                .map((source: Record<string, unknown>) => String(source.fact_id)),
               status: String(row.status) as Intent["status"],
+              dispatchRequested: Number(row.dispatch_requested ?? 1) !== 0,
               parentIntentId: row.parent_intent_id ? String(row.parent_intent_id) : undefined,
+              leaseEpoch: Number(row.lease_epoch ?? 0),
               priority: Number(row.priority),
               createdAt: String(row.created_at),
             },

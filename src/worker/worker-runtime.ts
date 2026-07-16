@@ -1,31 +1,31 @@
 /**
  * WorkerPool — the execution abstraction for peak.
  *
- * Stages never call subprocesses directly. They call WorkerPool.execute().
- * This indirection makes every Stage a pure function of (input, graph, workerPool),
- * which is what makes MockWorker-based testing possible.
+ * Agent protocol code never calls subprocesses directly. It calls
+ * WorkerPool.execute(), which keeps execution replaceable in tests.
  *
  * Two implementations:
  *   - MockWorker: testing, returns canned responses by regex match
  *   - AgentDriverPool: production, wraps AgentDriver + AgentBackend + ModelProvider
  */
 
-import type { TaskConfig, WorkerConfig, WorkerName } from "../agent/types.js";
+import type { SessionRole, TaskConfig, WorkerConfig, WorkerName } from "../agent/types.js";
 import type { ProjectId } from "../agent/types.js";
 
 export interface WorkerRequest {
   prompt: string;
   config: WorkerConfig;
-  workerName?: WorkerName;
-  /** Role of the profile issuing this request (planner/explorer/evaluator/metacog or custom). */
-  role?: string;
-  projectId?: ProjectId;
-  expectedPayload?: string;
-  cwd?: string;
+  workerName: WorkerName;
+  /** Protocol role issuing this request. */
+  role: SessionRole;
+  projectId: ProjectId;
+  cwd: string;
   maxOutputTokens?: number;
   sessionId?: string;
   /** Marks this invocation as a conclude-phase call (force-summarize, no further work). */
   conclude?: boolean;
+  /** Cancels the underlying HTTP request or process tree. */
+  signal?: AbortSignal;
 }
 
 export interface WorkerResult {
@@ -35,6 +35,7 @@ export interface WorkerResult {
   stderr?: string;
   sessionId?: string;
   timedOut?: boolean;
+  aborted?: boolean;
 }
 
 export interface WorkerPool {
@@ -48,22 +49,10 @@ export interface WorkerPool {
    * Pick a worker for the given project. Should prefer heterogeneous engines
    * (an engine not currently running for this project) when possible.
    */
-  pickWorker(projectId: ProjectId, config: TaskConfig): WorkerName;
+  pickWorker(projectId: ProjectId, config: TaskConfig, candidates?: WorkerName[]): WorkerName;
 
   /**
    * Number of workers currently executing for the given project.
    */
   runningCount(projectId: ProjectId): number;
-}
-
-/**
- * A worker pool that does nothing — for configs that have no workers
- * or for early prototyping. Always fails.
- */
-export class NullWorkerPool implements WorkerPool {
-  async execute(): Promise<WorkerResult> {
-    return { workerId: "null", text: "", returncode: 1, stderr: "null worker pool" };
-  }
-  pickWorker(): WorkerName { return "null"; }
-  runningCount(): number { return 0; }
 }

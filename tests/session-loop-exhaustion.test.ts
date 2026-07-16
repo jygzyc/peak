@@ -9,7 +9,7 @@
  */
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
-import { InMemoryGraph } from "../dist/graph/in-memory-graph.js";
+import { TestGraph } from "./test-graph.ts";
 import { MockWorker } from "../dist/worker/mock-worker.js";
 import { SessionLoop } from "../dist/session/session-loop.js";
 import { minimalConfig, createProject, env } from "./helper.ts";
@@ -19,7 +19,7 @@ function decisions(ci: unknown[] = [], fi: unknown[] = [], cr: unknown = null) {
 }
 
 test("exhaustion: planner chains a downstream trace intent after an accepted fact (re-plan on accept)", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph, { goal: "G" });
@@ -54,7 +54,7 @@ test("exhaustion: planner chains a downstream trace intent after an accepted fac
 test("exhaustion: does NOT complete while an intent is still claimed (in-flight explorer)", async () => {
   // A worker that resolves slowly simulates an in-flight explorer whose claim
   // is still live when checkTermination first sees openIntents === 0.
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph, { goal: "G" });

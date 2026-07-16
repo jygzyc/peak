@@ -25,8 +25,7 @@ interface MockEntry {
 
 export class MockWorker implements WorkerPool {
   private entries: MockEntry[] = [];
-  private runningPerProject = new Map<ProjectId, Set<string>>();
-  private callLog: Array<{ prompt: string; text: string; workerName?: string }> = [];
+  private callLog: Array<{ prompt: string; text: string; workerName?: string; cwd?: string }> = [];
 
   register(pattern: RegExp, response: ResponseSpec, returncode = 0): this {
     this.entries.unshift({ pattern, response, returncode });
@@ -53,6 +52,7 @@ export class MockWorker implements WorkerPool {
         if (plannerInvoked) {
           return envelope("decisions", {
             createIntents: [],
+            stopExplorerIntentIds: [],
             failIntents: [],
             consumeHints: [],
             concludeRun: { description: "mock goal reached" },
@@ -60,7 +60,14 @@ export class MockWorker implements WorkerPool {
         }
         plannerInvoked = true;
         return envelope("decisions", {
-          createIntents: [{ description: "MOCK-INTENT: inspect the target's entry point", from: [], priority: 1 }],
+          createIntents: [{
+            description: "MOCK-INTENT: inspect the target's entry point",
+            from: [],
+            priority: 1,
+            dispatchExplorer: true,
+          }],
+          dispatchExplorerIntentIds: [],
+          stopExplorerIntentIds: [],
           failIntents: [],
           consumeHints: [],
           concludeRun: null,
@@ -88,44 +95,49 @@ export class MockWorker implements WorkerPool {
     return this;
   }
 
-  calls(): Array<{ prompt: string; text: string; workerName?: string }> {
+  calls(): Array<{ prompt: string; text: string; workerName?: string; cwd?: string }> {
     return [...this.callLog];
   }
 
   async execute(request: WorkerRequest): Promise<WorkerResult> {
+    if (request.signal?.aborted) {
+      return { workerId: "mock", text: "", returncode: 1, stderr: "mock worker cancelled", aborted: true };
+    }
     for (const entry of this.entries) {
       if (entry.pattern.test(request.prompt)) {
         const raw: string | Promise<string> = typeof entry.response === "function"
           ? entry.response(request)
           : entry.response;
-        const text = await Promise.resolve(raw);
-        this.callLog.push({ prompt: request.prompt, text, workerName: request.workerName });
+        const text = await abortable(raw, request.signal);
+        this.callLog.push({ prompt: request.prompt, text, workerName: request.workerName, cwd: request.cwd });
         return { workerId: "mock", text, returncode: entry.returncode };
       }
     }
     const stderr = `no mock match for prompt: ${request.prompt.slice(0, 100)}`;
-    this.callLog.push({ prompt: request.prompt, text: "", workerName: request.workerName });
+    this.callLog.push({ prompt: request.prompt, text: "", workerName: request.workerName, cwd: request.cwd });
     return { workerId: "mock", text: "", returncode: 1, stderr };
   }
 
-  pickWorker(projectId: ProjectId, config: TaskConfig): WorkerName {
-    const candidates = Object.keys(config.workers);
-    const running = this.runningPerProject.get(projectId);
-    return candidates.find((w) => !running?.has(w)) ?? candidates[0] ?? "mock";
+  pickWorker(projectId: ProjectId, config: TaskConfig, allowed?: WorkerName[]): WorkerName {
+    const candidates = (allowed?.length ? allowed : Object.keys(config.workers))
+      .filter((name) => config.workers[name]);
+    return candidates[0] ?? "mock";
   }
 
-  runningCount(projectId: ProjectId): number {
-    return this.runningPerProject.get(projectId)?.size ?? 0;
-  }
+  runningCount(_projectId: ProjectId): number { return 0; }
+}
 
-  markRunning(projectId: ProjectId, workerId: string): void {
-    let s = this.runningPerProject.get(projectId);
-    if (!s) {
-      s = new Set();
-      this.runningPerProject.set(projectId, s);
-    }
-    s.add(workerId);
-  }
+async function abortable(value: string | Promise<string>, signal?: AbortSignal): Promise<string> {
+  if (!signal) return Promise.resolve(value);
+  return new Promise<string>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason instanceof Error
+      ? signal.reason
+      : new Error("mock worker cancelled"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(value).then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", onAbort);
+    });
+  });
 }
 
 /** Build a `{kind, data}` worker envelope string — the shape contracts expect. */

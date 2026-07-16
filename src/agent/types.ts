@@ -2,13 +2,13 @@
  * Core data model for peak.
  *
  * The model is intentionally graph-first and domain-neutral: facts, intents,
- * hints, directives, links, events, subagent runs, workers, and workflow
+ * hints, directives, links, events, subagent runs, workers, and scheduling
  * limits describe analysis structure while domain meaning stays in
  * descriptions, evidence, and prompts.
  *
- * Roles are plain strings; source code does not encode role names beyond the
- * built-in defaults used by SessionLoop wiring. Custom profiles can introduce
- * arbitrary role identifiers (e.g. "android-source-finder").
+ * The protocol has four fixed session roles. Domain specialization belongs in
+ * arbitrary profile ids, prompts, knowledge, skills, models, and workers; a
+ * profile binds to one of the four roles and cannot invent new capabilities.
  */
 
 export type ProjectId = string;
@@ -17,13 +17,10 @@ export type IntentId = string;
 export type HintId = string;
 export type DirectiveId = string;
 export type RunId = string;
+export type EndFactId = string;
 
-/**
- * Role identifiers are free-form strings. A small set of built-in defaults is
- * exported for convenience, but custom SubagentProfiles may use any role name
- * without touching source code.
- */
-export type RoleId = string;
+export type SessionRole = "planner" | "explorer" | "evaluator" | "metacog";
+export type RoleId = SessionRole | "system";
 
 export const BUILTIN_ROLES = {
   planner: "planner",
@@ -38,7 +35,14 @@ export type ToolKind = "tool" | "skill";
 
 export type ISOTime = string;
 
-export type ProjectStatus = "active" | "paused" | "completed" | "failed" | "stopped";
+export type ProjectStatus =
+  | "active"
+  | "paused"
+  | "finish_proposed"
+  | "exhausted"
+  | "completed"
+  | "failed"
+  | "stopped";
 
 export interface Project {
   id: ProjectId;
@@ -49,13 +53,19 @@ export interface Project {
   status: ProjectStatus;
   worker: string;
   sessionDir: string;
+  /** User/task workspace inspected by coding-agent workers; distinct from state. */
+  workspaceDir: string;
   configPath: string;
   taskConfig: TaskConfig;
   createdAt: ISOTime;
   updatedAt: ISOTime;
 }
 
-export type FactStatus = "pending" | "pass" | "deny";
+/**
+ * candidate: produced by an explorer and awaiting evaluator review.
+ * pending: reviewed, but blocked on explicit requiredConditions.
+ */
+export type FactStatus = "candidate" | "pass" | "deny" | "pending";
 
 export interface Fact {
   id: FactId;
@@ -72,18 +82,36 @@ export interface Fact {
   createdAt: ISOTime;
 }
 
+/** Planner-authored, provisional proof that a session may finish. */
+export interface EndFact {
+  id: EndFactId;
+  projectId: ProjectId;
+  description: string;
+  fromFactIds: FactId[];
+  status: "active" | "superseded";
+  createdAt: ISOTime;
+  supersededAt?: ISOTime;
+  supersededReason?: string;
+}
+
 export type IntentStatus = "open" | "claimed" | "pass" | "deny";
 
 export interface Intent {
   id: IntentId;
   projectId: ProjectId;
   description: string;
-  creator: RoleId | "workflow" | "human";
+  creator: RoleId | "human";
   parentFactIds: FactId[];
   status: IntentStatus;
+  /** Planner-authored dispatch gate. An open Intent is not executable until
+   * create_subagent_explorer has explicitly requested an explorer. */
+  dispatchRequested: boolean;
   parentIntentId?: IntentId;
+  /** Monotonic fencing token. It is never reset when a lease is released. */
+  leaseEpoch: number;
   lease?: {
     workerId: string;
+    epoch: number;
     claimedAt: ISOTime;
     expiresAt: ISOTime;
   };
@@ -124,9 +152,19 @@ export interface Verdict {
   requiredConditions?: string[];
 }
 
+/** Evaluator result for a cross-session FactBroadcast. It is deliberately
+ * unable to create local Facts, Intents, or Hints. */
+export interface BroadcastAssessment {
+  decision: "relevant" | "irrelevant" | "condition_satisfied";
+  reason: string;
+  /** Existing local pending Fact whose condition the broadcast satisfies. */
+  targetFactId?: FactId;
+}
+
 export interface Progress {
   totalFacts: number;
   passFacts: number;
+  candidateFacts: number;
   pendingFacts: number;
   denyFacts: number;
   openIntents: number;
@@ -154,7 +192,14 @@ export interface DirectiveInput {
 
 // ─── Subagent runs (first-class trackable, cancellable executions) ───
 
-export type RunStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
+export type RunStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "abandoned"
+  | "discarded";
 
 /**
  * A SubagentRun tracks one execution of a SubagentProfile against the graph.
@@ -171,18 +216,33 @@ export interface SubagentRun {
   role: RoleId;
   workerName: WorkerName;
   status: RunStatus;
+  /** Stable identity of the logical dispatch while it is pending/running. */
+  dispatchKey?: string;
+  /** Current coordinator lease. leaseEpoch fences prior owners after expiry. */
+  ownerId?: string;
+  attempt: number;
+  leaseEpoch: number;
+  heartbeatAt?: ISOTime;
+  leaseExpiresAt?: ISOTime;
   intentId?: IntentId;
   factId?: FactId;
   parentRunId?: RunId;
   inputSummary?: string;
   outputSummary?: string;
   errorMessage?: string;
-  rotateOf?: RunId;
-  usedDelta?: boolean;
   /** True when the run's output came from a conclude-fallback retry. */
   usedConclude?: boolean;
   inputTokens?: number;
   outputTokens?: number;
+  /** Hash and component provenance of the exact static prompt injected. */
+  promptHash?: string;
+  promptManifest?: PromptManifest;
+  /** Immutable, derived Graph context file used to build this run's prompt. */
+  contextArtifact?: ContextArtifact;
+  /** Validated role JSON captured before the control plane applies it. */
+  outputArtifact?: RoleOutputArtifact;
+  /** Opaque backend conversation id, retained only as run provenance. */
+  workerSessionId?: string;
   createdAt: ISOTime;
   startedAt?: ISOTime;
   finishedAt?: ISOTime;
@@ -192,12 +252,11 @@ export interface SubagentRunInput {
   profileId: string;
   role: RoleId;
   workerName: WorkerName;
+  dispatchKey?: string;
   intentId?: IntentId;
   factId?: FactId;
   parentRunId?: RunId;
   inputSummary?: string;
-  rotateOf?: RunId;
-  usedDelta?: boolean;
 }
 
 // ─── Workers ───
@@ -236,23 +295,83 @@ export interface RuntimeSpec {
 }
 
 /**
- * Prompt assembly specification. The role preamble may come from a file, raw
- * text, optional rules/knowledge appendices, and optional instructions block.
- * At runtime, ContextBuilder prepends dynamic graph context per `context`.
+ * Prompt assembly specification. `file` accepts a `builtin:<id>` source or an
+ * external file path. Rules, knowledge, skills, and instructions are appended
+ * to that system prompt. ContextBuilder supplies runtime graph context.
  */
 export interface PromptSpec {
   file: string;
   rules?: string[];
   knowledge?: string[];
+  /** Versioned task skill instructions. Paths and inline text are both allowed. */
+  skills?: string[];
   instructions?: string;
   /**
-   * Optional conclude-phase prompt file. When set, a profile enables conclude
+   * Optional conclude-phase builtin source or external prompt file. When set,
+   * a profile enables conclude
    * fallback: if the worker's first output fails to parse into a valid envelope,
    * the worker is re-invoked (in the same session when the backend supports
    * resume) with this prompt, which forces it to summarize already-confirmed
    * findings into the required JSON shape. Modeled on Cairn's conclude phase.
    */
   concludeFile?: string;
+}
+
+export type PromptComponentKind =
+  | "primary"
+  | "rule"
+  | "knowledge"
+  | "skill"
+  | "instructions"
+  | "conclude"
+  | "graph-context"
+  | "assignment"
+  | "output-contract";
+
+export interface PromptManifestComponent {
+  kind: PromptComponentKind;
+  index: number;
+  source: string;
+  resolvedPath?: string;
+  sha256: string;
+  bytes: number;
+  graphSeq?: number;
+  artifactSha256?: string;
+  delivery?: "reference";
+}
+
+export interface PromptManifest {
+  version: 1;
+  /** Hash of the normalized, fully assembled static preamble. */
+  hash: string;
+  components: PromptManifestComponent[];
+}
+
+export interface ContextArtifact {
+  version: 1;
+  sessionId: string;
+  projectId: ProjectId;
+  graphSeq: number;
+  view: GraphView;
+  relativePath: string;
+  resolvedPath: string;
+  sha256: string;
+  bytes: number;
+  delivery: "reference";
+  createdAt: ISOTime;
+}
+
+export interface RoleOutputArtifact {
+  version: 1;
+  sessionId: string;
+  projectId: ProjectId;
+  runId: RunId;
+  role: RoleId;
+  relativePath: string;
+  resolvedPath: string;
+  sha256: string;
+  bytes: number;
+  createdAt: ISOTime;
 }
 
 /**
@@ -266,7 +385,6 @@ export interface ContextSpec {
   maxFacts?: number;
   includeDeadEnds?: boolean;
   includeProgress?: boolean;
-  rotateOnContextFull?: boolean;
   relevanceScope?: "linked" | "all";
 }
 
@@ -277,12 +395,17 @@ export interface ContextSpec {
 export type Permission =
   | "create_intent"
   | "fail_intent"
-  | "spawn_subagent"
-  | "cancel_subagent"
-  | "resolve_fact"
+  | "handle_hint"
+  | "create_subagent_explorer"
+  | "stop_subagent_explorer"
+  | "create_end_fact"
+  | "handle_intent"
   | "write_candidate_fact"
-  | "write_hint"
-  | "conclude_run";
+  | "change_fact"
+  | "receive_fact_broadcast"
+  | "create_hint"
+  | "get_graph"
+  | "send_fact_broadcast";
 
 /**
  * Output contract identifier. The contracts module validates worker output
@@ -292,11 +415,19 @@ export type OutputContract =
   | "main_decision"
   | "candidate_fact"
   | "verdict"
+  | "broadcast_assessment"
   | "hints"
   | "stop";
 
 export interface OutputSpec {
   contract: OutputContract;
+}
+
+export interface RetryPolicy {
+  /** Consecutive transport/parse/contract failures before the project fails. */
+  maxAttempts?: number;
+  /** Reserved scheduling delay between attempts; zero means next eligible tick. */
+  backoffMs?: number;
 }
 
 /**
@@ -309,7 +440,7 @@ export interface OutputSpec {
  *   - triggers: (metacog) when the wall-clock metacog loop fires.
  */
 export interface SubagentProfile {
-  role: RoleId;
+  role: SessionRole;
   runtime: RuntimeSpec;
   prompt: PromptSpec;
   context: ContextSpec;
@@ -321,9 +452,8 @@ export interface SubagentProfile {
   cooldownSteps?: number;
   /** Metacog-only: when the metacog wall-clock loop fires. */
   triggers?: MetacogTriggers;
-  sessionReuse?: boolean;
   maxOutputTokens?: number;
-  promptCache?: boolean;
+  retry?: RetryPolicy;
 }
 
 /** Metacog firing triggers (per-metacog-profile, not global). */
@@ -351,18 +481,30 @@ export interface TaskConfig {
     goal: string;
     session?: string;
     name?: string;
+    /** Worker cwd, resolved relative to the task config file. */
+    workspace?: string;
   };
   profiles: BuiltinProfiles & Record<string, SubagentProfile>;
   workers: Record<WorkerName, WorkerConfig>;
   /** Scheduler resource knobs (optional; defaults suffice). Not a "workflow". */
   scheduler?: SchedulerConfig;
   control?: ControlConfig;
+  federation?: FederationConfig;
+}
+
+export interface FederationConfig {
+  /** Related-session completion and broadcast visibility boundary. */
+  scope?: string;
+  /** Expected related session ids. Required for safe cross-process grouping;
+   * omitted means membership is the sessions registered before execution. */
+  members?: string[];
 }
 
 export interface ControlConfig {
   mainProfile?: string;
+  explorerProfile?: string;
+  evaluatorProfile?: string;
   metacogProfile?: string;
-  metacogIntervalSeconds?: number;
   globalMaxConcurrent?: number;
 }
 
@@ -379,10 +521,18 @@ export interface SchedulerConfig {
   workerLeaseMs?: number;
 }
 
-/** Default scheduler values (used when TaskConfig.scheduler is absent). */
+/**
+ * Default scheduler values (used when TaskConfig.scheduler is absent).
+ *
+ * maxConcurrent/refillPerTick default to 10 so the explorer pool can fan out to
+ * many parallel intents in a single step. This pairs with the planner's fan-out
+ * guidance (see agent/prompts/planner.ts): the planner is asked to produce many
+ * small independent intents, and these defaults ensure the scheduler dispatches
+ * them concurrently rather than throttling to one explorer per tick.
+ */
 export const DEFAULT_SCHEDULER = {
-  maxConcurrent: 3,
-  refillPerTick: 1,
+  maxConcurrent: 10,
+  refillPerTick: 10,
   workerLeaseMs: 300_000,
 } as const;
 
@@ -397,12 +547,12 @@ export const DEFAULT_METACOG_TRIGGERS: MetacogTriggers = {
  * Permission sets for the built-in roles. Custom profiles declare their own.
  * Exported so the default config and tests share one source of truth.
  */
-export const BUILTIN_PERMISSIONS: Record<string, Permission[]> = {
+export const BUILTIN_PERMISSIONS: Record<SessionRole, Permission[]> = {
   planner: [
-    "create_intent", "fail_intent", "spawn_subagent", "cancel_subagent",
-    "write_hint", "conclude_run",
+    "create_intent", "fail_intent", "handle_hint", "create_subagent_explorer",
+    "stop_subagent_explorer", "create_end_fact",
   ],
-  explorer: ["write_candidate_fact"],
-  evaluator: ["resolve_fact"],
-  metacog: ["write_hint"],
+  explorer: ["handle_intent", "write_candidate_fact"],
+  evaluator: ["change_fact", "receive_fact_broadcast"],
+  metacog: ["create_hint", "get_graph", "send_fact_broadcast"],
 };

@@ -1,246 +1,262 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
-import { InMemoryGraph } from "../dist/graph/in-memory-graph.js";
+import { TestFederationBus, TestGraph } from "./test-graph.ts";
 import { MockWorker } from "../dist/worker/mock-worker.js";
 import { SessionLoop } from "../dist/session/session-loop.js";
+import { MetacogSupervisor } from "../dist/session/metacog-supervisor.js";
 import { FederationBus } from "../dist/graph/federation-bus.js";
-import { evaluatorExtra } from "../dist/agent/subagent-runner.js";
+import { broadcastEvaluatorExtra } from "../dist/agent/subagent-runner.js";
 import { minimalConfig, createProject, env } from "./helper.ts";
-import type { Fact } from "../dist/agent/types.js";
-
-/**
- * Cross-session federation: a sibling session's VERIFIED facts and RULED-OUT
- * dead-ends are surfaced to the local evaluator as read-only corroboration.
- * The evaluator cross-validates the local candidate against them — sibling facts
- * never enter the local graph; they only appear in the evaluator's prompt.
- */
-
-const SAMPLE_CANDIDATE: Fact = {
-  id: "f001",
-  projectId: "proj_1",
-  description: "port 8080 exposes an unauthenticated admin panel",
-  evidence: ["nmap shows 8080 open", "curl /admin returns 200 without auth"],
-  source: "explorer",
-  confidence: 0.7,
-  status: "pending",
-  createdAt: "2026-07-14T00:00:00Z",
-};
-
-test("evaluatorExtra: renders Cross-session Corroboration when sibling facts present", () => {
-  const out = evaluatorExtra(SAMPLE_CANDIDATE, [
-    { summary: "admin panel at :8080 confirmed reachable", confidence: 0.9, fromSession: "sess-a" },
-  ]);
-  assert.match(out, /Cross-session Corroboration/);
-  assert.match(out, /sess-a/);
-  assert.match(out, /admin panel at :8080 confirmed reachable/);
-  assert.match(out, /conf 0\.9/);
-  // The candidate itself is still rendered.
-  assert.match(out, /port 8080 exposes an unauthenticated admin panel/);
-});
-
-test("evaluatorExtra: renders Cross-session Dead-ends when sibling dead-ends present", () => {
-  const out = evaluatorExtra(SAMPLE_CANDIDATE, undefined, [
-    { summary: "brute-forcing ssh on :22 is a dead end (rate-limited)", confidence: 0.2, fromSession: "sess-b" },
-  ]);
-  assert.match(out, /Cross-session Dead-ends/);
-  assert.match(out, /sess-b/);
-  assert.match(out, /brute-forcing ssh/);
-});
-
-test("evaluatorExtra: omits federation sections when no sibling insights", () => {
-  const out = evaluatorExtra(SAMPLE_CANDIDATE);
-  assert.doesNotMatch(out, /Cross-session/);
-  // Backward compatible — plain candidate render still works.
-  assert.match(out, /Candidate Fact Under Review/);
-});
-
-test("evaluatorExtra: empty arrays render nothing (no empty headers)", () => {
-  const out = evaluatorExtra(SAMPLE_CANDIDATE, [], []);
-  assert.doesNotMatch(out, /Cross-session/);
-});
 
 function decisions(createIntents: unknown[] = [], concludeRun: unknown = null) {
   return env("decisions", { createIntents, failIntents: [], consumeHints: [], concludeRun });
 }
 
-test("federation: sibling verified fact appears in the evaluator's prompt during a run", async () => {
-  // Session B shares a bus that already carries a fact insight published by a
-  // sibling (sess-a). When B's evaluator runs, its prompt must contain the
-  // Cross-session Corroboration section citing the sibling's finding.
-  const graph = new InMemoryGraph();
+function attachMetacog(
+  graph: TestGraph,
+  worker: MockWorker,
+  config: ReturnType<typeof minimalConfig>,
+  loop: SessionLoop,
+  bus: FederationBus,
+  sessionId: string,
+) {
+  const metacog = new MetacogSupervisor(
+    graph,
+    worker,
+    config,
+    undefined,
+    { sessionId, scope: "app-group" },
+  );
+  loop.setMetacog(metacog);
+  return metacog;
+}
+
+test("broadcastEvaluatorExtra renders an untrusted broadcast and local pending facts", () => {
+  const graph = new TestGraph();
+  const project = createProject(graph);
+  const fact = graph.addFact(project.id, {
+    description: "exported activity may lack permission",
+    source: "explorer",
+  });
+  graph.resolveFact(project.id, fact.id, {
+    decision: "pending",
+    reason: "need manifest evidence",
+    requiredConditions: ["manifest export"],
+  });
+
+  const prompt = broadcastEvaluatorExtra({
+    id: "b1",
+    kind: "fact",
+    sourceSessionId: "manifest-session",
+    sourceProjectId: "p1",
+    sourceFactId: "f1",
+    summary: "manifest confirms the activity is exported",
+    confidence: 0.95,
+  }, graph.facts(project.id, "pending"));
+
+  assert.match(prompt, /FactBroadcast Under Review/);
+  assert.match(prompt, /Broadcast kind: fact/);
+  assert.match(prompt, /untrusted external reference/);
+  assert.match(prompt, new RegExp(fact.id));
+  assert.match(prompt, /broadcast_assessment/);
+});
+
+test("broadcastEvaluatorExtra distinguishes a final session summary from a Fact", () => {
+  const prompt = broadcastEvaluatorExtra({
+    id: "summary-1",
+    kind: "session_summary",
+    sourceSessionId: "manifest-session",
+    sourceProjectId: "p1",
+    summary: "manifest analysis finished",
+    confidence: 1,
+  }, []);
+  assert.match(prompt, /Broadcast kind: session_summary/);
+  assert.match(prompt, /not a Fact/);
+  assert.match(prompt, /cannot satisfy a pending Fact condition/);
+});
+
+test("received broadcast creates a tracked evaluator run and advances the durable cursor", async () => {
+  const bus = new TestFederationBus();
+  bus.registerSession("source", "app-group");
+
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
-  const p = createProject(graph);
-  const bus = new FederationBus();
+  config.federation = { scope: "app-group" };
+  const project = createProject(graph);
+  const loop = new SessionLoop(graph, worker, config, {
+    federationBus: bus,
+    sessionId: "target",
+    federationScope: "app-group",
+  });
+
+  worker.register(/automated planning module/i, decisions());
+  worker.register(/Cross-session FactBroadcast Under Review/i, env("broadcast_assessment", {
+    decision: "relevant",
+    reason: "this affects the same app component",
+  }));
+
+  const insight = bus.publishInsight(
+    "fact",
+    { sessionId: "source", projectId: "source-project", factId: "f001" },
+    "an exported activity accepts untrusted deep links",
+    0.9,
+    undefined,
+    { id: "fact:source:f001", scope: "app-group" },
+  );
+
+  await loop.step(project.id);
+
+  const event = graph.events(project.id).find(
+    (item) => item.type === "federation.broadcast_assessed"
+      && item.payload.broadcastId === insight.id,
+  );
+  assert.ok(event);
+  assert.equal(event!.payload.decision, "relevant");
+  assert.equal(event!.payload.broadcastKind, "fact");
+  const runs = graph.subagentRuns(project.id, { profileId: "evaluator" });
+  assert.ok(runs.some((run) => run.inputSummary?.includes(insight.id) && run.status === "completed"));
+  assert.equal(graph.facts(project.id).length, 0, "external broadcast must not become a local Fact");
+  assert.equal(bus.pendingForSession("target").length, 0);
+  assert.equal(bus.cursor("target"), bus.headSeq("app-group"));
+});
+
+test("repeated broadcast evaluator failures fail the session instead of livelocking the group", async () => {
+  const bus = new TestFederationBus();
+  bus.registerSession("source", "app-group");
+  const graph = new TestGraph();
+  const worker = new MockWorker();
+  const config = minimalConfig();
+  config.profiles.evaluator.retry = { maxAttempts: 2 };
+  config.federation = { scope: "app-group" };
+  const project = createProject(graph, { session: "poison-target" });
+  const loop = new SessionLoop(graph, worker, config, {
+    federationBus: bus,
+    sessionId: "poison-target",
+    federationScope: "app-group",
+  });
+  worker.register(/Cross-session FactBroadcast Under Review/i, "not a worker envelope");
+  const insight = bus.publishInsight(
+    "fact",
+    { sessionId: "source", projectId: "source-project", factId: "poison" },
+    "broadcast that repeatedly fails evaluation",
+    0.8,
+    undefined,
+    { id: "fact:source:poison", scope: "app-group" },
+  );
+
+  await loop.step(project.id);
+  assert.equal(graph.getProject(project.id)?.status, "active");
+  const result = await loop.step(project.id);
+  assert.equal(result.type, "failed");
+  assert.equal(graph.getProject(project.id)?.status, "failed");
+  assert.equal(bus.pendingForSession("poison-target")[0]?.id, insight.id);
+  assert.ok(graph.events(project.id).some((event) =>
+    event.type === "project.failed_retry_exhausted"
+      && event.payload.stage === "broadcast-evaluator"));
+});
+
+test("condition_satisfied may only reactivate an existing local pending Fact", async () => {
+  const bus = new TestFederationBus();
+  bus.registerSession("source", "app-group");
+  const graph = new TestGraph();
+  const worker = new MockWorker();
+  const config = minimalConfig();
+  config.federation = { scope: "app-group" };
+  const project = createProject(graph);
+  const pending = graph.addFact(project.id, {
+    description: "deep-link handler may be reachable externally",
+    source: "explorer",
+  });
+  graph.resolveFact(project.id, pending.id, {
+    decision: "pending",
+    reason: "need exported component evidence",
+    requiredConditions: ["exported activity"],
+  });
+
+  const loop = new SessionLoop(graph, worker, config, {
+    federationBus: bus,
+    sessionId: "target",
+    federationScope: "app-group",
+  });
+  worker.register(/automated planning module/i, decisions());
+  worker.register(/Candidate Fact Under Review/i, env("verdict", {
+    decision: "pass",
+    reason: "broadcast supplied the missing prerequisite",
+  }));
+  worker.register(/Cross-session FactBroadcast Under Review/i, env("broadcast_assessment", {
+    decision: "condition_satisfied",
+    reason: "the manifest session verified export",
+    targetFactId: pending.id,
+  }));
+
   bus.publishInsight(
     "fact",
-    { sessionId: "sess-a", projectId: "proj_other", factId: "f_x" },
-    "admin panel reachable on :8080 without auth",
-    0.9,
+    { sessionId: "source", projectId: "source-project", factId: "f002" },
+    "the deep-link activity is exported",
+    0.95,
+    undefined,
+    { id: "fact:source:f002", scope: "app-group" },
   );
-  const loop = new SessionLoop(graph, worker, config, { federationBus: bus, sessionId: "sess-b" });
 
-  worker.register(/automated planning module/i, decisions([{ description: "PROBE-8080" }]));
-  worker.register(/PROBE-8080/i, env("fact", { description: "found admin panel on 8080", confidence: 0.75 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "corroborated by sibling" }));
-  worker.register(/## Recent Evaluator Verdicts/i, decisions());
-
-  await loop.run(p.id, { idlePollMs: 5 });
-
-  // The evaluator call must have received the sibling fact in its prompt.
-  const evaluatorCall = worker.calls().find((c) => /Evaluator Role/i.test(c.prompt));
-  assert.ok(evaluatorCall, "evaluator was invoked");
-  assert.match(evaluatorCall!.prompt, /Cross-session Corroboration/);
-  assert.match(evaluatorCall!.prompt, /sess-a/);
-  assert.match(evaluatorCall!.prompt, /admin panel reachable on :8080 without auth/);
-  // And the candidate was accepted (federation corroborated it).
-  const verified = graph.facts(p.id, "pass");
-  assert.ok(verified.some((f) => f.description.includes("admin panel")), "candidate accepted via corroboration");
+  await loop.step(project.id);
+  assert.equal(graph.getFact(project.id, pending.id)?.status, "pass");
+  assert.ok(graph.events(project.id).some((event) => event.type === "fact.reactivated"));
 });
 
-test("federation: own published insights are not echoed back to the same session", async () => {
-  // sess-a publishes a fact insight (its own accept). When sess-a's evaluator
-  // runs next, the insight must NOT appear in its prompt — collectSiblingInsights
-  // skips insights whose source.sessionId === this session.
-  const graph = new InMemoryGraph();
-  const worker = new MockWorker();
-  const config = minimalConfig();
-  const p = createProject(graph);
-  const bus = new FederationBus();
-  bus.publishInsight(
-    "fact",
-    { sessionId: "sess-a", projectId: p.id, factId: "f_self" },
-    "self-published finding",
-    0.9,
-  );
-  const loop = new SessionLoop(graph, worker, config, { federationBus: bus, sessionId: "sess-a" });
+test("accepted Fact is broadcast only after metacog and consumed by the sibling evaluator", async () => {
+  const bus = new TestFederationBus();
 
-  worker.register(/automated planning module/i, decisions([{ description: "PROBE-SELF" }]));
-  worker.register(/PROBE-SELF/i, env("fact", { description: "local finding", confidence: 0.8 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
-  worker.register(/## Recent Evaluator Verdicts/i, decisions());
-
-  await loop.run(p.id, { idlePollMs: 5 });
-
-  const evaluatorCall = worker.calls().find((c) => /Evaluator Role/i.test(c.prompt));
-  assert.ok(evaluatorCall);
-  assert.doesNotMatch(evaluatorCall!.prompt, /Cross-session Corroboration/, "own insight must not be echoed back");
-  assert.doesNotMatch(evaluatorCall!.prompt, /self-published finding/);
-});
-
-test("federation: sibling dead-end appears in the evaluator's prompt", async () => {
-  // A sibling ruled out a path; the local evaluator must see it so it can reject
-  // a candidate that aligns with the ruled-out direction.
-  const graph = new InMemoryGraph();
-  const worker = new MockWorker();
-  const config = minimalConfig();
-  const p = createProject(graph);
-  const bus = new FederationBus();
-  bus.publishInsight(
-    "dead_end",
-    { sessionId: "sess-c", projectId: "proj_other", factId: "f_d" },
-    "ssh brute force on :22 is rate-limited and futile",
-    0.2,
-  );
-  const loop = new SessionLoop(graph, worker, config, { federationBus: bus, sessionId: "sess-d" });
-
-  worker.register(/automated planning module/i, decisions([{ description: "TRY-SSH-BRUTE" }]));
-  worker.register(/TRY-SSH-BRUTE/i, env("fact", { description: "attempted ssh brute force", confidence: 0.4 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "deny", reason: "sibling ruled this out" }));
-  worker.register(/## Recent Evaluator Verdicts/i, decisions());
-
-  await loop.run(p.id, { idlePollMs: 5 });
-
-  const evaluatorCall = worker.calls().find((c) => /Evaluator Role/i.test(c.prompt));
-  assert.ok(evaluatorCall);
-  assert.match(evaluatorCall!.prompt, /Cross-session Dead-ends/);
-  assert.match(evaluatorCall!.prompt, /sess-c/);
-  assert.match(evaluatorCall!.prompt, /ssh brute force/);
-});
-
-test("federation: two real sessions share a bus — A's accepted fact reaches B's evaluator", async () => {
-  // TRUE end-to-end: loop A actually runs and publishes a fact insight on accept.
-  // Then loop B runs against the SAME bus and its evaluator must see A's finding
-  // in its Cross-session Corroboration section. This proves the publish→pull loop
-  // closes across two independently-constructed SessionLoops.
-  const bus = new FederationBus();
-
-  // ── Session A: discovers a finding and accepts it → publishes to bus ──
-  const graphA = new InMemoryGraph();
+  const graphA = new TestGraph();
   const workerA = new MockWorker();
   const configA = minimalConfig();
-  const pA = createProject(graphA);
-  const loopA = new SessionLoop(graphA, workerA, configA, { federationBus: bus, sessionId: "sess-a" });
+  configA.federation = { scope: "app-group" };
+  const projectA = createProject(graphA, { session: "manifest" });
+  const loopA = new SessionLoop(graphA, workerA, configA, {
+    federationBus: bus,
+    sessionId: "manifest",
+    federationScope: "app-group",
+  });
+  attachMetacog(graphA, workerA, configA, loopA, bus, "manifest");
 
-  workerA.register(/automated planning module/i, decisions([{ description: "A-PROBE" }]));
-  workerA.register(/A-PROBE/i, env("fact", { description: "redis on :6379 has no auth", confidence: 0.92 }));
-  workerA.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "confirmed" }));
-  workerA.register(/## Recent Evaluator Verdicts/i, decisions());
+  workerA.register(/automated planning module/i, decisions([{ description: "CHECK-MANIFEST" }]));
+  workerA.register(/CHECK-MANIFEST/i, env("fact", {
+    description: "MainActivity is exported without a signature permission",
+    evidence: ["AndroidManifest.xml:12"],
+    confidence: 0.95,
+  }));
+  workerA.register(/Candidate Fact Under Review/i, env("verdict", {
+    decision: "pass",
+    reason: "manifest evidence is direct",
+  }));
+  workerA.register(/# Metacog Role/i, env("hints", { hints: [] }));
 
-  await loopA.run(pA.id, { idlePollMs: 5 });
+  await loopA.step(projectA.id);
+  const published = bus.recentInsights(10, "app-group");
+  assert.equal(published.length, 1);
+  assert.equal(published[0]!.source.sessionId, "manifest");
+  assert.ok(graphA.events(projectA.id).some((event) => event.type === "metacog.fact_reviewed"));
 
-  // The bus now carries A's fact insight (published by runEvaluators on accept).
-  const published = bus.recentInsights().filter((i) => i.kind === "fact");
-  assert.ok(published.some((i) => i.summary.includes("redis") && i.source.sessionId === "sess-a"),
-    "session A must have published its accepted fact to the bus");
-
-  // ── Session B: runs after A finished, shares the same bus ──
-  const graphB = new InMemoryGraph();
+  const graphB = new TestGraph();
   const workerB = new MockWorker();
   const configB = minimalConfig();
-  const pB = createProject(graphB);
-  const loopB = new SessionLoop(graphB, workerB, configB, { federationBus: bus, sessionId: "sess-b" });
+  configB.federation = { scope: "app-group" };
+  const projectB = createProject(graphB, { session: "deeplink" });
+  const loopB = new SessionLoop(graphB, workerB, configB, {
+    federationBus: bus,
+    sessionId: "deeplink",
+    federationScope: "app-group",
+  });
+  workerB.register(/automated planning module/i, decisions());
+  workerB.register(/Cross-session FactBroadcast Under Review/i, env("broadcast_assessment", {
+    decision: "relevant",
+    reason: "export status is required for deep-link reachability",
+  }));
 
-  workerB.register(/automated planning module/i, decisions([{ description: "B-PROBE" }]));
-  workerB.register(/B-PROBE/i, env("fact", { description: "checking redis exposure", confidence: 0.6 }));
-  workerB.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
-  workerB.register(/## Recent Evaluator Verdicts/i, decisions());
-
-  await loopB.run(pB.id, { idlePollMs: 5 });
-
-  // B's evaluator prompt must contain A's finding — proving the publish→pull
-  // loop closed across the two independent sessions.
-  const bEvalCall = workerB.calls().find((c) => /Evaluator Role/i.test(c.prompt));
-  assert.ok(bEvalCall, "session B's evaluator was invoked");
-  assert.match(bEvalCall!.prompt, /Cross-session Corroboration/);
-  assert.match(bEvalCall!.prompt, /sess-a/);
-  assert.match(bEvalCall!.prompt, /redis on :6379 has no auth/);
-
-  // And A's insight was NOT echoed into A's own later evaluator calls (A's only
-  // evaluator run happened before B existed, so just confirm A's prompt lacks it
-  // — already covered by the self-echo test, this is a cross-check).
-  const aEvalCall = workerA.calls().find((c) => /Evaluator Role/i.test(c.prompt));
-  assert.ok(aEvalCall);
-  assert.doesNotMatch(aEvalCall!.prompt, /Cross-session Corroboration/,
-    "A's evaluator ran before any sibling insight existed");
+  await loopB.step(projectB.id);
+  assert.ok(graphB.events(projectB.id).some(
+    (event) => event.type === "federation.broadcast_assessed"
+      && event.payload.broadcastId === published[0]!.id,
+  ));
+  assert.equal(graphB.facts(projectB.id).length, 0);
 });
-
-test("federation: two sessions publish mutually — each sees the other's finding", async () => {
-  // Both sessions run to completion first (each publishes its own fact), then a
-  // THIRD round on a fresh candidate confirms cross-visibility is symmetric:
-  // neither session's own insight is echoed, but the sibling's is visible.
-  const bus = new FederationBus();
-
-  async function runSession(sid: string, intent: string, factDesc: string) {
-    const graph = new InMemoryGraph();
-    const worker = new MockWorker();
-    const config = minimalConfig();
-    const p = createProject(graph);
-    const loop = new SessionLoop(graph, worker, config, { federationBus: bus, sessionId: sid });
-    worker.register(/automated planning module/i, decisions([{ description: intent }]));
-    worker.register(new RegExp(intent), env("fact", { description: factDesc, confidence: 0.9 }));
-    worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
-    worker.register(/## Recent Evaluator Verdicts/i, decisions());
-    await loop.run(p.id, { idlePollMs: 5 });
-    return worker;
-  }
-
-  await runSession("alpha", "ALPHA-I", "alpha found mysql exposed on :3306");
-  await runSession("beta", "BETA-I", "beta found postgres on :5432");
-
-  // Both facts should be on the bus, each attributed to its own session.
-  const facts = bus.recentInsights().filter((i) => i.kind === "fact");
-  assert.ok(facts.some((i) => i.source.sessionId === "alpha" && i.summary.includes("mysql")));
-  assert.ok(facts.some((i) => i.source.sessionId === "beta" && i.summary.includes("postgres")));
-});
-

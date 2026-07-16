@@ -48,16 +48,68 @@ export function loadProvidersFile(filePath: string = defaultProvidersPath()): Pr
     try {
       const raw = readFileSync(filePath, "utf-8");
       const parsed = JSON.parse(raw);
-      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-        result = parsed as ProvidersFile;
-      }
-    } catch {
-      result = {};
+      result = validateProvidersFile(parsed);
+    } catch (error) {
+      throw new Error(`providers config is invalid (${filePath}): ${(error as Error).message}`);
     }
   }
   cachedFile = result;
   cachedPath = filePath;
   return result;
+}
+
+function validateProvidersFile(value: unknown): ProvidersFile {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("root must be an object");
+  }
+  const result: ProvidersFile = {};
+  for (const [id, raw] of Object.entries(value)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new Error(`provider "${id}" must be an object`);
+    }
+    const config = raw as Record<string, unknown>;
+    const baseURL = requiredString(config.baseURL, id, "baseURL");
+    const apiKeyEnv = requiredString(config.apiKeyEnv, id, "apiKeyEnv");
+    const model = requiredString(config.model, id, "model");
+    const name = optionalString(config.name, id, "name");
+    if (config.kind !== undefined && config.kind !== "openai" && config.kind !== "anthropic") {
+      throw new Error(`provider "${id}" kind must be "openai" or "anthropic"`);
+    }
+    let headers: Record<string, string> | undefined;
+    if (config.headers !== undefined) {
+      if (!config.headers || typeof config.headers !== "object" || Array.isArray(config.headers)) {
+        throw new Error(`provider "${id}" headers must be an object of strings`);
+      }
+      headers = {};
+      for (const [key, headerValue] of Object.entries(config.headers)) {
+        if (typeof headerValue !== "string") {
+          throw new Error(`provider "${id}" header "${key}" must be a string`);
+        }
+        headers[key] = headerValue;
+      }
+    }
+    result[id] = {
+      baseURL,
+      apiKeyEnv,
+      model,
+      ...(name ? { name } : {}),
+      ...(config.kind ? { kind: config.kind } : {}),
+      ...(headers ? { headers } : {}),
+    };
+  }
+  return result;
+}
+
+function requiredString(value: unknown, id: string, field: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`provider "${id}" ${field} must be a non-empty string`);
+  }
+  return value.trim();
+}
+
+function optionalString(value: unknown, id: string, field: string): string | undefined {
+  if (value === undefined) return undefined;
+  return requiredString(value, id, field);
 }
 
 export function saveProvidersFile(file: ProvidersFile, filePath: string = defaultProvidersPath()): void {

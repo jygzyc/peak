@@ -2,7 +2,7 @@ import { test } from "node:test";
 import { strict as assert } from "node:assert";
 import { applyMainDecision, nearDuplicateGoal } from "../dist/agent/decision-applier.js";
 import { PermissionChecker } from "../dist/agent/permissions.js";
-import { InMemoryGraph } from "../dist/graph/in-memory-graph.js";
+import { TestGraph } from "./test-graph.ts";
 import { minimalConfig, createProject } from "./helper.ts";
 import type { MainDecision } from "../dist/agent/contracts.js";
 import type { SubagentProfile, Permission } from "../dist/agent/types.js";
@@ -18,7 +18,12 @@ function perms(permissions: Permission[]): PermissionChecker {
 
 function decision(partial: Partial<MainDecision>): MainDecision {
   return {
-    createIntents: partial.createIntents ?? [],
+    createIntents: (partial.createIntents ?? []).map((intent) => ({
+      ...intent,
+      dispatchExplorer: intent.dispatchExplorer ?? true,
+    })),
+    dispatchExplorerIntentIds: partial.dispatchExplorerIntentIds ?? [],
+    stopExplorerIntentIds: partial.stopExplorerIntentIds ?? [],
     failIntents: partial.failIntents ?? [],
     consumeHintIds: partial.consumeHintIds ?? [],
     concludeRun: partial.concludeRun,
@@ -26,19 +31,95 @@ function decision(partial: Partial<MainDecision>): MainDecision {
 }
 
 test("decision-applier: creates intents from createIntents", () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const p = createProject(graph);
   const result = applyMainDecision({
     projectId: p.id, graph, config: minimalConfig(),
     decision: decision({ createIntents: [{ description: "task A" }, { description: "task B" }] }),
-    permissions: perms(["create_intent"]),
+    permissions: perms(["create_intent", "create_subagent_explorer"]),
   });
   assert.equal(result.intentsCreated, 2);
   assert.equal(graph.intents(p.id).length, 2);
 });
 
+test("decision-applier: planner may create a held Intent and dispatch it later", () => {
+  const graph = new TestGraph();
+  const p = createProject(graph);
+  applyMainDecision({
+    projectId: p.id, graph, config: minimalConfig(),
+    decision: decision({ createIntents: [{ description: "held", dispatchExplorer: false }] }),
+    permissions: perms(["create_intent"]),
+  });
+  const held = graph.intents(p.id)[0]!;
+  assert.equal(held.dispatchRequested, false);
+
+  applyMainDecision({
+    projectId: p.id, graph, config: minimalConfig(),
+    decision: decision({ dispatchExplorerIntentIds: [held.id] }),
+    permissions: perms(["create_subagent_explorer"]),
+  });
+  assert.equal(graph.getIntent(p.id, held.id)!.dispatchRequested, true);
+});
+
+test("decision-applier: stopExplorer revokes the claim without denying the Intent", () => {
+  const graph = new TestGraph();
+  const p = createProject(graph);
+  const intent = graph.addIntent(p.id, { description: "running", creator: "planner" });
+  const claimed = graph.claimIntent(p.id, intent.id, "worker", 300_000);
+  const claimedEpoch = claimed.lease!.epoch;
+  const run = graph.createSubagentRun(p.id, {
+    profileId: "explorer", role: "explorer", workerName: "mock", intentId: intent.id,
+  });
+  graph.updateSubagentRun(p.id, run.id, { status: "running" });
+
+  const result = applyMainDecision({
+    projectId: p.id,
+    graph,
+    config: minimalConfig(),
+    decision: decision({ stopExplorerIntentIds: [intent.id] }),
+    permissions: perms(["stop_subagent_explorer"]),
+  });
+
+  const stopped = graph.getIntent(p.id, intent.id)!;
+  assert.equal(result.explorersStopped, 1);
+  assert.equal(stopped.status, "open");
+  assert.equal(stopped.dispatchRequested, false);
+  assert.ok(stopped.leaseEpoch > claimedEpoch);
+  assert.equal(graph.getSubagentRun(p.id, run.id)!.status, "cancelled");
+});
+
+test("decision-applier: failing a claimed Intent also requires stop_subagent_explorer", () => {
+  const graph = new TestGraph();
+  const p = createProject(graph);
+  const intent = graph.addIntent(p.id, { description: "running", creator: "planner" });
+  graph.claimIntent(p.id, intent.id, "worker", 300_000);
+
+  assert.throws(() => applyMainDecision({
+    projectId: p.id,
+    graph,
+    config: minimalConfig(),
+    decision: decision({ failIntents: [{ intentId: intent.id, reason: "redirect" }] }),
+    permissions: perms(["fail_intent"]),
+  }), /stop_subagent_explorer/);
+  assert.equal(graph.getIntent(p.id, intent.id)!.status, "claimed");
+});
+
+test("decision-applier: dispatched Intent requires create_subagent_explorer", () => {
+  const graph = new TestGraph();
+  const p = createProject(graph);
+  assert.throws(
+    () => applyMainDecision({
+      projectId: p.id, graph, config: minimalConfig(),
+      decision: decision({ createIntents: [{ description: "run now" }] }),
+      permissions: perms(["create_intent"]),
+    }),
+    /lacks permission "create_subagent_explorer"/,
+  );
+  assert.equal(graph.intents(p.id).length, 0);
+});
+
 test("decision-applier: skips intents matching recorded dead-ends", () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const p = createProject(graph);
   const intent = graph.addIntent(p.id, { description: "dead path", creator: "planner" });
   graph.failIntent(p.id, intent.id, "proven useless", true);
@@ -46,7 +127,7 @@ test("decision-applier: skips intents matching recorded dead-ends", () => {
   const result = applyMainDecision({
     projectId: p.id, graph, config: minimalConfig(),
     decision: decision({ createIntents: [{ description: "dead path" }, { description: "new path" }] }),
-    permissions: perms(["create_intent"]),
+    permissions: perms(["create_intent", "create_subagent_explorer"]),
   });
   assert.equal(result.intentsCreated, 1);
   assert.equal(graph.intents(p.id, "open").length, 1);
@@ -56,7 +137,7 @@ test("decision-applier: skips intents matching recorded dead-ends", () => {
 });
 
 test("decision-applier: fails intents from failIntents", () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const p = createProject(graph);
   const i1 = graph.addIntent(p.id, { description: "wrong dir", creator: "planner" });
 
@@ -71,7 +152,7 @@ test("decision-applier: fails intents from failIntents", () => {
 });
 
 test("decision-applier: failing unknown intentId is silently ignored", () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const p = createProject(graph);
   const result = applyMainDecision({
     projectId: p.id, graph, config: minimalConfig(),
@@ -82,7 +163,7 @@ test("decision-applier: failing unknown intentId is silently ignored", () => {
 });
 
 test("decision-applier: consumes hints from decision.consumeHintIds", () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const p = createProject(graph);
   const h1 = graph.addHint(p.id, { content: "go left", creator: "metacog" });
   const h2 = graph.addHint(p.id, { content: "go right", creator: "metacog" });
@@ -97,34 +178,52 @@ test("decision-applier: consumes hints from decision.consumeHintIds", () => {
   assert.equal(graph.unconsumedHints(p.id)[0].id, h2.id);
 });
 
-test("decision-applier: falls back to hintIdsToConsume when consumeHintIds empty", () => {
-  const graph = new InMemoryGraph();
+test("decision-applier: does not consume hints the planner did not select", () => {
+  const graph = new TestGraph();
   const p = createProject(graph);
   const h1 = graph.addHint(p.id, { content: "hint", creator: "metacog" });
 
   const result = applyMainDecision({
     projectId: p.id, graph, config: minimalConfig(),
     decision: decision({}),
-    hintIdsToConsume: [h1.id],
     permissions: perms([]),
   });
-  assert.equal(result.hintsConsumed, 1);
+  assert.equal(result.hintsConsumed, 0);
+  assert.equal(graph.unconsumedHints(p.id)[0]?.id, h1.id);
 });
 
-test("decision-applier: concludeRun sets project status to completed", () => {
-  const graph = new InMemoryGraph();
+test("decision-applier: concludeRun creates a finish proposal", () => {
+  const graph = new TestGraph();
   const p = createProject(graph);
   const result = applyMainDecision({
     projectId: p.id, graph, config: minimalConfig(),
     decision: decision({ concludeRun: { description: "goal achieved" } }),
-    permissions: perms(["conclude_run"]),
+    permissions: perms(["create_end_fact"]),
   });
   assert.equal(result.concluded, true);
-  assert.equal(graph.getProject(p.id)!.status, "completed");
+  assert.equal(graph.getProject(p.id)!.status, "finish_proposed");
+});
+
+test("decision-applier: cannot create new work and an EndFact in one decision", () => {
+  const graph = new TestGraph();
+  const p = createProject(graph);
+  assert.throws(
+    () => applyMainDecision({
+      projectId: p.id, graph, config: minimalConfig(),
+      decision: decision({
+        createIntents: [{ description: "not finished" }],
+        concludeRun: { description: "contradictory completion" },
+      }),
+      permissions: perms(["create_intent", "create_subagent_explorer", "create_end_fact"]),
+    }),
+    /intents are open or claimed/,
+  );
+  assert.equal(graph.intents(p.id).length, 0, "the whole planner decision must roll back");
+  assert.equal(graph.activeEndFact(p.id), undefined);
 });
 
 test("decision-applier: throws PermissionDeniedError on createIntent without permission", () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const p = createProject(graph);
   assert.throws(
     () => applyMainDecision({
@@ -137,7 +236,7 @@ test("decision-applier: throws PermissionDeniedError on createIntent without per
 });
 
 test("decision-applier: throws PermissionDeniedError on failIntent without permission", () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const p = createProject(graph);
   const i1 = graph.addIntent(p.id, { description: "x", creator: "planner" });
   assert.throws(
@@ -151,7 +250,7 @@ test("decision-applier: throws PermissionDeniedError on failIntent without permi
 });
 
 test("decision-applier: throws PermissionDeniedError on concludeRun without permission", () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const p = createProject(graph);
   assert.throws(
     () => applyMainDecision({
@@ -159,12 +258,12 @@ test("decision-applier: throws PermissionDeniedError on concludeRun without perm
       decision: decision({ concludeRun: { description: "done" } }),
       permissions: perms([]),
     }),
-    /lacks permission "conclude_run"/,
+    /lacks permission "create_end_fact"/,
   );
 });
 
 test("decision-applier: parentFactIds and priority passed through to addIntent", () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const p = createProject(graph);
   const f1 = graph.addFact(p.id, { description: "fact", source: "explorer", confidence: 0.9 });
   // Intents may only extend from verified facts (Cairn-minimal edge rule).
@@ -172,7 +271,7 @@ test("decision-applier: parentFactIds and priority passed through to addIntent",
   applyMainDecision({
     projectId: p.id, graph, config: minimalConfig(),
     decision: decision({ createIntents: [{ description: "task", parentFactIds: [f1.id], priority: 5 }] }),
-    permissions: perms(["create_intent"]),
+    permissions: perms(["create_intent", "create_subagent_explorer"]),
   });
   const intent = graph.intents(p.id)[0];
   assert.deepEqual(intent.parentFactIds, [f1.id]);
@@ -180,7 +279,7 @@ test("decision-applier: parentFactIds and priority passed through to addIntent",
 });
 
 test("decision-applier: empty decision returns all-zero result", () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const p = createProject(graph);
   const result = applyMainDecision({
     projectId: p.id, graph, config: minimalConfig(),
@@ -194,15 +293,17 @@ test("decision-applier: empty decision returns all-zero result", () => {
 });
 
 test("decision-applier: mid-decision permission error rolls back all mutations", () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const p = createProject(graph);
 
   const decision: MainDecision = {
     createIntents: [
-      { description: "first intent" },
-      { description: "second intent" },
-      { description: "third intent" },
+      { description: "first intent", dispatchExplorer: true },
+      { description: "second intent", dispatchExplorer: true },
+      { description: "third intent", dispatchExplorer: true },
     ],
+    dispatchExplorerIntentIds: [],
+    stopExplorerIntentIds: [],
     failIntents: [],
     consumeHintIds: [],
     concludeRun: undefined,
@@ -213,7 +314,7 @@ test("decision-applier: mid-decision permission error rolls back all mutations",
     runtime: { worker: "mock" },
     prompt: { file: "x.md" },
     context: { graphView: "full" },
-    permissions: ["create_intent", "fail_intent", "write_hint"],
+    permissions: ["create_intent", "fail_intent", "handle_hint"],
     output: { contract: "main_decision" },
   });
 
@@ -246,7 +347,7 @@ test("decision-applier: mid-decision permission error rolls back all mutations",
 });
 
 test("decision-applier: successful decision is fully persisted", () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const p = createProject(graph);
 
   applyMainDecision({
@@ -254,7 +355,7 @@ test("decision-applier: successful decision is fully persisted", () => {
     decision: decision({
       createIntents: [{ description: "a" }, { description: "b" }],
     }),
-    permissions: perms(["create_intent"]),
+    permissions: perms(["create_intent", "create_subagent_explorer"]),
   });
 
   assert.equal(graph.intents(p.id).length, 2);
@@ -262,7 +363,7 @@ test("decision-applier: successful decision is fully persisted", () => {
 });
 
 test("decision-applier: drops near-duplicate intents already in flight", () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const p = createProject(graph);
   // Pre-existing open intent — a direction already being explored.
   graph.addIntent(p.id, { description: "try the login SQL injection", creator: "planner" });
@@ -277,7 +378,7 @@ test("decision-applier: drops near-duplicate intents already in flight", () => {
         { description: "scan the upload endpoint for vulnerabilities" },
       ],
     }),
-    permissions: perms(["create_intent"]),
+    permissions: perms(["create_intent", "create_subagent_explorer"]),
   });
   assert.equal(result.intentsCreated, 1, "near-duplicate should be dropped, only the new one created");
   const dupEvent = graph.events(p.id).find((e) => e.type === "planner.duplicate_intent_dropped");

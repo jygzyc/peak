@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
-import { InMemoryGraph } from "../dist/graph/in-memory-graph.js";
+import { existsSync, readFileSync } from "node:fs";
+import { TestGraph } from "./test-graph.ts";
 import { MockWorker } from "../dist/worker/mock-worker.js";
 import { SessionLoop } from "../dist/session/session-loop.js";
 import { minimalConfig, createProject, env } from "./helper.ts";
@@ -18,7 +19,7 @@ function openOnce(createIntents: unknown[]): () => string {
 }
 
 test("SubagentRun tracking: explorer dispatch creates a tracked run", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
 
@@ -38,7 +39,7 @@ test("SubagentRun tracking: explorer dispatch creates a tracked run", async () =
 });
 
 test("SubagentRun tracking: evaluator dispatch creates a tracked run", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
 
@@ -57,7 +58,7 @@ test("SubagentRun tracking: evaluator dispatch creates a tracked run", async () 
 });
 
 test("SubagentRun tracking: failed explorer marks run as failed", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
 
@@ -77,7 +78,7 @@ test("SubagentRun tracking: failed explorer marks run as failed", async () => {
 });
 
 test("SubagentRun tracking: maxActive caps concurrent explorer runs", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   // Force maxActive=1 to serialize explorer runs
@@ -122,8 +123,8 @@ test("SubagentRun tracking: maxActive caps concurrent explorer runs", async () =
   assert.equal(completed.length, 3);
 });
 
-test("SubagentRun tracking: completed explorer run records inputTokens and usedDelta", async () => {
-  const graph = new InMemoryGraph();
+test("SubagentRun tracking: completed explorer run records token usage", async () => {
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
 
@@ -139,14 +140,17 @@ test("SubagentRun tracking: completed explorer run records inputTokens and usedD
   assert.ok(completed.length >= 1);
   const run = completed[0]!;
   assert.ok(run.inputTokens !== undefined && run.inputTokens > 0, "inputTokens should be positive");
-  assert.equal(typeof run.usedDelta, "boolean");
+  assert.ok(run.contextArtifact && existsSync(run.contextArtifact.resolvedPath));
+  assert.ok(run.outputArtifact && existsSync(run.outputArtifact.resolvedPath));
+  const output = JSON.parse(readFileSync(run.outputArtifact.resolvedPath, "utf8"));
+  assert.equal(output.kind, "fact");
 });
 
 test("SubagentRun tracking: completed explorer run records non-zero outputTokens", async () => {
   // Previously outputTokens was hard-coded to 0 (docs 04-session.md §4.1); it is
   // now estimated from the worker's raw output text so the field is usable for
   // rough quota/audit purposes.
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
 
@@ -165,7 +169,7 @@ test("SubagentRun tracking: completed explorer run records non-zero outputTokens
 });
 
 test("SubagentRun tracking: failed run has errorMessage set", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
 
@@ -182,7 +186,7 @@ test("SubagentRun tracking: failed run has errorMessage set", async () => {
 });
 
 test("SubagentRun tracking: fact created via SessionLoop has stepDiscovered set", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
 

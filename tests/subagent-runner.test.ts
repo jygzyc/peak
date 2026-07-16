@@ -1,21 +1,89 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
+import { existsSync, readFileSync } from "node:fs";
 import { runSubagent, runSubagentWithText, plannerExtra, explorerExtra, evaluatorExtra, metacogExtra } from "../dist/agent/subagent-runner.js";
 import { MainAgent } from "../dist/agent/main-agent.js";
+import { ServerSessionGraphReader } from "../dist/server/session-graph-reader.js";
 import { freshSetup, createProject, env, minimalConfig } from "./helper.ts";
+
+let runSequence = 0;
+
+function roleContext(graph: ReturnType<typeof freshSetup>["graph"], project: ReturnType<typeof createProject>) {
+  return {
+    project,
+    graphReader: new ServerSessionGraphReader(graph),
+    runId: `run_test_${++runSequence}`,
+  };
+}
+
+function plannerAgent(
+  graph: ReturnType<typeof freshSetup>["graph"],
+  project: ReturnType<typeof createProject>,
+  config: ReturnType<typeof minimalConfig>,
+  worker: ReturnType<typeof freshSetup>["worker"],
+) {
+  const run = graph.createSubagentRun(project.id, {
+    profileId: "planner",
+    role: "planner",
+    workerName: config.profiles.planner.runtime.worker,
+  });
+  return {
+    agent: new MainAgent({
+      project,
+      config,
+      workerPool: worker,
+      graphReader: new ServerSessionGraphReader(graph),
+    }),
+    input: {
+      runId: run.id,
+      workerName: run.workerName,
+      onRunUpdate: (patch: Parameters<typeof graph.updateSubagentRun>[2]) =>
+        graph.updateSubagentRun(project.id, run.id, patch),
+    },
+  };
+}
 
 test("planner via MainAgent: empty graph returns createIntents decisions", async () => {
   const { graph, worker, config } = freshSetup();
   const p = createProject(graph);
   worker.register(/automated planning module/i, env("decisions", {
-    createIntents: [{ description: "scan", from: [], priority: 2 }],
+    createIntents: [{ description: "scan", from: [], priority: 2, dispatchExplorer: true }],
     failIntents: [], consumeHints: [], concludeRun: null,
   }));
 
-  const agent = new MainAgent({ projectId: p.id, graph, config, workerPool: worker });
-  const { decision } = await agent.run({});
+  const { agent, input } = plannerAgent(graph, p, config, worker);
+  const { decision, runId } = await agent.run(input);
   assert.equal(decision.createIntents.length, 1);
   assert.equal(decision.createIntents[0].description, "scan");
+  const run = graph.getSubagentRun(p.id, runId)!;
+  assert.equal(run.role, "planner");
+  assert.equal(run.status, "pending");
+  assert.match(run.promptHash!, /^[a-f0-9]{64}$/);
+  assert.equal(run.promptManifest?.components[0]?.kind, "primary");
+  assert.equal(run.promptManifest?.components[0]?.source, "builtin:planner");
+  assert.equal(run.promptManifest?.components[0]?.resolvedPath, undefined);
+  const graphComponent = run.promptManifest?.components.find((component) => component.kind === "graph-context");
+  assert.equal(graphComponent?.artifactSha256, run.contextArtifact?.sha256);
+  assert.equal(graphComponent?.graphSeq, run.contextArtifact?.graphSeq);
+  assert.ok(run.promptManifest?.components.some((component) => component.kind === "assignment"));
+  assert.ok(run.promptManifest?.components.some((component) => component.kind === "output-contract"));
+  assert.ok(run.contextArtifact);
+  assert.ok(run.outputArtifact);
+  assert.ok(existsSync(run.contextArtifact!.resolvedPath));
+  const artifact = JSON.parse(readFileSync(run.contextArtifact!.resolvedPath, "utf8"));
+  assert.match(artifact.content, /## Objective/);
+});
+
+test("runSubagent uses workspaceDir rather than the persistent sessionDir as worker cwd", async () => {
+  const { graph, worker, config } = freshSetup();
+  const p = createProject(graph, { workspaceDir: "configured-workspace" });
+  worker.register(/automated planning module/i, env("decisions", {
+    createIntents: [], failIntents: [], consumeHints: [], concludeRun: null,
+  }));
+  const { agent, input } = plannerAgent(graph, p, config, worker);
+  await agent.run(input);
+  assert.equal(worker.calls()[0]!.cwd, "configured-workspace");
+  assert.notEqual(p.workspaceDir, p.sessionDir);
 });
 
 test("planner via MainAgent: hint-received returns failIntents", async () => {
@@ -30,14 +98,14 @@ test("planner via MainAgent: hint-received returns failIntents", async () => {
     consumeHints: [h1.id], concludeRun: null,
   }));
 
-  const agent = new MainAgent({ projectId: p.id, graph, config, workerPool: worker });
-  const { decision } = await agent.run({ hints: [h1] });
+  const { agent, input } = plannerAgent(graph, p, config, worker);
+  const { decision } = await agent.run({ ...input, hints: [h1] });
   assert.equal(decision.failIntents.length, 1);
   assert.equal(decision.failIntents[0].intentId, i1.id);
   assert.deepEqual(decision.consumeHintIds, [h1.id]);
 });
 
-test("planner via MainAgent: explicit consumeHints overrides the actionable default", async () => {
+test("planner via MainAgent: consumes only explicitly selected hints", async () => {
   // Planner selectively consumes only h1, ignoring h2 — its choice must be
   // respected (previously MainAgent overwrote consumeHintIds with ALL hints).
   const { graph, worker, config } = freshSetup();
@@ -52,31 +120,27 @@ test("planner via MainAgent: explicit consumeHints overrides the actionable defa
     concludeRun: null,
   }));
 
-  const agent = new MainAgent({ projectId: p.id, graph, config, workerPool: worker });
-  const { decision } = await agent.run({ hints: [h1, h2] });
-  assert.deepEqual(decision.consumeHintIds, [h1.id], "planner's explicit selection must win over the default");
+  const { agent, input } = plannerAgent(graph, p, config, worker);
+  const { decision } = await agent.run({ ...input, hints: [h1, h2] });
+  assert.deepEqual(decision.consumeHintIds, [h1.id]);
 });
 
-test("planner via MainAgent: absent consumeHints defaults to all actionable hints", async () => {
-  // Backward-compat: when the planner does not declare consumeHints, actionable
-  // hints (stop-explorer / direction) are still consumed so the pipeline's
-  // stop-explorer-kill path keeps working.
+test("planner via MainAgent: does not consume unselected hints", async () => {
   const { graph, worker, config } = freshSetup();
   const p = createProject(graph);
   const hAction = graph.addHint(p.id, { content: "do X", creator: "metacog", kind: "direction" });
-  // A "warning" hint is NOT actionable — it must not be auto-consumed.
   const hWarn = graph.addHint(p.id, { content: "heads up", creator: "metacog", kind: "warning" });
 
   worker.register(/## Hints Requiring Response/i, env("decisions", {
     createIntents: [],
     failIntents: [],
-    consumeHints: [], // planner did not select any
+    consumeHints: [],
     concludeRun: null,
   }));
 
-  const agent = new MainAgent({ projectId: p.id, graph, config, workerPool: worker });
-  const { decision } = await agent.run({ hints: [hAction, hWarn] });
-  assert.deepEqual(decision.consumeHintIds, [hAction.id], "only actionable hints are consumed by default");
+  const { agent, input } = plannerAgent(graph, p, config, worker);
+  const { decision } = await agent.run({ ...input, hints: [hAction, hWarn] });
+  assert.deepEqual(decision.consumeHintIds, []);
 });
 
 test("planner via MainAgent: verdict-driven can conclude", async () => {
@@ -87,8 +151,9 @@ test("planner via MainAgent: verdict-driven can conclude", async () => {
     concludeRun: { description: "goal achieved" },
   }));
 
-  const agent = new MainAgent({ projectId: p.id, graph, config, workerPool: worker });
+  const { agent, input } = plannerAgent(graph, p, config, worker);
   const { decision } = await agent.run({
+    ...input,
     recentVerdicts: [{ factId: "f001", verdict: { decision: "pass", reason: "ok" } }],
   });
   assert.ok(decision.concludeRun);
@@ -103,7 +168,7 @@ test("explorer via runSubagent: produces candidate fact", async () => {
 
   const output = await runSubagent({
     profile: config.profiles.explorer, profileId: "explorer",
-    projectId: p.id, graph, workerPool: worker, config,
+    ...roleContext(graph, p), workerPool: worker, config,
     promptExtra: explorerExtra(intent.id, intent.description, intent.parentFactIds, []),
   });
   assert.equal(output.kind, "fact");
@@ -125,7 +190,7 @@ test("explorer via runSubagent: conclude fallback recovers from unparseable firs
 
   const result = await runSubagentWithText({
     profile: config.profiles.explorer, profileId: "explorer",
-    projectId: p.id, graph, workerPool: worker, config,
+    ...roleContext(graph, p), workerPool: worker, config,
     promptExtra: explorerExtra(intent.id, intent.description, intent.parentFactIds, []),
   });
   assert.equal(result.output.kind, "fact");
@@ -142,7 +207,7 @@ test("evaluator via runSubagent: returns accept verdict", async () => {
 
   const output = await runSubagent({
     profile: config.profiles.evaluator, profileId: "evaluator",
-    projectId: p.id, graph, workerPool: worker, config,
+    ...roleContext(graph, p), workerPool: worker, config,
     promptExtra: evaluatorExtra(candidate),
   });
   assert.equal(output.kind, "verdict");
@@ -157,7 +222,7 @@ test("evaluator via runSubagent: returns reject verdict", async () => {
 
   const output = await runSubagent({
     profile: config.profiles.evaluator, profileId: "evaluator",
-    projectId: p.id, graph, workerPool: worker, config,
+    ...roleContext(graph, p), workerPool: worker, config,
     promptExtra: evaluatorExtra(candidate),
   });
   assert.equal(output.verdict.decision, "deny");
@@ -171,7 +236,7 @@ test("evaluator via runSubagent: demote with adjusted confidence", async () => {
 
   const output = await runSubagent({
     profile: config.profiles.evaluator, profileId: "evaluator",
-    projectId: p.id, graph, workerPool: worker, config,
+    ...roleContext(graph, p), workerPool: worker, config,
     promptExtra: evaluatorExtra(candidate),
   });
   assert.equal(output.verdict.decision, "pass");
@@ -186,7 +251,7 @@ test("evaluator via runSubagent: throws on invalid decision", async () => {
 
   await assert.rejects(runSubagent({
     profile: config.profiles.evaluator, profileId: "evaluator",
-    projectId: p.id, graph, workerPool: worker, config,
+    ...roleContext(graph, p), workerPool: worker, config,
     promptExtra: evaluatorExtra(candidate),
   }));
 });
@@ -198,7 +263,7 @@ test("metacog via runSubagent: produces hints", async () => {
 
   const output = await runSubagent({
     profile: config.profiles.metacog!, profileId: "metacog",
-    projectId: p.id, graph, workerPool: worker, config,
+    ...roleContext(graph, p), workerPool: worker, config,
     promptExtra: metacogExtra("scheduled"),
   });
   assert.equal(output.kind, "hints");
@@ -213,11 +278,26 @@ test("metacog via runSubagent: can request stop", async () => {
 
   const output = await runSubagent({
     profile: config.profiles.metacog!, profileId: "metacog",
-    projectId: p.id, graph, workerPool: worker, config,
+    ...roleContext(graph, p), workerPool: worker, config,
     promptExtra: metacogExtra("stagnation"),
   });
   assert.equal(output.kind, "stop");
   assert.equal(output.stop.reason, "goal met");
+});
+
+test("role execution rejects direct API workers that cannot read JSON artifacts", async () => {
+  const { graph, worker, config } = freshSetup();
+  const p = createProject(graph);
+  config.workers.direct = { kind: "api" };
+  config.profiles.explorer.runtime.worker = "direct";
+  await assert.rejects(runSubagent({
+    profile: config.profiles.explorer,
+    profileId: "explorer",
+    ...roleContext(graph, p),
+    workerPool: worker,
+    config,
+    promptExtra: "test",
+  }), /cannot read session JSON artifacts/);
 });
 
 test("plannerExtra: with hints renders hint response block", () => {
@@ -240,22 +320,50 @@ test("plannerExtra: empty input returns empty string", () => {
 });
 
 test("explorerExtra: includes intent id and description", () => {
-  const text = explorerExtra("i001", "find bugs", ["f001"], []);
+  const source = {
+    id: "f001", projectId: "p", description: "verified entry point",
+    evidence: ["src/a.ts:1"], source: "explorer" as const,
+    confidence: 0.9, status: "pass" as const, createdAt: "",
+  };
+  const text = explorerExtra("i001", "find bugs", ["f001"], [], [source]);
   assert.match(text, /i001/);
   assert.match(text, /find bugs/);
   assert.match(text, /f001/);
+  assert.match(text, /\[0\].*verified entry point/);
 });
 
 test("evaluatorExtra: includes candidate id and evidence", () => {
   const candidate = {
     id: "f005", projectId: "p", description: "finding",
     evidence: ["proof1", "proof2"], source: "explorer",
-    confidence: 0.8, status: "pending" as const, createdAt: "",
+    confidence: 0.8, status: "candidate" as const, createdAt: "",
   };
   const text = evaluatorExtra(candidate);
   assert.match(text, /f005/);
   assert.match(text, /finding/);
   assert.match(text, /proof1/);
+});
+
+test("evaluatorExtra renders the producing Intent's ordered source Fact details", () => {
+  const source = {
+    id: "f001", projectId: "p", description: "verified component export",
+    evidence: [], source: "explorer" as const,
+    confidence: 0.9, status: "pass" as const, createdAt: "",
+  };
+  const intent = {
+    id: "i002", projectId: "p", description: "trace the exported component",
+    creator: "planner" as const, parentFactIds: [source.id], status: "pass" as const,
+    dispatchRequested: true, priority: 1, createdAt: "",
+  };
+  const candidate = {
+    id: "f002", projectId: "p", description: "candidate reachability",
+    evidence: [], source: "explorer" as const,
+    confidence: 0.8, status: "candidate" as const, createdAt: "",
+  };
+  const text = evaluatorExtra(candidate, undefined, undefined, { intent, sourceFacts: [source] });
+  assert.match(text, /Producing Intent and Ordered Sources/);
+  assert.match(text, /i002/);
+  assert.match(text, /\[0\].*verified component export/);
 });
 
 test("metacogExtra: includes trigger", () => {
@@ -272,7 +380,7 @@ test("contract enforcement: explorer returning verdict is rejected", async () =>
   await assert.rejects(
     runSubagent({
       profile: config.profiles.explorer, profileId: "explorer",
-      projectId: p.id, graph, workerPool: worker, config,
+      ...roleContext(graph, p), workerPool: worker, config,
       promptExtra: explorerExtra(intent.id, intent.description, [], []),
     }),
     /contract="candidate_fact".*kind="verdict"/,
@@ -288,7 +396,7 @@ test("contract enforcement: evaluator returning decisions is rejected", async ()
   await assert.rejects(
     runSubagent({
       profile: config.profiles.evaluator, profileId: "evaluator",
-      projectId: p.id, graph, workerPool: worker, config,
+      ...roleContext(graph, p), workerPool: worker, config,
       promptExtra: evaluatorExtra(candidate),
     }),
     /contract="verdict".*kind="decisions"/,
@@ -303,7 +411,7 @@ test("contract enforcement: metacog returning fact is rejected", async () => {
   await assert.rejects(
     runSubagent({
       profile: config.profiles.metacog!, profileId: "metacog",
-      projectId: p.id, graph, workerPool: worker, config,
+      ...roleContext(graph, p), workerPool: worker, config,
       promptExtra: metacogExtra("scheduled"),
     }),
     /contract="hints".*kind="fact"/,

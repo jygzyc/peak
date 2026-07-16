@@ -12,9 +12,9 @@
     "peak": "dist/cli.js"
   },
   "scripts": {
-    "clean": "rm -rf dist dist-packages",
-    "build": "npm run clean && tsc && npm run copy-assets",
-    "copy-assets": "cp src/server/dashboard.html dist/server/dashboard.html && cp -r src/agent/prompts dist/agent/prompts",
+    "clean": "node scripts/build.mjs clean",
+    "build": "node scripts/build.mjs",
+    "copy-assets": "node scripts/build.mjs copy-assets",
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test tests/*.test.ts",
     "smoke": "node scripts/smoke.mjs",

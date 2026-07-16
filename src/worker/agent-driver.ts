@@ -30,6 +30,7 @@ export class AgentDriver implements WorkerDriver {
       cwd: request.cwd,
       sessionId: request.sessionId,
       conclude: request.conclude,
+      signal: request.signal,
     });
 
     return {
@@ -38,6 +39,8 @@ export class AgentDriver implements WorkerDriver {
       stdout: result.text,
       stderr: result.stderr ?? "",
       sessionId: result.sessionId,
+      timedOut: result.timedOut,
+      aborted: result.aborted,
     };
   }
 

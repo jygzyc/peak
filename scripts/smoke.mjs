@@ -5,7 +5,7 @@
  * verifies that the built CLI can load config, run a task with MockWorker, list
  * worker capabilities, and initialize a minimal task file under ESM.
  */
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,13 +15,16 @@ import { spawnSync } from "node:child_process";
 // Windows — pathname yields a malformed "\\E:\\Code\\" drive path there.
 const root = fileURLToPath(new URL("..", import.meta.url));
 const workspace = mkdtempSync(join(tmpdir(), "peak-smoke-"));
+const peakHome = join(workspace, "peak-home");
 const cli = join(root, "dist", "cli.js");
+mkdirSync(peakHome, { recursive: true });
 
 function run(args, options = {}) {
   const result = spawnSync(process.execPath, [cli, ...args], {
     cwd: root,
     encoding: "utf-8",
     maxBuffer: 1024 * 1024 * 10,
+    env: { ...process.env, PEAK_HOME: peakHome, ...options.env },
     ...options,
   });
   if (result.status !== 0) {
@@ -63,7 +66,6 @@ try {
   }
 
   const initDir = join(workspace, "init-target");
-  const { mkdirSync } = await import("node:fs");
   mkdirSync(initDir, { recursive: true });
   const initOut = run(["init", initDir]);
   const initTask = join(initDir, "task.json");

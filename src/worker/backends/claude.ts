@@ -9,21 +9,37 @@
 import type { WorkerConfig } from "../../agent/types.js";
 import { SubprocessBackend, type BuildArgvOptions } from "./subprocess.js";
 
-const SESSION_RE = /session[: ]+([0-9a-fA-F-]{8,})/i;
-
 export class ClaudeBackend extends SubprocessBackend {
   readonly id = "claude-code";
 
   buildArgv(config: WorkerConfig, prompt: string, opts?: BuildArgvOptions) {
-    const argv = ["claude", "--dangerously-skip-permissions", "-p"];
+    const argv = ["claude", "--dangerously-skip-permissions", "-p", "--output-format", "json"];
     if (opts?.sessionId) argv.push("--resume", opts.sessionId);
-    argv.push("--", prompt);
-    return { argv, env: envFor(config) };
+    // Keep task/prompt content off argv. This avoids command-line disclosure,
+    // Windows quoting limits, and accidental shell interpretation.
+    return { argv, env: envFor(config), input: prompt };
   }
 
-  extractSession(stdout: string, stderr: string): string | undefined {
-    const m = SESSION_RE.exec(stderr) ?? SESSION_RE.exec(stdout);
-    return m ? m[1] : undefined;
+  extractSession(stdout: string, _stderr: string): string | undefined {
+    const result = parseResult(stdout);
+    return typeof result?.session_id === "string" ? result.session_id : undefined;
+  }
+
+  extractResponseText(stdout: string, _stderr: string): string {
+    const result = parseResult(stdout);
+    return typeof result?.result === "string" ? result.result.trim() : "";
+  }
+}
+
+function parseResult(stdout: string): Record<string, unknown> | undefined {
+  try {
+    const value = JSON.parse(stdout.trim()) as unknown;
+    return value && typeof value === "object" && !Array.isArray(value)
+      && (value as Record<string, unknown>).type === "result"
+      ? value as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
   }
 }
 

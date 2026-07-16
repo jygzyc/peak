@@ -1,0 +1,58 @@
+{
+  "task": {
+    "name": "Offline-first inspection idea deep analysis",
+    "session": "idea-deep-analysis",
+    "target": "fixture/idea-brief.md",
+    "goal": "Produce an evidence-linked go, pivot or no-go recommendation with architecture risks and a falsifiable pilot plan",
+    "workspace": "fixture"
+  },
+  "profiles": {
+    "planner": {
+      "role": "planner",
+      "runtime": { "worker": "codex" },
+      "prompt": {
+        "file": "builtin:planner",
+        "knowledge": ["knowledge/idea-analysis.md"],
+        "rules": ["rules/decision-evidence.md"],
+        "skills": ["skills/hypothesis-analysis.md"],
+        "instructions": "Separate problem/value, technical feasibility and delivery/adoption risk. Create a final synthesis Intent only from verified Facts."
+      },
+      "context": { "graphView": "full", "maxFacts": 80 }
+    },
+    "explorer": {
+      "role": "explorer",
+      "runtime": { "worker": "codex" },
+      "prompt": {
+        "file": "builtin:explorer",
+        "knowledge": ["knowledge/idea-analysis.md"],
+        "rules": ["rules/decision-evidence.md"],
+        "skills": ["skills/hypothesis-analysis.md"]
+      },
+      "context": { "graphView": "focused", "maxFacts": 60 }
+    },
+    "evaluator": {
+      "role": "evaluator",
+      "runtime": { "worker": "codex" },
+      "prompt": {
+        "file": "builtin:evaluator",
+        "knowledge": ["knowledge/idea-analysis.md"],
+        "rules": ["rules/decision-evidence.md"]
+      },
+      "context": { "graphView": "evidence-only", "maxFacts": 80 }
+    },
+    "metacog": {
+      "role": "metacog",
+      "runtime": { "worker": "codex" },
+      "prompt": {
+        "file": "builtin:metacog",
+        "knowledge": ["knowledge/idea-analysis.md"],
+        "rules": ["rules/decision-evidence.md"]
+      },
+      "context": { "graphView": "summary", "maxFacts": 100 }
+    }
+  },
+  "workers": { "codex": { "kind": "agent", "backend": "codex", "timeoutMs": 300000 } },
+  "scheduler": { "maxConcurrent": 3, "refillPerTick": 3, "workerLeaseMs": 300000 },
+  "control": { "mainProfile": "planner", "metacogProfile": "metacog", "globalMaxConcurrent": 3 },
+  "federation": { "scope": "idea-deep-analysis", "members": ["idea-deep-analysis"] }
+}

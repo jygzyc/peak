@@ -13,13 +13,11 @@
  */
 
 import type { Fact, GraphView, Intent, Progress, Verdict } from "./types.js";
-import { tierFacts, renderTieredFacts, DEFAULT_TIER_OPTIONS } from "./fact-tiering.js";
-
-const TIER_THRESHOLD = 15;
 
 export interface GraphViewInput {
   passFacts: Fact[];
   denyFacts?: Fact[];
+  candidateFacts?: Fact[];
   pendingFacts?: Fact[];
   openIntents?: Intent[];
   claimedIntents?: Intent[];
@@ -29,6 +27,12 @@ export interface GraphViewInput {
   target?: string;
   goal?: string;
   recentVerdicts?: Array<{ factId: string; verdict: Verdict; intentId?: string }>;
+  broadcastAssessments?: Array<{
+    broadcastId: string;
+    decision: string;
+    reason: string;
+    targetFactId?: string;
+  }>;
 }
 
 export interface GraphViewOptions {
@@ -59,30 +63,17 @@ function cap<T>(items: T[], max: number | undefined): T[] {
 }
 
 function renderFull(input: GraphViewInput, options: GraphViewOptions): string {
-  const sections: string[] = [];
+  const sections: string[] = renderObjective(input);
   const denyFacts = input.denyFacts ?? [];
-
-  // Target/goal always first — the planner must know the task.
-  if (input.target || input.goal) {
-    sections.push("## Objective");
-    if (input.target) sections.push(`Target: ${input.target}`);
-    if (input.goal) sections.push(`Goal: ${input.goal}`);
-  }
 
   if (options.includeProgress && input.progress) {
     sections.push(renderProgressBlock(input.progress));
   }
 
   if (input.passFacts.length > 0) {
-    if (input.passFacts.length > TIER_THRESHOLD) {
-      const currentStep = input.progress?.stepsExecuted ?? input.passFacts.length;
-      const tiered = tierFacts(input.passFacts, currentStep);
-      sections.push(renderTieredFacts(tiered));
-    } else {
-      sections.push("## Passed Facts");
-      for (const f of cap(input.passFacts, options.maxFacts)) {
-        sections.push(`- ${fmtFact(f)}`);
-      }
+    sections.push("## Passed Facts");
+    for (const f of cap(input.passFacts, options.maxFacts)) {
+      sections.push(`- ${fmtFact(f)}`);
     }
   }
 
@@ -90,6 +81,21 @@ function renderFull(input: GraphViewInput, options: GraphViewOptions): string {
     sections.push("## Denied Facts (dead-ends)");
     for (const f of cap(denyFacts, 10)) {
       sections.push(`- ${f.id}: ${f.description} — ${f.reviewerReason ?? "deny"}`);
+    }
+  }
+
+  if (input.candidateFacts && input.candidateFacts.length > 0) {
+    sections.push("## Candidate Facts (awaiting evaluator)");
+    for (const f of cap(input.candidateFacts, 10)) {
+      sections.push(`- ${fmtFact(f)}`);
+    }
+  }
+
+  if (input.pendingFacts && input.pendingFacts.length > 0) {
+    sections.push("## Pending Facts (conditions missing)");
+    for (const f of cap(input.pendingFacts, 10)) {
+      const conditions = f.requiredConditions?.join(", ") || "unspecified";
+      sections.push(`- ${f.id}: ${f.description} — waiting for: ${conditions}`);
     }
   }
 
@@ -117,24 +123,28 @@ function renderFull(input: GraphViewInput, options: GraphViewOptions): string {
     }
   }
 
+  if (input.broadcastAssessments && input.broadcastAssessments.length > 0) {
+    sections.push("## Evaluated Cross-session Broadcasts");
+    for (const assessment of input.broadcastAssessments) {
+      const target = assessment.targetFactId ? `, target=${assessment.targetFactId}` : "";
+      sections.push(
+        `- ${assessment.broadcastId}: ${assessment.decision}${target} — ${assessment.reason}`,
+      );
+    }
+  }
+
   return sections.join("\n");
 }
 
 function renderFocused(input: GraphViewInput, options: GraphViewOptions): string {
-  const sections: string[] = [];
+  const sections: string[] = renderObjective(input);
   const denyFacts = input.denyFacts ?? [];
 
   const ctx = input.passFacts;
   if (ctx.length > 0) {
-    if (ctx.length > TIER_THRESHOLD) {
-      const currentStep = input.progress?.stepsExecuted ?? ctx.length;
-      const tiered = tierFacts(ctx, currentStep);
-      sections.push(renderTieredFacts(tiered));
-    } else {
-      sections.push("## Context (passed facts)");
-      for (const f of cap(ctx, options.maxFacts ?? 50)) {
-        sections.push(`- ${fmtFact(f)}`);
-      }
+    sections.push("## Context (passed facts)");
+    for (const f of cap(ctx, options.maxFacts ?? 50)) {
+      sections.push(`- ${fmtFact(f)}`);
     }
   }
 
@@ -149,7 +159,7 @@ function renderFocused(input: GraphViewInput, options: GraphViewOptions): string
 }
 
 function renderEvidenceOnly(input: GraphViewInput, options: GraphViewOptions): string {
-  const sections: string[] = [];
+  const sections: string[] = renderObjective(input);
   const withEvidence = input.passFacts.filter((f) => f.evidence.length > 0);
   if (withEvidence.length > 0) {
     sections.push("## Passed Facts (evidence)");
@@ -162,7 +172,7 @@ function renderEvidenceOnly(input: GraphViewInput, options: GraphViewOptions): s
 }
 
 function renderSummary(input: GraphViewInput, _options: GraphViewOptions): string {
-  const sections: string[] = [];
+  const sections: string[] = renderObjective(input);
   if (input.progress) {
     sections.push(renderProgressBlock(input.progress));
   } else {
@@ -181,10 +191,19 @@ function renderSummary(input: GraphViewInput, _options: GraphViewOptions): strin
   return sections.join("\n");
 }
 
+function renderObjective(input: GraphViewInput): string[] {
+  if (!input.target && !input.goal) return [];
+  const lines = ["## Objective"];
+  if (input.target) lines.push(`Target: ${input.target}`);
+  if (input.goal) lines.push(`Goal: ${input.goal}`);
+  return lines;
+}
+
 function renderProgressBlock(progress: Progress): string {
   const lines = [
     "## Progress",
     `- Passed facts: ${progress.passFacts}`,
+    `- Candidate facts: ${progress.candidateFacts}`,
     `- Pending facts: ${progress.pendingFacts}`,
     `- Denied facts: ${progress.denyFacts}`,
     `- Open intents: ${progress.openIntents}`,

@@ -1,8 +1,13 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
+import { readFileSync } from "node:fs";
 import { renderGraphView } from "../dist/agent/graph-view.js";
-import { buildDynamicContext } from "../dist/agent/context-builder.js";
-import { InMemoryGraph } from "../dist/graph/in-memory-graph.js";
+import {
+  materializeGraphContext,
+  renderGraphContextArtifact,
+} from "../dist/agent/context-builder.js";
+import { buildDynamicContext, ServerSessionGraphReader } from "../dist/server/session-graph-reader.js";
+import { TestGraph } from "./test-graph.ts";
 import { createProject } from "./helper.ts";
 
 function fact(id: string, desc: string, evidence: string[] = []) {
@@ -51,7 +56,7 @@ test("graph-view: summary shows counts not bodies", () => {
     passFacts: [fact("f001", "secret")],
     denyFacts: [],
     progress: {
-      totalFacts: 1, passFacts: 1, pendingFacts: 0, denyFacts: 0,
+      totalFacts: 1, passFacts: 1, candidateFacts: 0, pendingFacts: 0, denyFacts: 0,
       openIntents: 0, claimedIntents: 0,
       stepsExecuted: 5, lastActivityAt: "", stagnationLevel: 0,
     },
@@ -59,6 +64,19 @@ test("graph-view: summary shows counts not bodies", () => {
   assert.match(text, /Progress/);
   assert.match(text, /Passed facts: 1/);
   assert.doesNotMatch(text, /secret/);
+});
+
+test("graph-view: every policy preserves the task Objective", () => {
+  for (const view of ["full", "focused", "evidence-only", "summary"] as const) {
+    const text = renderGraphView({
+      target: "workspace/app",
+      goal: "prove the requested property",
+      passFacts: [],
+    }, { view });
+    assert.match(text, /## Objective/);
+    assert.match(text, /workspace\/app/);
+    assert.match(text, /prove the requested property/);
+  }
 });
 
 test("graph-view: maxFacts caps rendered fact count", () => {
@@ -72,7 +90,7 @@ test("graph-view: maxFacts caps rendered fact count", () => {
 });
 
 test("context-builder: buildDynamicContext reads from graph", () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const p = createProject(graph);
   const fact = graph.addFact(p.id, { description: "discovered fact", source: "explorer", confidence: 0.9 });
   graph.resolveFact(p.id, fact.id, { decision: "pass", reason: "ok" });
@@ -84,7 +102,7 @@ test("context-builder: buildDynamicContext reads from graph", () => {
 });
 
 test("context-builder: relevanceScope=linked filters to linked facts only", () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const p = createProject(graph);
 
   const f1 = graph.addFact(p.id, { description: "root fact", source: "explorer", confidence: 0.9 });
@@ -114,7 +132,7 @@ test("context-builder: relevanceScope=linked filters to linked facts only", () =
 });
 
 test("context-builder: relevanceScope=all includes everything (default)", () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const p = createProject(graph);
 
   const f1 = graph.addFact(p.id, { description: "fact A", source: "explorer", confidence: 0.9 });
@@ -129,4 +147,43 @@ test("context-builder: relevanceScope=all includes everything (default)", () => 
 
   assert.match(text, /fact A/);
   assert.match(text, /fact B/);
+});
+
+test("context-builder: snapshot and artifact are deterministic and auditable", async () => {
+  const graph = new TestGraph();
+  const p = createProject(graph, { session: "artifact-session" });
+  const fact = graph.addFact(p.id, { description: "artifact fact", source: "explorer" });
+  graph.resolveFact(p.id, fact.id, { decision: "pass", reason: "verified" });
+  const reader = new ServerSessionGraphReader(graph);
+
+  const first = await reader.readSnapshot({
+    sessionId: p.session,
+    profileId: "planner",
+    projectId: p.id,
+    spec: { graphView: "full" },
+  });
+  const second = await reader.readSnapshot({
+    sessionId: p.session,
+    profileId: "planner",
+    projectId: p.id,
+    spec: { graphView: "full" },
+  });
+  assert.equal(first.contentHash, second.contentHash);
+  assert.equal(first.graphSeq, second.graphSeq);
+
+  const artifact = await materializeGraphContext(p.sessionDir, "run_context_1", first);
+  const stored = JSON.parse(readFileSync(artifact.resolvedPath, "utf8"));
+  assert.deepEqual(stored, first);
+  assert.notEqual(artifact.sha256, first.contentHash);
+  assert.match(artifact.relativePath, /graph-context-\d+-[a-f0-9]{64}\.json$/);
+  assert.match(artifact.relativePath, /^artifacts\/prompts\/run_context_1\//);
+
+  const injected = renderGraphContextArtifact(first, artifact);
+  assert.match(injected, /Read the referenced JSON file/);
+  assert.match(injected, /Never open analysis\.db/);
+  assert.doesNotMatch(injected, /artifact fact/);
+  await assert.rejects(
+    materializeGraphContext(p.sessionDir, "../escape", first),
+    /invalid run id/,
+  );
 });

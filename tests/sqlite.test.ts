@@ -3,6 +3,7 @@ import { strict as assert } from "node:assert";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { SqliteGraph } from "../dist/graph/sqlite-graph.js";
 import { SessionManager } from "../dist/session/session-manager.js";
 import { FederatedGraph } from "../dist/graph/federated-graph.js";
@@ -43,11 +44,27 @@ test("SqliteGraph: createProject + addFact + resolveFact roundtrip", () => {
 
   const f = g.addFact(p.id, { description: "test fact", source: "explorer", confidence: 0.8 });
   assert.equal(f.id, "f001");
-  assert.equal(f.status, "pending");
+  assert.equal(f.status, "candidate");
 
   g.resolveFact(p.id, f.id, { decision: "pass", reason: "ok" });
   assert.equal(g.getFact(p.id, f.id)!.status, "pass");
 
+  g.close();
+});
+
+test("SqliteGraph: events(sinceSeq) remains ascending", () => {
+  const dir = tempDir();
+  const g = new SqliteGraph(join(dir, "events.db"));
+  const p = g.createProject({
+    session: "events", name: "n", target: "T", goal: "G",
+    worker: "w", sessionDir: dir, configPath: "/tmp", taskConfig: config(),
+  });
+  const first = g.logEvent(p.id, "one");
+  g.logEvent(p.id, "two");
+  g.logEvent(p.id, "three");
+  const events = g.events(p.id, first.seq);
+  assert.deepEqual(events.map((event) => event.type), ["two", "three"]);
+  assert.ok(events[0]!.seq < events[1]!.seq);
   g.close();
 });
 
@@ -70,9 +87,62 @@ test("SqliteGraph: deferred fact persists and can be promoted", () => {
   const g2 = new SqliteGraph(dbPath);
   const loaded = g2.getProject("s1")!;
   assert.equal(g2.getFact(loaded.id, f.id)!.status, "pending");
+  g2.clearFactConditions(loaded.id, f.id);
+  assert.equal(g2.getFact(loaded.id, f.id)!.status, "candidate");
   g2.resolveFact(loaded.id, f.id, { decision: "pass", reason: "condition satisfied", confidence: 0.7 });
   assert.equal(g2.getFact(loaded.id, f.id)!.status, "pass");
   g2.close();
+});
+
+test("SqliteGraph: metacog outbox commit is durable and idempotently publishable", () => {
+  const dir = tempDir();
+  const dbPath = join(dir, "outbox.db");
+  const graph = new SqliteGraph(dbPath);
+  const project = graph.createProject({
+    session: "outbox", name: "n", target: "T", goal: "G",
+    worker: "w", sessionDir: dir, configPath: "/tmp", taskConfig: config(),
+  });
+  const run = graph.createSubagentRun(project.id, {
+    profileId: "metacog",
+    role: "metacog",
+    workerName: "w",
+    inputSummary: "fact.accepted:f001",
+  });
+  graph.updateSubagentRun(project.id, run.id, { status: "running" });
+  graph.commitMetacogResult(project.id, run.id, {
+    hints: [],
+    outputSummary: "0 hints",
+    broadcast: {
+      eventId: "fact:s:project:f001",
+      scope: "group-a",
+      kind: "fact",
+      sourceFactId: "f001",
+      summary: "durable finding",
+      confidence: 0.9,
+    },
+  });
+  assert.equal(graph.getSubagentRun(project.id, run.id)?.status, "completed");
+  assert.equal(graph.federationOutbox(project.id, "pending").length, 1);
+  graph.close();
+
+  const reopened = new SqliteGraph(dbPath);
+  const loaded = reopened.getProject("outbox")!;
+  assert.equal(reopened.federationOutbox(loaded.id, "pending").length, 1);
+  reopened.markFederationOutboxPublished(
+    loaded.id,
+    "fact:s:project:f001",
+    "fact:s:project:f001",
+    42,
+  );
+  reopened.markFederationOutboxPublished(
+    loaded.id,
+    "fact:s:project:f001",
+    "fact:s:project:f001",
+    42,
+  );
+  assert.equal(reopened.federationOutbox(loaded.id, "pending").length, 0);
+  assert.equal(reopened.federationOutbox(loaded.id, "published")[0]!.broadcastSeq, 42);
+  reopened.close();
 });
 
 
@@ -83,8 +153,16 @@ test("SqliteGraph: intent lifecycle (add → claim → conclude)", () => {
     session: "s1", name: "n", target: "T", goal: "G",
     worker: "w", sessionDir: dir, configPath: "/tmp", taskConfig: config(),
   });
-  const intent = g.addIntent(p.id, { description: "do x", creator: "planner" });
+  const intent = g.addIntent(p.id, {
+    description: "do x",
+    creator: "planner",
+    dispatchRequested: false,
+  });
   assert.equal(intent.status, "open");
+  assert.equal(intent.dispatchRequested, false);
+
+  g.requestExplorerDispatch(p.id, intent.id);
+  assert.equal(g.getIntent(p.id, intent.id)!.dispatchRequested, true);
 
   g.claimIntent(p.id, intent.id, "w1", 60000);
   assert.equal(g.getIntent(p.id, intent.id)!.status, "claimed");
@@ -93,6 +171,84 @@ test("SqliteGraph: intent lifecycle (add → claim → conclude)", () => {
   g.concludeIntent(p.id, intent.id, fact.id);
   assert.equal(g.getIntent(p.id, intent.id)!.status, "pass");
   g.close();
+});
+
+test("SqliteGraph: EndFact cannot bypass unfinished graph work", () => {
+  const dir = tempDir();
+  const g = new SqliteGraph(join(dir, "test.db"));
+  const p = g.createProject({
+    session: "s1", name: "n", target: "T", goal: "G",
+    worker: "w", sessionDir: dir, configPath: "/tmp", taskConfig: config(),
+  });
+  const intent = g.addIntent(p.id, { description: "unfinished", creator: "planner" });
+  assert.throws(() => g.createEndFact(p.id, "early", []), /intents are open or claimed/);
+  g.failIntent(p.id, intent.id, "closed", false, "planner");
+  const candidate = g.addFact(p.id, { description: "unreviewed", source: "explorer" });
+  assert.throws(() => g.createEndFact(p.id, "early", []), /candidate facts await evaluation/);
+  g.resolveFact(p.id, candidate.id, { decision: "deny", reason: "invalid" });
+  assert.equal(g.createEndFact(p.id, "done", []).status, "active");
+  g.close();
+});
+
+test("SqliteGraph: SubagentRun prompt provenance survives reopen", () => {
+  const dir = tempDir();
+  const dbPath = join(dir, "test.db");
+  const g = new SqliteGraph(dbPath);
+  const p = g.createProject({
+    session: "s1", name: "n", target: "T", goal: "G",
+    worker: "w", sessionDir: dir, configPath: "/tmp", taskConfig: config(),
+  });
+  const run = g.createSubagentRun(p.id, {
+    profileId: "planner", role: "planner", workerName: "w",
+  });
+  g.updateSubagentRun(p.id, run.id, {
+    promptHash: "a".repeat(64),
+    promptManifest: {
+      version: 1,
+      hash: "b".repeat(64),
+      components: [{
+        kind: "primary", index: 0, source: "planner.md",
+        resolvedPath: join(dir, "planner.md"), sha256: "c".repeat(64), bytes: 7,
+      }],
+    },
+    contextArtifact: {
+      version: 1,
+      sessionId: "prompt-run",
+      projectId: p.id,
+      graphSeq: 7,
+      view: "full",
+      relativePath: "artifacts/prompts/run/context.md",
+      resolvedPath: join(dir, "context.md"),
+      sha256: "d".repeat(64),
+      bytes: 42,
+      delivery: "reference",
+      createdAt: new Date().toISOString(),
+    },
+    outputArtifact: {
+      version: 1,
+      sessionId: "s1",
+      projectId: p.id,
+      runId: run.id,
+      role: "planner",
+      relativePath: `artifacts/roles/${run.id}/output.json`,
+      resolvedPath: join(dir, "output.json"),
+      sha256: "e".repeat(64),
+      bytes: 24,
+      createdAt: new Date().toISOString(),
+    },
+  });
+  g.close();
+
+  const reopened = new SqliteGraph(dbPath);
+  const loaded = reopened.getSubagentRun(p.id, run.id)!;
+  assert.equal(loaded.promptHash, "a".repeat(64));
+  assert.equal(loaded.promptManifest?.components[0]?.kind, "primary");
+  assert.equal(loaded.promptManifest?.components[0]?.resolvedPath, join(dir, "planner.md"));
+  assert.equal(loaded.contextArtifact?.graphSeq, 7);
+  assert.equal(loaded.contextArtifact?.sha256, "d".repeat(64));
+  assert.equal(loaded.outputArtifact?.runId, run.id);
+  assert.equal(loaded.outputArtifact?.sha256, "e".repeat(64));
+  reopened.close();
 });
 
 test("SqliteGraph: failIntent with killedBy", () => {
@@ -151,6 +307,49 @@ test("SqliteGraph: persistence survives reopen", () => {
   g2.close();
 });
 
+test("SqliteGraph: intent_sets is the canonical ordered source store", () => {
+  const dir = tempDir();
+  const dbPath = join(dir, "intent-sets.db");
+  const g1 = new SqliteGraph(dbPath);
+  const p = g1.createProject({
+    session: "sources", name: "n", target: "T", goal: "G",
+    worker: "w", sessionDir: dir, configPath: "/tmp", taskConfig: config(),
+  });
+  const first = g1.addFact(p.id, { description: "first", source: "explorer" });
+  const second = g1.addFact(p.id, { description: "second", source: "explorer" });
+  g1.resolveFact(p.id, first.id, { decision: "pass", reason: "verified" });
+  g1.resolveFact(p.id, second.id, { decision: "pass", reason: "verified" });
+  const intent = g1.addIntent(p.id, {
+    description: "combine", creator: "planner", parentFactIds: [second.id, first.id],
+  });
+  g1.close();
+
+  const raw = new DatabaseSync(dbPath);
+  assert.equal((raw.prepare("PRAGMA application_id").get() as { application_id: number }).application_id, 1346715980);
+  assert.equal((raw.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 1);
+  const intentColumns = raw.prepare("PRAGMA table_info(intents)").all()
+    .map((row) => String((row as { name: string }).name));
+  assert.equal(intentColumns.includes("parent_fact_ids_json"), false);
+  assert.equal(intentColumns.includes("chain_json"), false);
+  const removedTable = raw.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'intent_sources'",
+  ).get();
+  assert.equal(removedTable, undefined);
+  raw.close();
+
+  const g2 = new SqliteGraph(dbPath);
+  assert.deepEqual(g2.getIntent(p.id, intent.id)?.parentFactIds, [second.id, first.id]);
+  g2.close();
+});
+
+test("SqliteGraph: rejects an existing database without the first-version identity", () => {
+  const dbPath = join(tempDir(), "unmarked.db");
+  const db = new DatabaseSync(dbPath);
+  db.exec("CREATE TABLE unknown_state (id TEXT PRIMARY KEY)");
+  db.close();
+  assert.throws(() => new SqliteGraph(dbPath), /does not use the first-version schema/);
+});
+
 test("SqliteGraph: progress computes correctly", () => {
   const dir = tempDir();
   const g = new SqliteGraph(join(dir, "test.db"));
@@ -162,7 +361,8 @@ test("SqliteGraph: progress computes correctly", () => {
   g.addFact(p.id, { description: "f2", source: "explorer" });
   const pr = g.progress(p.id);
   assert.equal(pr.totalFacts, 2);
-  assert.equal(pr.pendingFacts, 2);
+  assert.equal(pr.candidateFacts, 2);
+  assert.equal(pr.pendingFacts, 0);
   assert.equal(pr.passFacts, 0);
   g.close();
 });
@@ -208,7 +408,7 @@ test("FederatedGraph: search facts across sessions", () => {
   });
   g2.addFact(p2.id, { description: "WebView bypass in app-b", source: "explorer", confidence: 0.8 });
 
-  const allAccepted = fed.searchFactsAcrossSessions(["app-a", "app-b"], { status: "pending" });
+  const allAccepted = fed.searchFactsAcrossSessions(["app-a", "app-b"], { status: "candidate" });
   assert.equal(allAccepted.length, 2);
 
   const webviewOnly = fed.searchFactsAcrossSessions(["app-a", "app-b"], { query: "WebView" });
@@ -235,7 +435,11 @@ test("FederatedGraph: search intents across sessions", () => {
     worker: "w", sessionDir: base, configPath: "/tmp",
     taskConfig: config(),
   });
-  g1.addIntent(p1.id, { description: "analyze crypto module", creator: "planner" });
+  const source = g1.addFact(p1.id, { description: "crypto is reachable", source: "explorer" });
+  g1.resolveFact(p1.id, source.id, { decision: "pass", reason: "verified" });
+  g1.addIntent(p1.id, {
+    description: "analyze crypto module", creator: "planner", parentFactIds: [source.id],
+  });
 
   const p2 = g2.createProject({
     session: "s2", name: "n", target: "T", goal: "G",
@@ -248,6 +452,7 @@ test("FederatedGraph: search intents across sessions", () => {
   assert.equal(results.length, 1);
   assert.equal(results[0].sessionId, "sess-x");
   assert.equal(results[0].intent.description, "analyze crypto module");
+  assert.deepEqual(results[0].intent.parentFactIds, [source.id]);
 
   g1.close();
   g2.close();

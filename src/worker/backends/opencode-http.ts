@@ -45,7 +45,7 @@ export class OpencodeHttpBackend implements AgentBackend {
           method: "POST",
           headers,
           body: JSON.stringify({ title: `peak-${Date.now()}` }),
-          signal: AbortSignal.timeout(10_000),
+          signal: requestSignal(input.signal, 10_000),
         });
         if (!sessionResp.ok) {
           return errorResult(`opencode server returned ${sessionResp.status}: ${await sessionResp.text()}`);
@@ -64,7 +64,7 @@ export class OpencodeHttpBackend implements AgentBackend {
         body: JSON.stringify({
           parts: [{ type: "text", text: input.prompt }],
         }),
-        signal: AbortSignal.timeout(input.config.timeoutMs ?? DEFAULT_TIMEOUT_MS),
+        signal: requestSignal(input.signal, input.config.timeoutMs ?? DEFAULT_TIMEOUT_MS),
       });
 
       if (!messageResp.ok) {
@@ -91,6 +91,11 @@ export class OpencodeHttpBackend implements AgentBackend {
     // that extracted text, so it's identity.
     return stdout;
   }
+}
+
+function requestSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
 function extractAssistantText(result: { parts?: Array<{ type: string; text?: string; content?: unknown }> }): string {

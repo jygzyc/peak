@@ -78,6 +78,15 @@ test("agentFile/taskFile: build named config paths", () => {
   });
 });
 
+test("agentFile/taskFile: reject names that escape their config directory", () => {
+  withTempHome(() => {
+    for (const name of ["../outside", "nested/name", "nested\\name", "..", " leading"]) {
+      assert.throws(() => agentFile(name), /must not contain a path|must contain only/);
+      assert.throws(() => taskFile(name), /must not contain a path|must contain only/);
+    }
+  });
+});
+
 test("ensurePeakLayout: creates agents/tasks/sessions idempotently", () => {
   withTempHome(() => {
     const home = process.env.PEAK_HOME!;

@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
-import { InMemoryGraph } from "../dist/graph/in-memory-graph.js";
+import { TestGraph } from "./test-graph.ts";
 import { createProject } from "./helper.ts";
 
 test("SubagentRun: createSubagentRun returns pending run with generated id", () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const p = createProject(graph);
   const run = graph.createSubagentRun(p.id, {
     profileId: "explorer",
@@ -20,7 +20,7 @@ test("SubagentRun: createSubagentRun returns pending run with generated id", () 
 });
 
 test("SubagentRun: updateSubagentRun sets startedAt on running and finishedAt on terminal", () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const p = createProject(graph);
   const run = graph.createSubagentRun(p.id, {
     profileId: "explorer", role: "explorer", workerName: "mock",
@@ -38,7 +38,7 @@ test("SubagentRun: updateSubagentRun sets startedAt on running and finishedAt on
 });
 
 test("SubagentRun: subagentRuns filters by profileId and status", () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const p = createProject(graph);
   graph.createSubagentRun(p.id, { profileId: "explorer", role: "explorer", workerName: "mock" });
   graph.createSubagentRun(p.id, { profileId: "explorer", role: "explorer", workerName: "mock" });
@@ -50,7 +50,7 @@ test("SubagentRun: subagentRuns filters by profileId and status", () => {
 });
 
 test("SubagentRun: updateSubagentRun throws on unknown runId", () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const p = createProject(graph);
   assert.throws(() => graph.updateSubagentRun(p.id, "run_unknown", { status: "running" }), /not found/);
 });

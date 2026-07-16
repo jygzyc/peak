@@ -15,6 +15,7 @@ export interface ModelCallInput {
   model?: string;
   temperature?: number;
   maxTokens?: number;
+  signal?: AbortSignal;
 }
 
 export interface ModelCallResult {

@@ -3,6 +3,7 @@ import { strict as assert } from "node:assert";
 import { AgentDriverPool } from "../dist/worker/agent-driver-pool.js";
 import { registerAgentBackend } from "../dist/worker/backends/registry.js";
 import type { AgentBackend, BackendInvokeInput, BackendInvokeResult } from "../dist/worker/backends/types.js";
+import { minimalConfig } from "./helper.ts";
 
 /**
  * Regression tests for AgentDriverPool (docs 05-worker-core.md §5.5).
@@ -31,6 +32,8 @@ test("AgentDriverPool: forwards apiKey from the worker config to the backend", a
       prompt: "hello",
       workerName: "capture-test",
       role: "evaluator",
+      projectId: "api-key-project",
+      cwd: process.cwd(),
       config: {
         kind: "agent",
         backend: "capture-test",
@@ -46,21 +49,16 @@ test("AgentDriverPool: forwards apiKey from the worker config to the backend", a
   }
 });
 
-test("AgentDriverPool: role defaults to explorer when request omits role", async () => {
-  // The pool still has to pass SOMETHING for role to executeWorker; when the
-  // request carries no role it falls back to "explorer" (the previous behavior
-  // for every call). The fix makes the real role available instead of
-  // hard-coding explorer unconditionally.
+test("AgentDriverPool: rejects requests without complete role provenance", async () => {
   const backend = new CapturingBackend();
   const unregister = registerAgentBackend(backend);
   try {
     const pool = new AgentDriverPool();
-    const result = await pool.execute({
+    await assert.rejects(pool.execute({
       prompt: "hello",
       workerName: "capture-test",
       config: { kind: "agent", backend: "capture-test" },
-    });
-    assert.equal(result.returncode, 0);
+    } as never), /requires workerName, role, projectId, and cwd/);
   } finally {
     unregister();
   }
@@ -77,6 +75,7 @@ test("AgentDriverPool: markRunning/unmarkRunning stay balanced around execute", 
       workerName: "w1",
       role: "explorer",
       projectId,
+      cwd: process.cwd(),
       config: { kind: "agent", backend: "capture-test" },
     });
     // After execute resolves, no worker should remain marked as running.
@@ -105,6 +104,7 @@ test("AgentDriverPool: unmarkRunning runs even when the backend errors", async (
       workerName: "w-fail",
       role: "explorer",
       projectId,
+      cwd: process.cwd(),
       config: { kind: "agent", backend: "fail-test" },
     });
     assert.equal(result.returncode, 1);
@@ -113,4 +113,15 @@ test("AgentDriverPool: unmarkRunning runs even when the backend errors", async (
   } finally {
     unregister();
   }
+});
+
+test("AgentDriverPool: pickWorker respects a profile's allowed worker pool", () => {
+  const pool = new AgentDriverPool();
+  const config = minimalConfig();
+  config.workers = {
+    w1: { kind: "mock" },
+    w2: { kind: "mock" },
+    forbidden: { kind: "mock" },
+  };
+  assert.equal(pool.pickWorker("project", config, ["w2"]), "w2");
 });

@@ -1,0 +1,65 @@
+{
+  "task": {
+    "name": "Single Android App vulnerability analysis",
+    "session": "single-app-vuln",
+    "target": "Authorized DeepLinkActivity fixture",
+    "goal": "Prove or reject the complete external deep-link to native token disclosure chain in one session",
+    "workspace": "../fixture"
+  },
+  "profiles": {
+    "planner": {
+      "role": "planner",
+      "runtime": { "worker": "codex" },
+      "prompt": {
+        "file": "builtin:planner",
+        "knowledge": ["../knowledge/android-app-vuln.md"],
+        "rules": ["../rules/evidence-gate.md"],
+        "skills": ["../skills/android-static-analysis.md"],
+        "instructions": "Analyze this one authorized App end to end in one session. Decompose entry, control/guard, sink and impact, then synthesize only local pass Facts into the final chain."
+      },
+      "context": { "graphView": "full", "maxFacts": 80 }
+    },
+    "explorer": {
+      "role": "explorer",
+      "runtime": { "worker": "codex" },
+      "prompt": {
+        "file": "builtin:explorer",
+        "knowledge": ["../knowledge/android-app-vuln.md"],
+        "rules": ["../rules/evidence-gate.md"],
+        "skills": ["../skills/android-static-analysis.md"],
+        "instructions": "Inspect the Manifest and Kotlin fixture, cite entry, attacker control, guard, WebView sink and TokenBridge impact."
+      },
+      "context": { "graphView": "focused", "maxFacts": 60 }
+    },
+    "evaluator": {
+      "role": "evaluator",
+      "runtime": { "worker": "codex" },
+      "prompt": {
+        "file": "builtin:evaluator",
+        "rules": ["../rules/evidence-gate.md"],
+        "knowledge": ["../knowledge/android-app-vuln.md"]
+      },
+      "context": { "graphView": "evidence-only", "maxFacts": 80 }
+    },
+    "metacog": {
+      "role": "metacog",
+      "runtime": { "worker": "codex" },
+      "prompt": {
+        "file": "builtin:metacog",
+        "rules": ["../rules/evidence-gate.md"],
+        "knowledge": ["../knowledge/android-app-vuln.md"]
+      },
+      "context": { "graphView": "summary", "maxFacts": 100 },
+      "triggers": { "everySteps": 5, "stagnationLevel": 3, "everySeconds": 30 }
+    }
+  },
+  "workers": {
+    "codex": { "kind": "agent", "backend": "codex", "timeoutMs": 300000 }
+  },
+  "scheduler": { "maxConcurrent": 2, "refillPerTick": 2, "workerLeaseMs": 300000 },
+  "control": { "mainProfile": "planner", "metacogProfile": "metacog", "globalMaxConcurrent": 2 },
+  "federation": {
+    "scope": "single-app-vuln",
+    "members": ["single-app-vuln"]
+  }
+}

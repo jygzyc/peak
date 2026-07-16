@@ -1,51 +1,38 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
-import { InMemoryGraph } from "../dist/graph/in-memory-graph.js";
+import { TestFederationBus, TestGraph } from "./test-graph.ts";
 import { MockWorker } from "../dist/worker/mock-worker.js";
 import { SessionLoop } from "../dist/session/session-loop.js";
+import { MetacogSupervisor } from "../dist/session/metacog-supervisor.js";
 import { FederationBus } from "../dist/graph/federation-bus.js";
 import { minimalConfig, createProject, env } from "./helper.ts";
 
 /**
- * Termination tests for the natural-completion model.
- *
- * This is an unbounded exploration/blackboard agent: there is no depth limit,
- * no stop gate, and no forced stagnation pause. A project completes naturally
- * when the planner produces no new intent AND none are in flight
- * (openIntents===0). Stagnation instead triggers the
- * metacog loop, whose hints the planner acts on. The planner is the sole judge.
+ * Termination tests for explicit planner EndFact semantics.
  */
 
 function decisions(createIntents: unknown[] = [], concludeRun: unknown = null) {
   return env("decisions", { createIntents, failIntents: [], consumeHints: [], concludeRun });
 }
 
-test("termination: project completes naturally when the planner produces no new intent", async () => {
-  const graph = new InMemoryGraph();
+test("termination: empty planner decision does not complete the project", async () => {
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
 
-  // Step 1: planner creates the only intent; explorer resolves it; evaluator accepts.
-  worker.register(/automated planning module/i, decisions([{ description: "ONLY-TASK" }]));
-  worker.register(/ONLY-TASK/i, env("fact", { description: "done", confidence: 0.9 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
-  // After the intent completes, the planner has nothing new to add → no intents.
-  worker.register(/## Recent Evaluator Verdicts/i, decisions());
+  worker.register(/automated planning module/i, decisions());
 
   const loop = new SessionLoop(graph, worker, config);
-  const result = await loop.run(p.id, { idlePollMs: 5 });
+  const result = await loop.step(p.id);
 
-  assert.equal(result.type, "completed", `expected completed, got ${result.type}`);
-  assert.equal(graph.getProject(p.id)!.status, "completed");
-  const events = graph.events(p.id).filter((e) => e.type === "project.completed_natural");
-  assert.equal(events.length, 1);
+  assert.equal(result.type, "idle");
+  assert.equal(graph.getProject(p.id)!.status, "active");
+  assert.equal(graph.activeEndFact(p.id), undefined);
 });
 
-test("termination: project completes even when the only intent is failed/rejected", async () => {
-  // A dead-end task with no follow-up also completes naturally — there is no
-  // forced stagnation pause anymore.
-  const graph = new InMemoryGraph();
+test("termination: rejected work still requires an explicit planner EndFact", async () => {
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
@@ -56,12 +43,14 @@ test("termination: project completes even when the only intent is failed/rejecte
   worker.register(/## Recent Evaluator Verdicts/i, decisions());
 
   const loop = new SessionLoop(graph, worker, config);
-  const result = await loop.run(p.id, { idlePollMs: 5 });
-  assert.equal(result.type, "completed");
+  await loop.step(p.id);
+  const result = await loop.step(p.id);
+  assert.equal(result.type, "idle");
+  assert.equal(graph.getProject(p.id)!.status, "active");
 });
 
 test("termination: paused project returns idle step result", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
@@ -74,7 +63,7 @@ test("termination: paused project returns idle step result", async () => {
 });
 
 test("termination: completed project returns completed step result (via concludeRun)", async () => {
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
@@ -91,29 +80,27 @@ test("termination: completed project returns completed step result (via conclude
   assert.equal(graph.getProject(p.id)!.status, "completed");
 });
 
-test("run() loops until natural completion (unbounded)", async () => {
-  // run() has no depth limit — it loops until the planner produces no new intent
-  // and none are in flight. The mock drives: planner opens one intent → explorer
-  // resolves it → evaluator accepts → next planner tick concludes the run.
-  const graph = new InMemoryGraph();
+test("run() loops until the planner creates an EndFact", async () => {
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
   worker.register(/automated planning module/i, decisions([{ description: "ONE-SHOT" }]));
   worker.register(/ONE-SHOT/i, env("fact", { description: "done", confidence: 0.9 }));
   worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
-  worker.register(/## Recent Evaluator Verdicts/i, decisions());
+  worker.register(/## Recent Evaluator Verdicts/i, decisions([], { description: "goal achieved" }));
 
   const loop = new SessionLoop(graph, worker, config);
   const result = await loop.run(p.id);
-  assert.equal(result.type, "completed", "unbounded run must still terminate naturally");
+  assert.equal(result.type, "completed");
+  assert.ok(graph.endFacts(p.id).length > 0);
 });
 
 test("evaluator failure leaves the candidate as candidate (not auto-rejected)", async () => {
   // Previously a transient evaluator error was silently turned into a reject
   // verdict, permanently marking the fact as a dead-end. Now the candidate is
   // left untouched so a later step can retry evaluation.
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
@@ -126,7 +113,7 @@ test("evaluator failure leaves the candidate as candidate (not auto-rejected)", 
   const loop = new SessionLoop(graph, worker, config);
   await loop.step(p.id);
 
-  const candidate = graph.facts(p.id, "pending");
+  const candidate = graph.facts(p.id, "candidate");
   const rejected = graph.facts(p.id, "deny");
   assert.equal(candidate.length, 1, "candidate must remain a candidate (not resolved)");
   assert.equal(rejected.length, 0, "transient evaluator error must NOT auto-reject the fact");
@@ -140,7 +127,7 @@ test("dispatchExplorers sweeps expired leases before counting claimed slots", as
   // before counting claimed intents, so the stale slot frees up within the
   // same step. We verify: a stale claim that fills the only scheduler slot
   // does NOT prevent a fresh open intent from dispatching in the same step.
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   config.scheduler!.maxConcurrent = 1; // only 1 slot total
@@ -160,48 +147,44 @@ test("dispatchExplorers sweeps expired leases before counting claimed slots", as
   worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
 
   const loop = new SessionLoop(graph, worker, config);
-  // dispatchExplorers is called inside stepLocked via dispatchExplorers, but
-  // stepLocked also runs the planner. Instead call dispatchExplorers' effect
-  // indirectly: run one step which (with no planner mock) will still dispatch.
-  // Actually verify the sweep directly: before dispatch, the stale lease is gone.
-  const swept = graph.sweepExpiredLeases();
-  assert.equal(swept, 1, "stale claim should be swept");
+  // SessionLoop recovery and dispatch both sweep leases. Construction already
+  // performs the first sweep, so verify the durable state/event rather than
+  // expecting a second sweep to count the same lease again.
+  assert.ok(graph.events(p.id).some((event) =>
+    event.type === "intent.lease_expired" && event.payload.intentId === stale.id));
   // After sweep, no claimed intents remain → slot is free for FRESH-TASK.
   assert.equal(graph.intents(p.id, "claimed").length, 0, "no claimed intents after sweep");
 });
 
-test("FederationBus: accepted facts and rejected dead-ends are published", async () => {
-  // When a FederationBus is wired into the SessionLoop, an evaluator's accept
-  // verdict publishes a "fact" insight and a reject verdict publishes a
-  // "dead_end" insight, so sibling sessions learn from confirmed findings and
-  // proven dead-ends.
-  const graph = new InMemoryGraph();
+test("FederationBus: accepted facts are published only after metacog review", async () => {
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
-  const bus = new FederationBus();
+  const bus = new TestFederationBus();
   const insights = bus.recentInsights.bind(bus);
   const loop = new SessionLoop(graph, worker, config, { federationBus: bus, sessionId: "s1" });
+  const metacog = new MetacogSupervisor(
+    graph,
+    worker,
+    config,
+    undefined,
+    { sessionId: "s1", scope: "default" },
+  );
+  loop.setMetacog(metacog);
 
-  worker.register(/automated planning module/i, decisions([{ description: "EXPLORE-X" }, { description: "DEAD-Y" }]));
+  worker.register(/automated planning module/i, decisions([{ description: "EXPLORE-X" }]));
   worker.register(/EXPLORE-X/i, env("fact", { description: "X confirmed", confidence: 0.95 }));
-  worker.register(/DEAD-Y/i, env("fact", { description: "Y was wrong", confidence: 0.2 }));
-  // First candidate accepted, second rejected.
-  let firstVerdict = true;
-  worker.register(/Evaluator Role/i, () => {
-    if (firstVerdict) { firstVerdict = false; return env("verdict", { decision: "pass", reason: "ok" }); }
-    return env("verdict", { decision: "deny", reason: "dead-end" });
-  });
-  worker.register(/## Recent Evaluator Verdicts/i, decisions([], { description: "done" }));
+  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
+  worker.register(/Metacog Role/i, env("hints", { hints: [] }));
 
-  await loop.run(p.id, { idlePollMs: 5 });
+  await loop.step(p.id);
   const all = insights(20);
   const facts = all.filter((i) => i.kind === "fact");
   const deadEnds = all.filter((i) => i.kind === "dead_end");
   assert.ok(facts.length >= 1, "accepted fact should be published as a fact insight");
   assert.ok(facts.some((i) => i.summary.includes("X confirmed")));
-  assert.ok(deadEnds.length >= 1, "rejected candidate should be published as a dead_end insight");
-  assert.ok(deadEnds.some((i) => i.summary.includes("Y was wrong")));
+  assert.equal(deadEnds.length, 0, "evaluator must not bypass metacog to publish dead-ends");
   // Source attribution carries the session id.
   assert.equal(facts[0]!.source.sessionId, "s1");
 });
@@ -211,7 +194,7 @@ test("deferred fact is reactivated when a later accepted fact matches its condit
   // accepted fact's description contains the condition text. The two facts must
   // be evaluated in separate steps (they're concurrent within one step's
   // runEvaluators), so the planner produces them one at a time.
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   config.profiles.planner.cooldownSteps = 0;
@@ -252,14 +235,14 @@ test("deferred fact is reactivated when a later accepted fact matches its condit
   assert.ok(reactivated, "deferred fact should be reactivated when condition is met");
 });
 
-test("persistently failing explorer is auto-failed after retries (no deadlock)", async () => {
+test("persistently failing explorer fails the project without inventing a semantic dead-end", async () => {
   // An explorer that always returns unparseable output would, without the
   // auto-fail guard, release the intent back to "open" every step and be
   // re-dispatched forever — no verdict is ever produced to wake the planner,
   // so loop.run() would never terminate. After MAX_EXPLORER_RETRIES the loop
   // fails the intent (mechanism, like lease expiry) and records a dead-end,
   // so the planner sees an empty graph and concludes naturally.
-  const graph = new InMemoryGraph();
+  const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
   const p = createProject(graph);
@@ -272,11 +255,11 @@ test("persistently failing explorer is auto-failed after retries (no deadlock)",
   const loop = new SessionLoop(graph, worker, config);
   const result = await loop.run(p.id, { idlePollMs: 1 });
 
-  assert.equal(result.type, "completed", "run must terminate, not deadlock");
+  assert.equal(result.type, "failed", "run must terminate, not deadlock");
   const intent = graph.intents(p.id)[0]!;
-  assert.equal(intent.status, "deny", "the broken intent is auto-failed");
+  assert.equal(intent.status, "open", "transport failure must not become planner semantic deny");
   const autoFailed = graph.events(p.id).find((e) => e.type === "intent.auto_failed");
-  assert.ok(autoFailed, "an intent.auto_failed event was logged");
+  assert.equal(autoFailed, undefined);
   const explorerErrors = graph.events(p.id).filter((e) => e.type === "explorer.error");
   assert.ok(explorerErrors.length >= 3, `at least 3 explorer errors before auto-fail, got ${explorerErrors.length}`);
 });

@@ -147,6 +147,18 @@ export function asOptionalString(
   return typeof v === "string" && v.length > 0 ? v : undefined;
 }
 
+export function asBoolean(
+  data: Record<string, unknown>,
+  field: string,
+  stage: string,
+): boolean {
+  const value = data[field];
+  if (typeof value !== "boolean") {
+    throw new StageError(`field "${field}" is not a boolean`, stage);
+  }
+  return value;
+}
+
 export function asNumber(
   data: Record<string, unknown>,
   field: string,

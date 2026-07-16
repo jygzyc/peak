@@ -50,9 +50,9 @@ Per-file audit of `src/` (purpose, exports, dependencies, bugs, dead code per fi
 src/
 ├── app/       # runtime composition root (AgentRuntime)
 ├── config/    # task/default/provider config, profile-loader, prompt-loader
-├── session/   # SessionLoop, GlobalSupervisor, MetacogSupervisor, SessionManager, ProjectLock
+├── session/   # SessionLoop, GlobalSupervisor, MetacogSupervisor, SessionCoordinator, SessionManager
 ├── agent/     # MainAgent, DecisionApplier, contracts, permissions, context-builder, graph-view,
-│              # parse-envelope, prompts/builtins, and the legacy Stage implementations
+│              # parse-envelope, prompts/builtins, and role implementations
 ├── graph/     # Graph interface, SQLite/InMemory stores, FederatedGraph, FederationBus
 ├── worker/    # worker runtime, drivers, backends, providers, mock worker
 ├── server/    # HTTP API and embedded dashboard
@@ -78,8 +78,8 @@ Important points:
 - `profiles` declares SubagentProfiles. The built-in slots are `planner`, `explorer`, `evaluator`, and optional `metacog`; custom profiles (e.g. `source-finder`, `strict-reviewer`) live under arbitrary keys.
 - A SubagentProfile binds together: `runtime` (worker + optional model), `prompt` (file/text/rules/knowledge), `context` (graphView + maxFacts), `permissions` (capability tokens), `output` (contract name), plus per-agent tuning knobs: `maxActive`, `cooldownSteps` (planner), `triggers` (metacog), `intervalSeconds`.
 - `workers` defines low-level worker configs (`kind: "agent" | "api" | "mock"`).
-- **There is no `workflow` concept.** Termination is natural (planner produces no new intent). `scheduler` (`maxConcurrent`/`refillPerTick`/`workerLeaseMs`) is the only top-level execution knob and is optional. Legacy `workflow.limits.{maxConcurrent,refillPerTick,workerLeaseMs}` map to `scheduler` for backward compat; `maxSteps`/`stopGate`/`maxStagnation` are ignored.
-- `control.mainProfile`, `control.metacogProfile`, and `control.metacogIntervalSeconds` select which profiles drive planning and metacognition.
+- **There is no `workflow` concept.** Termination is natural (planner produces no new intent). `scheduler` (`maxConcurrent`/`refillPerTick`/`workerLeaseMs`) is the only top-level execution knob and is optional. A `workflow` field is rejected as outside the first-version config schema.
+- `control.mainProfile` and `control.metacogProfile` select which profiles drive planning and metacognition. Metacog cadence belongs to `profiles.<id>.triggers.everySeconds`.
 
 ## Peak home layout (`~/.peak/`)
 
@@ -94,7 +94,7 @@ All persistent state lives under one root (`PEAK_HOME` env overrides; default `~
 └── providers.json       model provider configs
 ```
 
-- **Agents are patches, not standalone profiles.** An agent file declares a `slot` (planner/explorer/evaluator/metacog) and is deep-merged over the builtin profile — declared fields override, omitted fields keep the builtin default. This preserves the graph/blackboard architecture (SessionLoop only knows the four builtin slots). See `src/config/agent-loader.ts`.
+- **Agent files are patches, not standalone profiles.** An agent file declares a builtin `slot` (planner/explorer/evaluator/metacog) and is deep-merged over that builtin profile — declared fields override, omitted fields keep the builtin default. Task `profiles` may additionally use arbitrary profile ids; `control.{mainProfile,explorerProfile,evaluatorProfile,metacogProfile}` binds one of them to each fixed protocol role, and SessionLoop validates that the profile's `role` matches. See `src/config/agent-loader.ts` and `src/session/session-loop.ts`.
 - A task's `agents: ["name", ...]` array references `~/.peak/agents/<name>.json`; each agent may also bring its own `workers` (merged under the task's workers).
 - Session name: `--session` > `task.session` > derived from `task.target` > derived from task filename.
 - `~/.peak/config.json` baseline is merged between `defaultConfig()` and the task file.
@@ -159,6 +159,6 @@ npm run pack        # builds the npm tarball into dist-packages/
 Testing conventions:
 
 - Tests import compiled output via `../dist/**.js`, **never** `../src/`. `npm test` builds first for this reason — after editing source you must rebuild before tests see the change.
-- `tests/helper.ts` provides `minimalConfig()`, `createProject()`, `freshSetup()` (InMemoryGraph + MockWorker), and `env(kind, data)` (JSON envelope builder). Reuse these instead of hand-rolling fixtures.
-- The only test reference into `src/` is `tests/helper.ts`'s `PROMPTS_DIR`, which points `PromptLoader` at the real `src/agent/prompts/*.md` (markdown isn't part of the TS build).
+- `tests/helper.ts` provides `minimalConfig()`, `createProject()`, `freshSetup()` (on-disk TestGraph + MockWorker), and `env(kind, data)` (JSON envelope builder). Reuse these instead of hand-rolling fixtures.
+- Builtin role system prompts live in `src/agent/prompts/*.ts` and are referenced as `builtin:<id>`; tests should use those identifiers rather than reaching into `src/` for prompt files.
 - Focused run: `node --test tests/<name>.test.ts` (after a build).

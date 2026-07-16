@@ -1,102 +1,201 @@
 /**
  * Prompt loader — assembles a subagent prompt from a PromptSpec.
  *
- * Reads the role preamble from `prompt.file` (required, relative to the task
- * config dir). Appends optional `rules`, `knowledge`, and `instructions`
- * files/text in order. The dynamic graph context is prepended separately by
- * ContextBuilder; this loader only produces the static role preamble.
+ * Resolves the system prompt from a builtin TypeScript registry or an external
+ * file, then appends optional rules, knowledge, skills, and instructions.
+ * Runtime graph context is owned by ContextBuilder and final composition by
+ * PromptBuilder.
  */
 
 import { readFileSync, existsSync } from "node:fs";
-import { resolve, isAbsolute, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import type { PromptSpec } from "../agent/types.js";
+import { createHash } from "node:crypto";
+import { homedir } from "node:os";
+import { resolve, isAbsolute, join } from "node:path";
+import type {
+  PromptManifest,
+  PromptManifestComponent,
+  PromptComponentKind,
+  PromptSpec,
+} from "../agent/types.js";
+import { isBuiltinPromptSource, resolveBuiltinPrompt } from "../agent/prompts/index.js";
 
 export interface ResolvedPrompt {
   preamble: string;
   fromConfig: boolean;
+  manifest: PromptManifest;
 }
 
 export interface PromptLoaderOptions {
   baseDir?: string;
 }
 
-/**
- * The package root (dist/) — derived from this compiled module's location so
- * that builtin prompt paths like "agent/prompts/planner.md" resolve to
- * dist/agent/prompts/ regardless of cwd.
- *
- * Two layouts must work:
- *   - tsc dev output: prompt-loader.js lives at dist/config/prompt-loader.js,
- *     so the dist root is one level up (dist/).
- *   - esbuild single-file bundle (npm run pack): everything is inlined into
- *     dist/index.js, so the module dir IS dist/ already. Probing for the
- *     prompts dir lets us pick the right ancestor in both cases.
- */
-const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
-const DIST_ROOT = resolveBuiltinRoot(MODULE_DIR);
-
-function resolveBuiltinRoot(moduleDir: string): string {
-  // dist/config/  -> dist/  (tsc dev layout)
-  // dist/         -> dist/  (flat esbuild bundle; prompts copied alongside)
-  for (const candidate of [resolve(moduleDir, ".."), moduleDir]) {
-    if (existsSync(join(candidate, "agent", "prompts", "planner.md"))) {
-      return candidate;
-    }
-  }
-  // Fallback: assume the tsc layout (parent of the module dir).
-  return resolve(moduleDir, "..");
-}
-
 export class PromptLoader {
   constructor(private readonly options: PromptLoaderOptions = {}) {}
 
-  load(spec: PromptSpec): ResolvedPrompt {
+  load(spec: PromptSpec, primaryKind: Extract<PromptComponentKind, "primary" | "conclude"> = "primary"): ResolvedPrompt {
     const parts: string[] = [];
+    const components: PromptManifestComponent[] = [];
 
-    const primary = this.tryReadFile(spec.file);
-    if (!primary) {
-      return { preamble: "", fromConfig: false };
+    const primary = this.readPrimaryComponent(spec.file, primaryKind, 0);
+    if (!primary || primary.text.length === 0) {
+      return { preamble: "", fromConfig: false, manifest: emptyManifest() };
     }
-    parts.push(primary);
+    parts.push(primary.text);
+    components.push(primary.component);
 
     if (spec.rules) {
-      for (const rule of spec.rules) {
-        const text = this.tryReadFile(rule) ?? rule;
-        if (text) parts.push("---\n" + text);
+      for (let index = 0; index < spec.rules.length; index += 1) {
+        const source = spec.rules[index]!;
+        const item = this.readFileOrInline(source, "rule", index);
+        if (item.text) {
+          parts.push("---\n" + item.text);
+          components.push(item.component);
+        }
       }
     }
 
     if (spec.knowledge) {
-      for (const k of spec.knowledge) {
-        const text = this.tryReadFile(k) ?? k;
-        if (text) parts.push("---\n" + text);
+      for (let index = 0; index < spec.knowledge.length; index += 1) {
+        const source = spec.knowledge[index]!;
+        const item = this.readFileOrInline(source, "knowledge", index);
+        if (item.text) {
+          parts.push("---\n" + item.text);
+          components.push(item.component);
+        }
+      }
+    }
+
+    if (spec.skills) {
+      for (let index = 0; index < spec.skills.length; index += 1) {
+        const source = spec.skills[index]!;
+        const item = this.readFileOrInline(source, "skill", index);
+        if (item.text) {
+          parts.push("---\n" + item.text);
+          components.push(item.component);
+        }
       }
     }
 
     if (spec.instructions) {
-      parts.push("---\nInstructions: " + spec.instructions);
+      const text = normalizeText(spec.instructions);
+      parts.push("---\nInstructions: " + text);
+      components.push(componentFor("instructions", 0, "inline:instructions", text));
     }
 
-    return { preamble: parts.join("\n\n"), fromConfig: true };
+    const preamble = parts.join("\n\n");
+    return {
+      preamble,
+      fromConfig: true,
+      manifest: { version: 1, hash: sha256(preamble), components },
+    };
   }
 
-  private tryReadFile(pathOrText: string): string | undefined {
-    if (!pathOrText) return undefined;
-    if (looksLikePath(pathOrText)) {
-      const abs = this.resolvePath(pathOrText);
-      if (existsSync(abs)) {
-        return readFileSync(abs, "utf-8");
-      }
+  private readPrimaryComponent(
+    source: string,
+    kind: Extract<PromptComponentKind, "primary" | "conclude">,
+    index: number,
+  ): { text: string; component: PromptManifestComponent } | undefined {
+    const builtin = resolveBuiltinPrompt(source);
+    if (builtin !== undefined) {
+      const text = normalizeText(builtin);
+      return { text, component: componentFor(kind, index, source, text) };
     }
-    return undefined;
+    if (isBuiltinPromptSource(source)) return undefined;
+    return this.readFileComponent(source, kind, index);
+  }
+
+  private readFileComponent(
+    source: string,
+    kind: Extract<PromptComponentKind, "primary" | "conclude">,
+    index: number,
+  ): { text: string; component: PromptManifestComponent } | undefined {
+    if (!source) return undefined;
+    const abs = this.resolvePath(source);
+    if (!existsSync(abs)) return undefined;
+    const text = normalizeText(readFileSync(abs, "utf-8"));
+    return { text, component: componentFor(kind, index, source, text, abs) };
+  }
+
+  private readFileOrInline(
+    source: string,
+    kind: Extract<PromptComponentKind, "rule" | "knowledge" | "skill">,
+    index: number,
+  ): { text: string; component: PromptManifestComponent } {
+    if (looksLikePath(source)) {
+      const item = this.readFileComponent(source, "primary", index);
+      if (!item) throw new Error(`prompt ${kind} file not found: ${this.resolvePath(source)}`);
+      return {
+        text: item.text,
+        component: { ...item.component, kind },
+      };
+    }
+    const text = normalizeText(source);
+    return { text, component: componentFor(kind, index, `inline:${kind}[${index}]`, text) };
   }
 
   private resolvePath(p: string): string {
-    return isAbsolute(p) ? p : resolve(this.options.baseDir ?? DIST_ROOT, p);
+    const expanded = p.startsWith("~/") || p.startsWith("~\\")
+      ? join(homedir(), p.slice(2))
+      : p;
+    return isAbsolute(expanded) ? expanded : resolve(this.options.baseDir ?? process.cwd(), expanded);
   }
 }
 
+/** Resolve only the path-bearing fields declared by a task/agent prompt patch.
+ * Inline rule/knowledge text is preserved. This is performed before profile
+ * merging so inherited builtin components keep their own package origin. */
+export function resolvePromptPaths<T extends Partial<PromptSpec>>(spec: T, baseDir: string): T {
+  const out = { ...spec } as Partial<PromptSpec>;
+  if (spec.file) out.file = isBuiltinPromptSource(spec.file) ? spec.file : resolve(baseDir, spec.file);
+  if (spec.concludeFile) {
+    out.concludeFile = isBuiltinPromptSource(spec.concludeFile)
+      ? spec.concludeFile
+      : resolve(baseDir, spec.concludeFile);
+  }
+  if (spec.rules) {
+    out.rules = spec.rules.map((source) => looksLikePath(source) ? resolve(baseDir, source) : source);
+  }
+  if (spec.knowledge) {
+    out.knowledge = spec.knowledge.map((source) => looksLikePath(source) ? resolve(baseDir, source) : source);
+  }
+  if (spec.skills) {
+    out.skills = spec.skills.map((source) => looksLikePath(source) ? resolve(baseDir, source) : source);
+  }
+  return out as T;
+}
+
+function emptyManifest(): PromptManifest {
+  return { version: 1, hash: sha256(""), components: [] };
+}
+
+function componentFor(
+  kind: PromptComponentKind,
+  index: number,
+  source: string,
+  text: string,
+  resolvedPath?: string,
+): PromptManifestComponent {
+  return {
+    kind,
+    index,
+    source,
+    resolvedPath,
+    sha256: sha256(text),
+    bytes: Buffer.byteLength(text, "utf8"),
+  };
+}
+
+function normalizeText(text: string): string {
+  return text.replace(/\r\n?/g, "\n");
+}
+
+function sha256(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
 function looksLikePath(s: string): boolean {
+  // Multi-line knowledge/rules are unambiguously inline prose even when they
+  // contain filesystem-like slashes (for example data-flow notation).
+  if (/\r|\n/.test(s)) return false;
   return /[\\/]/.test(s) || /\.[a-z0-9]+$/i.test(s) || s.startsWith(".") || s.startsWith("~/");
 }

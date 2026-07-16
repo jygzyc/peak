@@ -1,0 +1,65 @@
+{
+  "task": {
+    "name": "Android fixture entrypoint analysis",
+    "session": "app-entrypoints",
+    "target": "AndroidManifest.xml and DeepLinkActivity entry guard",
+    "goal": "Prove externally reachable attacker-controlled entry paths in the authorized fixture",
+    "workspace": "../fixture"
+  },
+  "profiles": {
+    "planner": {
+      "role": "planner",
+      "runtime": { "worker": "codex" },
+      "prompt": {
+        "file": "builtin:planner",
+        "knowledge": ["../knowledge/android-app-vuln.md"],
+        "rules": ["../rules/evidence-gate.md"],
+        "skills": ["../skills/android-static-analysis.md"],
+        "instructions": "Decompose only Manifest/deep-link reachability and guard questions. Create an EndFact only after concrete local pass Facts cover the entry conditions."
+      },
+      "context": { "graphView": "full", "maxFacts": 60 }
+    },
+    "explorer": {
+      "role": "explorer",
+      "runtime": { "worker": "codex" },
+      "prompt": {
+        "file": "builtin:explorer",
+        "knowledge": ["../knowledge/android-app-vuln.md"],
+        "rules": ["../rules/evidence-gate.md"],
+        "skills": ["../skills/android-static-analysis.md"],
+        "instructions": "Inspect AndroidManifest.xml and the URI guard. Cite exact repository-relative evidence."
+      },
+      "context": { "graphView": "focused", "maxFacts": 40 }
+    },
+    "evaluator": {
+      "role": "evaluator",
+      "runtime": { "worker": "codex" },
+      "prompt": {
+        "file": "builtin:evaluator",
+        "rules": ["../rules/evidence-gate.md"],
+        "knowledge": ["../knowledge/android-app-vuln.md"]
+      },
+      "context": { "graphView": "evidence-only", "maxFacts": 60 }
+    },
+    "metacog": {
+      "role": "metacog",
+      "runtime": { "worker": "codex" },
+      "prompt": {
+        "file": "builtin:metacog",
+        "rules": ["../rules/evidence-gate.md"],
+        "knowledge": ["../knowledge/android-app-vuln.md"]
+      },
+      "context": { "graphView": "summary", "maxFacts": 80 },
+      "triggers": { "everySteps": 5, "stagnationLevel": 3, "everySeconds": 30 }
+    }
+  },
+  "workers": {
+    "codex": { "kind": "agent", "backend": "codex", "timeoutMs": 300000 }
+  },
+  "scheduler": { "maxConcurrent": 2, "refillPerTick": 2, "workerLeaseMs": 300000 },
+  "control": { "mainProfile": "planner", "metacogProfile": "metacog", "globalMaxConcurrent": 2 },
+  "federation": {
+    "scope": "app-vuln-demo",
+    "members": ["app-entrypoints", "app-dataflow"]
+  }
+}

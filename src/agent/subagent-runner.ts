@@ -3,7 +3,8 @@
  *
  * Replaces the four hardcoded stage files (planner/explorer/evaluator/metacog).
  * The runner is role-agnostic: it assembles a prompt from (1) the profile's
- * prompt file, (2) dynamic graph context via ContextBuilder, and (3) a
+ * compiled or external system prompt, (2) dynamic graph context via
+ * ContextBuilder, and (3) a
  * role-specific extra block provided by the caller. It then calls the worker,
  * parses the envelope, and validates the output via the named contract.
  *
@@ -21,8 +22,11 @@ import type {
   TaskConfig,
   Verdict,
   WorkerName,
+  RunId,
+  PromptManifest,
+  Project,
+  SubagentRun,
 } from "./types.js";
-import type { Graph } from "../graph/graph.js";
 import type { WorkerPool } from "../worker/worker-runtime.js";
 import { parseEnvelope, StageError, type WorkerEnvelope } from "./parse-envelope.js";
 import {
@@ -31,36 +35,58 @@ import {
   validateMainDecision,
   validateStop,
   validateVerdict,
+  validateBroadcastAssessment,
   type CandidateFact,
   type MainDecision,
 } from "./contracts.js";
-import { buildDynamicContext } from "./context-builder.js";
+import {
+  materializeGraphContext,
+  materializeRoleOutput,
+  renderGraphContextArtifact,
+  type SessionGraphReader,
+} from "./context-builder.js";
 import { PromptLoader } from "../config/prompt-loader.js";
-import { ContextLedger } from "./context-ledger.js";
-import type { WorkerSessionManager } from "../worker/session-manager.js";
+import { PromptBuilder } from "./prompt-builder.js";
+export {
+  plannerExtra,
+  explorerExtra,
+  evaluatorExtra,
+  broadcastEvaluatorExtra,
+  metacogExtra,
+} from "./prompt-builder.js";
+export type { SiblingInsight } from "./prompt-builder.js";
+
+export type SubagentRunUpdate = Partial<Pick<SubagentRun,
+  "promptHash" | "promptManifest" | "contextArtifact" | "outputArtifact" | "workerSessionId"
+>>;
 
 export interface SubagentRunRequest {
   profile: SubagentProfile;
   profileId: string;
-  projectId: ProjectId;
-  graph: Graph;
+  project: Project;
   workerPool: WorkerPool;
   config: TaskConfig;
   promptExtra: string;
   hints?: Hint[];
   recentVerdicts?: Array<{ factId: string; verdict: Verdict; intentId?: string }>;
   promptLoader?: PromptLoader;
+  graphReader: SessionGraphReader;
   workerNameOverride?: WorkerName;
-  contextLedger?: ContextLedger;
-  sessionManager?: WorkerSessionManager;
   intent?: import("./types.js").Intent;
   candidate?: Fact;
+  /** Persist prompt provenance onto this already-created SubagentRun. */
+  runId: RunId;
+  /** Control-plane callback. Role execution never receives a Graph/database handle. */
+  onRunUpdate?: (patch: SubagentRunUpdate) => void;
+  /** Propagates a directive/runtime cancellation to the worker transport. */
+  signal?: AbortSignal;
 }
 
 export type SubagentOutput =
   | { kind: "decisions"; decision: MainDecision }
   | { kind: "fact"; fact: CandidateFact }
   | { kind: "verdict"; verdict: Verdict }
+  | { kind: "broadcast_assessment"; assessment: import("./types.js").BroadcastAssessment }
   | { kind: "hints"; hints: ReturnType<typeof validateHints> }
   | { kind: "stop"; stop: ReturnType<typeof validateStop> };
 
@@ -72,27 +98,31 @@ export interface SubagentRunWithTextResult {
   output: SubagentOutput;
   rawText: string;
   prompt: string;
-  usedDelta: boolean;
   /** True when the output came from a conclude-fallback retry (first call failed to parse). */
   usedConclude?: boolean;
+  promptHash: string;
+  promptManifest: PromptManifest;
 }
 
 export async function runSubagentWithText(req: SubagentRunRequest): Promise<SubagentRunWithTextResult> {
-  const { profile, projectId, graph, workerPool, config, promptExtra } = req;
-
-  const project = graph.getProject(projectId);
-  if (!project) throw new StageError(`project not found: ${projectId}`, profile.role);
-
+  const { profile, project, workerPool, config, promptExtra } = req;
+  const projectId = project.id;
   const workerName = req.workerNameOverride
-    ?? profile.runtime.workers?.[0]
-    ?? profile.runtime.worker;
+    ?? selectProfileWorker(profile, projectId, workerPool, config);
   const workerConfig = config.workers[workerName];
   if (!workerConfig) {
     throw new StageError(`worker config missing for ${profile.role}: ${workerName}`, profile.role);
   }
+  if (workerConfig.kind === "api") {
+    throw new StageError(
+      `role worker "${workerName}" cannot read session JSON artifacts; use an agent worker`,
+      profile.role,
+    );
+  }
 
   const loader = req.promptLoader ?? new PromptLoader({ baseDir: project.sessionDir });
-  const resolved = loader.load(profile.prompt);
+  const promptBuilder = new PromptBuilder(loader);
+  const resolved = promptBuilder.resolve(profile.prompt);
   if (!resolved.fromConfig) {
     throw new StageError(
       `prompt file not loaded for profile "${req.profileId}". Ensure prompt.file points to an existing file.`,
@@ -100,34 +130,42 @@ export async function runSubagentWithText(req: SubagentRunRequest): Promise<Suba
     );
   }
 
-  const useSession = profile.sessionReuse === true;
-  const ledger = useSession ? req.contextLedger : undefined;
   const recentVerdicts = req.recentVerdicts ?? [];
+  const snapshot = await req.graphReader.readSnapshot({
+    sessionId: project.session, projectId, spec: profile.context,
+    profileId: req.profileId,
+    hints: req.hints, recentVerdicts,
+    intent: req.intent, candidate: req.candidate,
+    signal: req.signal,
+  });
 
-  let contextBlock: string;
-  let usedDelta = false;
-
-  if (ledger && useSession) {
-    const delta = ledger.computeDelta(projectId, req.profileId, graph, recentVerdicts);
-    if (delta.isDelta) {
-      contextBlock = delta.deltaBlock;
-      usedDelta = true;
-    } else {
-      contextBlock = buildDynamicContext({
-        projectId, graph, spec: profile.context,
-        hints: req.hints, recentVerdicts,
-        intent: req.intent, candidate: req.candidate,
-      });
-    }
-  } else {
-    contextBlock = buildDynamicContext({
-      projectId, graph, spec: profile.context,
-      hints: req.hints, recentVerdicts,
-      intent: req.intent, candidate: req.candidate,
-    });
-  }
-
-  const prompt = [resolved.preamble, contextBlock, promptExtra].filter(Boolean).join("\n\n");
+  const contextArtifact = await materializeGraphContext(project.sessionDir, req.runId, snapshot);
+  const contextBlock = renderGraphContextArtifact(snapshot, contextArtifact);
+  const contextComponent = {
+    source: `artifact:${contextArtifact.relativePath}`,
+    resolvedPath: contextArtifact.resolvedPath,
+    graphSeq: snapshot.graphSeq,
+    artifactSha256: contextArtifact.sha256,
+    delivery: contextArtifact.delivery,
+  };
+  const assignmentBlock = promptExtra || [
+    "## Assignment",
+    `Execute the current ${profile.role} responsibility for project ${projectId}.`,
+  ].join("\n");
+  const outputContractBlock = [
+    "## Output Contract Binding",
+    `Contract: ${profile.output.contract}`,
+    "Return one response that conforms to the contract declared by the role system prompt.",
+  ].join("\n");
+  const builtPrompt = promptBuilder.compose(
+    resolved,
+    contextBlock,
+    assignmentBlock,
+    contextComponent,
+    outputContractBlock,
+  );
+  const { prompt, promptHash } = builtPrompt;
+  req.onRunUpdate?.({ promptHash, promptManifest: builtPrompt.manifest, contextArtifact });
 
   const result = await workerPool.execute({
     prompt,
@@ -135,15 +173,12 @@ export async function runSubagentWithText(req: SubagentRunRequest): Promise<Suba
     workerName,
     role: profile.role,
     projectId,
-    // Run the worker in the session directory (an isolated workspace), NOT the
-    // caller's cwd. Without this, coding-agent workers (opencode, claude) scan
-    // the host project directory and treat it as the task context, ignoring the
-    // prompt's actual instructions.
-    cwd: project.sessionDir,
+    // Persistent runtime state and the user workspace are distinct. Coding
+    // agents inspect the configured workspace; graph/session DB files remain in
+    // sessionDir and are never exposed as a substitute task target.
+    cwd: project.workspaceDir,
     maxOutputTokens: profile.maxOutputTokens,
-    sessionId: useSession && req.sessionManager
-      ? req.sessionManager.get(projectId, req.profileId)?.sessionId
-      : undefined,
+    signal: req.signal,
   });
 
   if (result.returncode !== 0) {
@@ -153,10 +188,7 @@ export async function runSubagentWithText(req: SubagentRunRequest): Promise<Suba
     );
   }
 
-  if (ledger && useSession) {
-    const progress = graph.progress(projectId);
-    ledger.sync(projectId, req.profileId, graph, recentVerdicts, progress);
-  }
+  persistWorkerSessionId(req, result.sessionId);
 
   // Conclude fallback: if the worker returned (returncode 0) but its output fails
   // to parse into a valid envelope, re-invoke the worker in the same session with
@@ -166,21 +198,37 @@ export async function runSubagentWithText(req: SubagentRunRequest): Promise<Suba
   try {
     const envelope = parseEnvelope(result.text, profile.role);
     const output = validateOutput(envelope, profile, req.profileId);
-    return { output, rawText: result.text, prompt, usedDelta };
+    await persistRoleOutput(req, output);
+    return {
+      output,
+      rawText: result.text,
+      prompt,
+      promptHash,
+      promptManifest: builtPrompt.manifest,
+    };
   } catch (parseErr) {
+    if (req.signal?.aborted) throw parseErr;
     const concludeFile = profile.prompt.concludeFile;
     if (!concludeFile) throw parseErr;
 
     // Load the conclude preamble and re-invoke the worker in the same session
     // (when the backend supports resume; sessionId propagates through the pool).
-    const concludeResolved = loader.load({ file: concludeFile });
-    if (!concludeResolved.fromConfig) throw parseErr;
     const concludePromptExtra = [
-      promptExtra,
+      assignmentBlock,
       `## Prior Worker Output (first attempt, failed to parse)\n${result.text.slice(0, 4000)}`,
     ].filter(Boolean).join("\n\n");
-    const concludePrompt = [concludeResolved.preamble, contextBlock, concludePromptExtra]
-      .filter(Boolean).join("\n\n");
+    const concludeBuilt = promptBuilder.build({
+      spec: { file: concludeFile },
+      primaryKind: "conclude",
+      context: contextBlock,
+      extra: concludePromptExtra,
+      contextComponent,
+      outputContract: outputContractBlock,
+    });
+    if (!concludeBuilt.fromConfig) throw parseErr;
+    const concludePrompt = concludeBuilt.prompt;
+    const concludePromptHash = concludeBuilt.promptHash;
+    req.onRunUpdate?.({ promptHash: concludePromptHash, promptManifest: concludeBuilt.manifest });
 
     const concludeResult = await workerPool.execute({
       prompt: concludePrompt,
@@ -188,30 +236,70 @@ export async function runSubagentWithText(req: SubagentRunRequest): Promise<Suba
       workerName,
       role: profile.role,
       projectId,
-      cwd: project.sessionDir,
+      cwd: project.workspaceDir,
       maxOutputTokens: profile.maxOutputTokens,
       sessionId: result.sessionId,
       conclude: true,
+      signal: req.signal,
     });
 
     if (concludeResult.returncode !== 0) throw parseErr;
 
+    persistWorkerSessionId(req, concludeResult.sessionId ?? result.sessionId);
+
     const concludeEnvelope = parseEnvelope(concludeResult.text, profile.role);
     const concludeOutput = validateOutput(concludeEnvelope, profile, req.profileId);
+    await persistRoleOutput(req, concludeOutput);
     return {
       output: concludeOutput,
       rawText: concludeResult.text,
       prompt: concludePrompt,
-      usedDelta,
       usedConclude: true,
+      promptHash: concludePromptHash,
+      promptManifest: concludeBuilt.manifest,
     };
   }
+}
+
+function persistWorkerSessionId(req: SubagentRunRequest, sessionId: string | undefined): void {
+  if (sessionId) req.onRunUpdate?.({ workerSessionId: sessionId });
+}
+
+async function persistRoleOutput(req: SubagentRunRequest, output: SubagentOutput): Promise<void> {
+  const artifact = await materializeRoleOutput(
+    req.project.sessionDir,
+    req.project.session,
+    req.project.id,
+    req.runId,
+    req.profile.role,
+    output,
+  );
+  req.onRunUpdate?.({ outputArtifact: artifact });
+}
+
+export function selectProfileWorker(
+  profile: SubagentProfile,
+  projectId: ProjectId,
+  workerPool: WorkerPool,
+  config: TaskConfig,
+): WorkerName {
+  const candidates = [...new Set(
+    profile.runtime.workers?.length
+      ? profile.runtime.workers
+      : [profile.runtime.worker],
+  )].filter((name) => config.workers[name]);
+  if (candidates.length === 0) {
+    throw new StageError(`no configured worker is available for ${profile.role}`, profile.role);
+  }
+  const selected = workerPool.pickWorker(projectId, config, candidates);
+  return candidates.includes(selected) ? selected : candidates[0]!;
 }
 
 const CONTRACT_KIND_MAP: Record<string, Set<string>> = {
   main_decision: new Set(["decisions"]),
   candidate_fact: new Set(["fact"]),
   verdict: new Set(["verdict"]),
+  broadcast_assessment: new Set(["broadcast_assessment"]),
   hints: new Set(["hints", "stop"]),
 };
 
@@ -236,8 +324,10 @@ function validateOutput(
       return { kind: "fact", fact: validateCandidateFact(envelope, stage) };
     case "verdict":
       return { kind: "verdict", verdict: validateVerdict(envelope, stage) };
+    case "broadcast_assessment":
+      return { kind: "broadcast_assessment", assessment: validateBroadcastAssessment(envelope, stage) };
     case "hints":
-      return { kind: "hints", hints: validateHints(envelope, stage, profileId) };
+      return { kind: "hints", hints: validateHints(envelope, stage, profile.role) };
     case "stop":
       return { kind: "stop", stop: validateStop(envelope, stage) };
     default:
@@ -246,117 +336,4 @@ function validateOutput(
         stage,
       );
   }
-}
-
-/**
- * Build the role-specific promptExtra block for each builtin role.
- * Callers use these to avoid duplicating formatting logic.
- */
-
-export function plannerExtra(
-  hints?: Hint[],
-  recentVerdicts?: Array<{ factId: string; verdict: Verdict; intentId?: string }>,
-): string {
-  const lines: string[] = [];
-
-  if (hints && hints.length > 0) {
-    lines.push("## Hints Requiring Response");
-    lines.push(
-      "For each hint: create a new intent pursuing it, fail an existing intent whose direction " +
-        "it contradicts, or ignore if irrelevant. A stop-explorer hint means: fail the targeted intent.",
-    );
-    for (const h of hints) {
-      const tgt = h.targetIntentId ? ` (target: ${h.targetIntentId})` : "";
-      lines.push(`- [${h.id}] (${h.kind}, from ${h.creator})${tgt}: ${h.content}`);
-    }
-  }
-
-  if (recentVerdicts && recentVerdicts.length > 0) {
-    lines.push("## Recent Evaluator Verdicts");
-    lines.push(
-      "If a candidate was rejected, decide whether its intent should be failed (dead-end confirmed), " +
-        "retried differently, or replaced. If accepted, decide what to investigate next.",
-    );
-    for (const v of recentVerdicts) {
-      lines.push(`- ${v.factId} (${v.intentId ?? "no intent"}): ${v.verdict.decision} — ${v.verdict.reason}`);
-    }
-  }
-
-  return lines.join("\n");
-}
-
-export function explorerExtra(
-  intentId: string,
-  intentDescription: string,
-  parentFactIds: string[],
-  insights: Fact[],
-): string {
-  const lines: string[] = [];
-  if (insights.length > 0) {
-    lines.push("## Recent Discoveries by Other Explorers");
-    lines.push("These facts were just discovered by parallel explorers. Use them — avoid duplicating their work.");
-    for (const f of insights) lines.push(`- ${f.id}: ${f.description}`);
-  }
-  lines.push("## Current Intent");
-  lines.push(`ID: ${intentId}`);
-  lines.push(`Description: ${intentDescription}`);
-  if (parentFactIds.length > 0) {
-    lines.push(`Triggered by facts: ${parentFactIds.join(", ")}`);
-  }
-  return lines.join("\n");
-}
-
-/**
- * A cross-session insight surfaced to the evaluator as read-only corroboration.
- * Federation facts never enter the local graph — they are shown to the evaluator
- * so it can cross-validate a local candidate against what siblings have already
- * verified or ruled out, saving redundant local verification work.
- */
-export interface SiblingInsight {
-  summary: string;
-  confidence: number;
-  fromSession: string;
-}
-
-export function evaluatorExtra(
-  candidate: Fact,
-  siblingFacts?: SiblingInsight[],
-  siblingDeadEnds?: SiblingInsight[],
-): string {
-  const lines: string[] = ["## Candidate Fact Under Review"];
-  lines.push(`ID: ${candidate.id}`);
-  lines.push(`Description: ${candidate.description}`);
-  lines.push(`Confidence claimed: ${candidate.confidence}`);
-
-  if (siblingFacts && siblingFacts.length > 0) {
-    lines.push("## Cross-session Corroboration (VERIFIED by other sessions)");
-    lines.push(
-      "Other sessions have VERIFIED these facts. Use them as supporting evidence — " +
-        "if this candidate is corroborated by any of them, you may accept with higher confidence.",
-    );
-    for (const f of siblingFacts) {
-      lines.push(`- [session ${f.fromSession}, conf ${f.confidence}] ${f.summary}`);
-    }
-  }
-
-  if (siblingDeadEnds && siblingDeadEnds.length > 0) {
-    lines.push("## Cross-session Dead-ends (RULED OUT by other sessions)");
-    lines.push(
-      "Other sessions ruled OUT these paths. If this candidate aligns with a ruled-out " +
-        "direction, reject it unless you have strong independent evidence.",
-    );
-    for (const d of siblingDeadEnds) {
-      lines.push(`- [session ${d.fromSession}] ${d.summary}`);
-    }
-  }
-
-  if (candidate.evidence.length > 0) {
-    lines.push("Evidence:");
-    for (const e of candidate.evidence) lines.push(`- ${e}`);
-  }
-  return lines.join("\n");
-}
-
-export function metacogExtra(trigger: string): string {
-  return `## Trigger\nThis metacog run was triggered by: ${trigger}`;
 }

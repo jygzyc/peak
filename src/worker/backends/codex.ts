@@ -9,19 +9,19 @@
 import type { WorkerConfig } from "../../agent/types.js";
 import { SubprocessBackend, type BuildArgvOptions } from "./subprocess.js";
 
-const SESSION_RE = /session[: ]+([0-9a-fA-F-]{8,})/i;
-
 export class CodexBackend extends SubprocessBackend {
   readonly id = "codex";
 
   buildArgv(config: WorkerConfig, prompt: string, opts?: BuildArgvOptions) {
-    const argv = [
-      "codex", "exec",
+    const options = [
       "--dangerously-bypass-approvals-and-sandbox",
       ...modelFlags(config),
       ...providerFlags(config),
+      "--json",
     ];
-    if (opts?.sessionId) argv.push("--resume", opts.sessionId);
+    const argv = opts?.sessionId
+      ? ["codex", "exec", "resume", ...options, opts.sessionId]
+      : ["codex", "exec", ...options];
     // Pass prompt via stdin (`-`) to avoid Windows cmd.exe arg-length/quoting
     // issues with long prompts containing newlines and special chars — same
     // approach as the opencode CLI backend.
@@ -29,9 +29,33 @@ export class CodexBackend extends SubprocessBackend {
     return { argv, env: envFor(config), input: prompt };
   }
 
-  extractSession(stdout: string, stderr: string): string | undefined {
-    const m = SESSION_RE.exec(stderr) ?? SESSION_RE.exec(stdout);
-    return m ? m[1] : undefined;
+  extractSession(stdout: string, _stderr: string): string | undefined {
+    for (const line of stdout.split(/\r?\n/)) {
+      try {
+        const event = JSON.parse(line) as Record<string, unknown>;
+        if (event.type === "thread.started" && typeof event.thread_id === "string") {
+          return event.thread_id;
+        }
+      } catch { /* ignore non-event diagnostics */ }
+    }
+    return undefined;
+  }
+
+  extractResponseText(stdout: string, _stderr: string): string {
+    const messages: string[] = [];
+    for (const line of stdout.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      try {
+        const event = JSON.parse(line) as Record<string, unknown>;
+        if (event.type !== "item.completed" || !event.item || typeof event.item !== "object") continue;
+        const item = event.item as Record<string, unknown>;
+        if (item.type === "agent_message" && typeof item.text === "string") {
+          messages.push(item.text);
+        }
+      } catch { /* ignore non-event diagnostics */ }
+    }
+    if (messages.length > 0) return messages.join("\n").trim();
+    return "";
   }
 }
 

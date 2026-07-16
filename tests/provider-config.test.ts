@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
-import { mkdtempSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PROVIDER_PRESETS } from "../dist/config/provider-presets.js";
@@ -125,6 +125,38 @@ test("loadProvidersFile/saveProvidersFile: kind round-trips through disk", () =>
     // Also confirm the raw JSON contains kind (not stripped on write).
     const raw = JSON.parse(readFileSync(filePath, "utf-8"));
     assert.equal(raw.anthropic.kind, "anthropic");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadProvidersFile: rejects malformed JSON instead of silently selecting presets", () => {
+  const dir = mkdtempSync(join(tmpdir(), "peak-pcfg-invalid-"));
+  const filePath = join(dir, "providers.json");
+  try {
+    writeFileSync(filePath, "{not-json", "utf-8");
+    assert.throws(() => loadProvidersFile(filePath), /providers config is invalid/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadProvidersFile: validates required provider fields and headers", () => {
+  const dir = mkdtempSync(join(tmpdir(), "peak-pcfg-shape-"));
+  const filePath = join(dir, "providers.json");
+  try {
+    writeFileSync(filePath, JSON.stringify({ broken: { baseURL: "https://example.test", apiKeyEnv: "KEY" } }));
+    assert.throws(() => loadProvidersFile(filePath), /broken.*model.*non-empty string/);
+
+    writeFileSync(filePath, JSON.stringify({
+      broken: {
+        baseURL: "https://example.test",
+        apiKeyEnv: "KEY",
+        model: "model",
+        headers: { authorization: 123 },
+      },
+    }));
+    assert.throws(() => loadProvidersFile(filePath), /header.*authorization.*string/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

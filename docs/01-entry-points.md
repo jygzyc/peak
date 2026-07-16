@@ -1,117 +1,56 @@
-# 01 · 入口层（`src/` 根目录）
+# 入口与公共 API
 
-> 审计范围：`src/index.ts`（包入口）、`src/cli.ts`（CLI）、`src/node-sqlite.d.ts`（类型声明）。
-> 审计方法：逐文件 `Read` + `codegraph` 依赖分析。
+> 当前实现审计，2026-07-16。本文只描述第一版正式入口。
 
----
+## CLI
 
-## 1. `src/index.ts`（95 行）
+`src/cli.ts` 是薄组合入口，正式命令为：
 
-### 用途
-`peak` 包的 **公共 API 出口（barrel）**。不包含任何运行时逻辑，仅做 `export` 聚合，把散落在各子模块的对外类型/函数统一对外暴露。
+| 命令 | 作用 |
+|---|---|
+| `run <configPath>` | 加载 task config，创建/重开 session Graph，组合 `AgentRuntime` 并运行 |
+| `resume <session>` | 从持久 Project 的 `taskConfig` 重建同一组合根并继续 |
+| `status <session>` | 读取本地 Graph 状态与 progress |
+| `workers` | 输出可用 backend/provider 能力 |
+| `sessions` | 列出本地 session |
+| `search <query>` | 通过只读 `FederatedGraph` 搜索多个 session |
+| `init [dir]` | 生成第一版 task config |
+| `agents` / `tasks` | 列出 `PEAK_HOME` 下的配置条目 |
 
-### 职责
-- 重导出整个对外类型面（`agent/types.js` 中的全部 protocol 类型）
-- 重导出 Graph 接口与三个实现（InMemory / Sqlite / Federated）
-- 重导出会话运行时（`SessionLoop`、`SessionManager`、监督者）
-- 重导出配置加载（`loadConfig` / `defaultConfig` / `normalizeProfile` / `PromptLoader`）
-- 重导出 worker 层（`AgentDriverPool` / `MockWorker` / `WorkerSessionManager`）
-- 重导出 agent 协议层（`parseEnvelope` / `validateMainDecision` / `renderGraphView` / `buildDynamicContext` / `ContextLedger` / `tierFacts` / `runSubagent` / `MainAgent` / `applyMainDecision`）
-- 重导出 HTTP server（`HttpServer`）和组合根（`AgentRuntime`）
+`run` 和 `resume` 都通过 `AgentRuntime` 创建 `SessionLoop`、planner controller、MetacogSupervisor 和 Graph；不再维护一条独立的恢复调度路径。session 状态目录与 task/workspace 目录分离，task config 的绝对路径写入 Project，prompt 相对路径在加载配置时解析。
 
-### 关键导出
-全部是 re-export，无自有符号。按来源分组（见源文件 6–94 行）。
+单 CLI 进程可选用持久 `FederationBus`。多 session 服务应使用 `SessionRuntimeFactory`，由它持有一个 `GlobalSupervisor` 和一个统一 `HttpServer`。
 
-### 依赖
-无值依赖；纯类型/符号转出。被 `package.json` 的 `main`/`exports` 字段指向，是外部消费者（含 dist bundle）唯一入口。
+## SDK barrel
 
-### 审计要点
-- ✅ 严格 barrel，零逻辑，符合「包入口应薄」惯例。
-- ⚠️ **导出面与 `AGENTS.md` 中「Public commands are `run <config>`, `resume`, `status`, `workers`, `serve`」描述不一致**：`index.ts` 是 SDK 出口（无 CLI 命令概念），且 CLI 里也无 `serve`（见 §2），AGENTS.md 的承诺与实现有偏差。
-- ⚠️ barrel 文件天然削弱 tree-shaking；若后续要做 SDK 子路径导出（如 `peak/graph`），当前 `package.json` 未做 `exports` 子路径映射。
+`src/index.ts` 按边界导出：
 
-### 跨文件观察
-- `index.ts` 的导出清单是判断「公共 API 面」的唯一权威来源；审计其它模块时，凡未在此导出的符号均视为内部实现。
+- Graph 接口、InMemory/SQLite 实现、FederatedGraph 与 FederationBus；
+- config、PromptLoader、PromptBuilder 和 builtin prompt；
+- WorkerPool、AgentDriverPool、MockWorker 与资源治理；
+- contract、permission、context artifact 与 Subagent runner；
+- SessionLoop、MetacogSupervisor、GlobalSupervisor；
+- AgentRuntime 与 SessionRuntimeFactory。
 
----
+公共 API 不导出已删除的注册表、迁移器或占位 runtime。两个同名 `WorkerRequest/WorkerResult` 仍分别存在于 agent-facing 与 driver-internal 边界，后续应重命名以减少误用，但不应把两层合同合并。
 
-## 2. `src/cli.ts`（234 行，含 shebang）
+## 进程与资源所有权
 
-### 用途
-`peak` 命令行入口。基于 `commander` 构建命令树，解析参数后把运行时构造委托给 `app/agent-runtime.ts`。自身刻意保持 thin。
+```text
+CLI / SDK caller
+  -> AgentRuntime or SessionRuntimeFactory
+      -> SessionLoop / Metacog / HTTP
+      -> Graph
+      -> optional external Supervisor/FederationBus
+```
 
-### 职责 / 命令树
-| 命令 | 作用 | 关键选项 |
-|---|---|---|
-| `run <configPath>` | 从 `task.json` 起一个新任务 | `-s/--session`、`-P/--port`(默认 25429)、`--host`(默认 127.0.0.1)、`--no-http`、`--no-metacog`、`--mock`、`--max-steps` |
-| `resume <session>` | 恢复已停止会话 | `-P/--port`、`--no-http` |
-| `status <session>` | 打印 project 进度 | — |
-| `workers` | 列出可用 worker backends/providers | — |
-| `sessions` | 列出所有分析会话 | `--base-dir`(默认 `.peak-analysis`) |
-| `search <query>` | 跨会话全文检索 facts | `--base-dir`、`--status`、`--min-confidence`、`--limit`(默认 50) |
-| `init [dir]` | 生成最小 `task.json` 模板 | — |
+- `AgentRuntime.close()` 是幂等、单向、可等待的终态操作。
+- runtime 自建的资源由 runtime 关闭；外部注入的 supervisor/bus 仍由调用方关闭。
+- factory 只在自己创建 supervisor 时关闭其 FederationBus。
+- 关闭开始后，runtime 的创建、执行、调度、prompt 注入和 HTTP 启动入口全部快速失败。
 
-`run` 的执行链：`loadConfig` → 构造 `workerPool`（`MockWorker` 或 `AgentDriverPool`）→ `new AgentRuntime(...)` → `createProject` → 可选 `startHttp` / `startMetacog` → `runtime.run()` → 打印 accepted facts。
+## 当前余项
 
-`resume` 的执行链：`SessionManager(".peak-analysis")` → `open(session)` → 取 `projects[0]` → 置 `active` → `new SessionLoop` → 可选 `HttpServer` → `loop.run()`。
-
-### 关键导出
-无（脚本入口）。`program.parse()` 在模块加载时立即执行。
-
-### 依赖
-`commander`、`node:fs`、`node:path`；`AgentRuntime`、`loadConfig`、`InMemoryGraph`、`SqliteGraph`、`SessionManager`、`FederatedGraph`、`SessionLoop`、`HttpServer`、`AgentDriverPool`、`MockWorker`、`workerCapabilities`、`DEFAULT_LIMITS`、`defaultConfig`。
-
-### 审计要点
-- 🚨 **版本号硬编码** `0.1.0`（第 33 行），与 `app/version.ts`、`package.json` 三处各写一份，极易漂移。建议从 `version.ts` 统一导入。
-- 🚨 **大量未使用的 import**：`InMemoryGraph`、`SqliteGraph`、`SessionLoop`、`DEFAULT_LIMITS` 从未引用（死代码）；`MockWorker` 仅在 `--mock` 时构造，可改为按需动态 import。
-- ⚠️ **`resume` 重复动态 import `HttpServer`**：第 21 行已静态 `import { HttpServer }`，第 127 行又 `await import("./server/http-server.js")`，多余。
-- ⚠️ **`resume` 与 `run` 选项不对齐**：`resume` 无 `--mock`、无 `--no-metacog`，恢复会话时无法用 mock worker。
-- ⚠️ **`resume` 仅取 `projects[0]`**：多 project session 其余被静默忽略。
-- ⚠️ **baseDir 处理不一致**：`run`/`resume`/`status` 硬编码 `SessionManager(".peak-analysis")`，`sessions`/`search` 提供 `--base-dir`。路径相对 `process.cwd()`，跨目录行为不可预期。
-- ⚠️ **`search` 的 `--status` 强转**（第 210 行）`as "accepted" | ...`：未校验合法性，非法值透传给 `FederatedGraph`。
-- ⚠️ **`init` 直接 `writeFileSync`**：目标已存在会无提示覆盖。
-- ⚠️ **`status`/`sessions` 无异常处理**：DB 损坏时未捕获异常。
-- ⚠️ **无 `serve` 命令**：`AGENTS.md` 声明的 public commands 含 `serve`，但本文件无；文档与实现不一致。
-- ⚠️ **无全局错误边界**：任一 `action` 抛错直接非 0 退出，无统一日志格式化。
-- ✅ `run --mock` 与 `AgentDriverPool` 切换清晰；默认端口 25429 与 server 对齐。
-
-### 跨文件观察
-- `resume` 手动 `new SessionLoop(...)` 绕过 `AgentRuntime`，与 `run` 的「统一走 runtime」路径分叉 → 见 [02-app.md](./02-app.md)。
-- `cli.ts` 直接 `new SessionManager(".peak-analysis")`，而 `PEAK_HOME` 重定向机制在 `peak-cli` 而非本包；本包的 baseDir 完全靠 CLI 字面量，与 AGENTS.md「`.peak/agent_tasks/`」默认路径也不一致（这里用的是 `.peak-analysis/`）。**两套路径约定并存，易混淆**。
-
----
-
-## 3. `src/node-sqlite.d.ts`（14 行）
-
-### 用途
-为 Node.js 内置 `node:sqlite` 实验性模块提供 **环境类型声明（ambient declaration）**，使 TS 编译期可识别 `DatabaseSync` / `StatementSync`。
-
-### 职责
-- 声明 `declare module "node:sqlite"`
-- 声明 `DatabaseSync` 类（`constructor` / `exec` / `prepare` / `close`）
-- 声明 `StatementSync` 接口（`run` / `get` / `all`）及其返回类型
-
-### 关键导出
-`DatabaseSync`（class）、`StatementSync`（interface）。
-
-### 依赖
-无。
-
-### 审计要点
-- ⚠️ **类型精度不足**：`run(...params: unknown[])` 应为 `[...bindings: SupportedValueType]`（`null | number | bigint | string | Uint8Array`）。当前 `unknown[]` 放弃校验，`prepare(sql).run(someObject)` 编译能过但运行必崩。
-- ⚠️ **`get`/`all` 返回 `Record<string, unknown>`**：列类型丢失；下游 `sqlite-graph.ts` 需大量 `as` 断言。建议泛型 `get<T>(...)`。
-- ⚠️ **未声明 `StatementSync.prototype.reset`**（Node 22.5+ 实际存在），下游想用会 TS 报错。
-- ⚠️ 当前未声明 `loadExtension` / `function` / `applyChangeset` 等；日后扩展会受阻（当前用不到，仅记录）。
-- ✅ 作为单点声明，避免了到处 `// @ts-ignore`。
-
-### 跨文件观察
-- `node:sqlite` 是 Node 22.5+ 实验 API（需 `--experimental-sqlite`，高版本稳定）。本声明是 `sqlite-graph.ts`、`federated-graph.ts`、`session-manager.ts` 全部 SQLite 操作的类型基础 → 见 [08-graph.md](./08-graph.md)。
-
----
-
-## 跨文件小结（本册）
-
-1. **入口三处版本/路径硬编码**：`cli.ts` 的 `0.1.0`、`.peak-analysis`、`25429` 端口；建议集中到 `app/version.ts` + 配置。
-2. **死 import 与重复 import** 集中在 `cli.ts`，是最易清理的卫生问题。
-3. **`AGENTS.md` 与 `cli.ts` 不一致**：`serve` 命令文档声明但未实现——需统一。
-4. 本册文件不含业务逻辑，所有真实行为在下游模块；审计重点在「入口契约是否准确暴露了下游能力」。
+1. 常驻 daemon 需要从 `PEAK_HOME/sessions` 恢复 factory registry 与统一 HTTP binding。
+2. CLI 的版本号仍应最终从 `package.json` 单一读取。
+3. HTTP 模式的进程级 SIGINT/SIGTERM 优雅退出还需形成自动测试。

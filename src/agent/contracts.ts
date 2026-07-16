@@ -5,14 +5,15 @@
  * has a dedicated validator that takes a parsed WorkerEnvelope and
  * returns a typed, validated payload — or throws on shape mismatch.
  *
- * The Stage implementations and the decision applier share these validators,
- * so output enforcement is centralized rather than duplicated per stage.
+ * The subagent runner and decision applier share these validators, so output
+ * enforcement is centralized.
  */
 
-import type { OutputContract, Verdict } from "./types.js";
+import type { BroadcastAssessment, Verdict } from "./types.js";
 import type { HintInput } from "../graph/graph.js";
 import {
   asArray,
+  asBoolean,
   asNumber,
   asOptionalString,
   asString,
@@ -27,6 +28,8 @@ export interface MainDecisionIntent {
   description: string;
   parentFactIds?: string[];
   priority?: number;
+  /** Explicit planner request to create an explorer for this Intent. */
+  dispatchExplorer: boolean;
 }
 
 export interface MainDecisionFail {
@@ -36,9 +39,11 @@ export interface MainDecisionFail {
 
 export interface MainDecision {
   createIntents: MainDecisionIntent[];
+  dispatchExplorerIntentIds: string[];
+  stopExplorerIntentIds: string[];
   failIntents: MainDecisionFail[];
   consumeHintIds: string[];
-  concludeRun?: { description: string };
+  concludeRun?: { description: string; fromFactIds?: string[] };
 }
 
 export function validateMainDecision(envelope: WorkerEnvelope): MainDecision {
@@ -49,7 +54,22 @@ export function validateMainDecision(envelope: WorkerEnvelope): MainDecision {
     description: asString(raw, "description", "planner"),
     parentFactIds: Array.isArray(raw.from) ? (raw.from as string[]) : undefined,
     priority: typeof raw.priority === "number" ? raw.priority : undefined,
+    dispatchExplorer: asBoolean(raw, "dispatchExplorer", "planner"),
   }));
+
+  const dispatchRaw = Array.isArray(data.dispatchExplorerIntentIds)
+    ? data.dispatchExplorerIntentIds
+    : [];
+  const dispatchExplorerIntentIds = dispatchRaw.filter(
+    (value): value is string => typeof value === "string" && value.length > 0,
+  );
+
+  const stopRaw = Array.isArray(data.stopExplorerIntentIds)
+    ? data.stopExplorerIntentIds
+    : [];
+  const stopExplorerIntentIds = stopRaw.filter(
+    (value): value is string => typeof value === "string" && value.length > 0,
+  );
 
   const failRaw = (Array.isArray(data.failIntents) ? data.failIntents : []) as Array<Record<string, unknown>>;
   const failIntents: MainDecisionFail[] = failRaw.map((raw) => ({
@@ -59,17 +79,25 @@ export function validateMainDecision(envelope: WorkerEnvelope): MainDecision {
 
   const concludeRaw = data.concludeRun as Record<string, unknown> | undefined;
   const concludeRun = concludeRaw && typeof concludeRaw.description === "string"
-    ? { description: concludeRaw.description }
+    ? {
+        description: concludeRaw.description,
+        fromFactIds: Array.isArray(concludeRaw.from)
+          ? concludeRaw.from.filter((value): value is string => typeof value === "string" && value.length > 0)
+          : undefined,
+      }
     : undefined;
 
-  // Honor the planner's own consumeHints selection (string[]). Previously this
-  // was hard-coded to [] and the planner had zero control over hint consumption
-  // (docs 03-agent.md §3.3). An empty/missing array is preserved as [] so the
-  // caller (MainAgent) can apply its "consume all actionable hints" default.
   const consumeRaw = Array.isArray(data.consumeHints) ? data.consumeHints : [];
   const consumeHintIds = consumeRaw.filter((v): v is string => typeof v === "string" && v.length > 0);
 
-  return { createIntents, failIntents, consumeHintIds, concludeRun };
+  return {
+    createIntents,
+    dispatchExplorerIntentIds,
+    stopExplorerIntentIds,
+    failIntents,
+    consumeHintIds,
+    concludeRun,
+  };
 }
 
 // ─── candidate_fact (explorer output) ───
@@ -109,6 +137,31 @@ export function validateVerdict(envelope: WorkerEnvelope, stage: string): Verdic
   return { decision: decisionRaw, reason, confidence, requiredConditions };
 }
 
+// ─── broadcast_assessment (evaluator receives a FactBroadcast) ───
+
+export function validateBroadcastAssessment(
+  envelope: WorkerEnvelope,
+  stage: string,
+): BroadcastAssessment {
+  const data = expectKind(envelope, "broadcast_assessment", stage);
+  const decision = asString(data, "decision", stage);
+  if (decision !== "relevant" && decision !== "irrelevant" && decision !== "condition_satisfied") {
+    throw new StageError(
+      `broadcast assessment decision must be relevant|irrelevant|condition_satisfied, got: ${decision}`,
+      stage,
+    );
+  }
+  const targetFactId = asOptionalString(data, "targetFactId");
+  if (decision === "condition_satisfied" && !targetFactId) {
+    throw new StageError("condition_satisfied requires targetFactId", stage);
+  }
+  return {
+    decision,
+    reason: asString(data, "reason", stage),
+    targetFactId,
+  };
+}
+
 // ─── hints (metacog output) ───
 
 export function validateHints(envelope: WorkerEnvelope, stage: string, creator: string): { hints: HintInput[] } {
@@ -127,13 +180,3 @@ export function validateStop(envelope: WorkerEnvelope, stage: string): { reason:
   const data = expectKind(envelope, "stop", stage);
   return { reason: asString(data, "reason", stage) };
 }
-
-// ─── contract registry ───
-
-export const CONTRACTS: Record<OutputContract, (envelope: WorkerEnvelope, stage: string) => unknown> = {
-  main_decision: (e, _s) => validateMainDecision(e),
-  candidate_fact: (e, s) => validateCandidateFact(e, s),
-  verdict: (e, s) => validateVerdict(e, s),
-  hints: (e, s) => validateHints(e, s, "system"),
-  stop: (e, s) => validateStop(e, s),
-};

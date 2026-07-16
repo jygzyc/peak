@@ -30,11 +30,13 @@ test("codex: buildArgv adds --model from config", () => {
   assert.ok(built.argv.includes("gpt-5.5"), "should include the model name");
 });
 
-test("codex: buildArgv adds --resume for session continuation", () => {
+test("codex: buildArgv uses the exec resume subcommand for session continuation", () => {
   const config = { kind: "agent" as const, backend: "codex" };
   const built = backend.buildArgv(config, "x", { sessionId: "abc-1234-5678" });
   const argvStr = built.argv.join(" ");
-  assert.ok(argvStr.includes("--resume abc-1234-5678"), "should add --resume for session");
+  assert.ok(argvStr.includes("exec resume"), "should select the resume subcommand");
+  assert.ok(argvStr.includes("abc-1234-5678 -"), "session id must precede the stdin prompt marker");
+  assert.ok(!built.argv.includes("--resume"), "current Codex CLI has no --resume option");
 });
 
 test("codex: buildArgv wires OPENAI_API_KEY env when key present", () => {
@@ -50,8 +52,18 @@ test("codex: buildArgv wires OPENAI_API_KEY env when key present", () => {
   }
 });
 
-test("codex: extractSession finds session id in output", () => {
+test("codex: ignores non-JSON session text", () => {
   const output = "session: 12345678-1234-1234-1234-123456789abc created";
   const sid = backend.extractSession(output, "");
-  assert.equal(sid, "12345678-1234-1234-1234-123456789abc");
+  assert.equal(sid, undefined);
+});
+
+test("codex: extracts thread id and final assistant text from --json events", () => {
+  const output = [
+    JSON.stringify({ type: "thread.started", thread_id: "12345678-1234-1234-1234-123456789abc" }),
+    JSON.stringify({ type: "turn.started" }),
+    JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "final answer" } }),
+  ].join("\n");
+  assert.equal(backend.extractSession(output, ""), "12345678-1234-1234-1234-123456789abc");
+  assert.equal(backend.extractResponseText(output, ""), "final answer");
 });
