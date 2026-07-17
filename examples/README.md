@@ -15,8 +15,8 @@ The App fixtures are authorized static-analysis inputs only. The deterministic
 acceptance tests use MockWorker responses while exercising the real graph,
 roles, federation and completion protocol. The task JSON files select a Codex
 worker for manual runs in an appropriately configured local environment. See
-[`docs/14-acceptance-scenarios.md`](../docs/14-acceptance-scenarios.md) for the
-evidence required from each scenario.
+[`docs/data-flow.md`](../docs/data-flow.md) for the protocol exercised by these
+scenarios.
 
 ## mock-task.json
 

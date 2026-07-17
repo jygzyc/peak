@@ -129,7 +129,7 @@ function validateConfigSchema(config: Record<string, unknown>, source: string, a
   assertKnownFields(recordValue(config, "task"), new Set(["target", "goal", "session", "name", "workspace"]), `${source}.task`);
   assertKnownFields(
     recordValue(config, "scheduler"),
-    new Set(["maxConcurrent", "refillPerTick", "workerLeaseMs"]),
+    new Set(["maxConcurrent", "refillPerTick"]),
     `${source}.scheduler`,
   );
   assertKnownFields(
@@ -268,11 +268,7 @@ function mergeScheduler(
   const refillPerTick =
     (directRaw ? numberValue(directRaw, "refillPerTick") : undefined) ??
     base?.refillPerTick ?? DEFAULT_SCHEDULER.refillPerTick;
-  const workerLeaseMs =
-    (directRaw ? numberValue(directRaw, "workerLeaseMs") : undefined) ??
-    base?.workerLeaseMs ?? DEFAULT_SCHEDULER.workerLeaseMs;
-
-  return { maxConcurrent, refillPerTick, workerLeaseMs };
+  return { maxConcurrent, refillPerTick };
 }
 
 function mergeControl(

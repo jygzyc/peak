@@ -12,7 +12,6 @@ import type {
 } from "../agent/types.js";
 import { DEFAULT_SCHEDULER } from "../agent/types.js";
 import type { Graph } from "../graph/graph.js";
-import type { IntentLeaseClaim } from "../graph/graph.js";
 import type { WorkerPool } from "../worker/worker-runtime.js";
 import { StageError } from "../agent/parse-envelope.js";
 import { MainAgent } from "../agent/main-agent.js";
@@ -24,7 +23,6 @@ import { PromptLoader } from "../config/prompt-loader.js";
 import type { FederationBus } from "../graph/federation-bus.js";
 import type { MetacogSupervisor } from "./metacog-supervisor.js";
 import { PermissionChecker, PermissionDeniedError } from "../agent/permissions.js";
-import { randomUUID } from "node:crypto";
 import type { GlobalResourceGovernor } from "../worker/resource-governor.js";
 import { SessionCoordinator } from "./session-coordinator.js";
 import type { Permission } from "../agent/types.js";
@@ -61,8 +59,6 @@ export interface SessionLoopOptions {
    * evaluators, before termination). When set, metacog reviews the graph and
    * emits correction hints the planner consumes on the next step. */
   metacog?: MetacogSupervisor;
-  /** Stable only for this coordinator process. Primarily injectable for tests. */
-  coordinatorId?: string;
   graphReader?: SessionGraphReader;
 }
 
@@ -85,9 +81,7 @@ export class SessionLoop {
     controller: AbortController;
     intentId?: IntentId;
     role: SessionRole;
-    heartbeatTimer?: ReturnType<typeof setInterval>;
   }>>();
-  private readonly coordinatorId: string;
   private resourceGovernor?: GlobalResourceGovernor;
   private readonly coordinator: SessionCoordinator;
   private readonly graphReader: SessionGraphReader;
@@ -104,10 +98,14 @@ export class SessionLoop {
         "SessionLoop requires exactly one task/Project per session; use GlobalSupervisor for multiple sessions",
       );
     }
+    for (const project of existingProjects) {
+      for (const intent of graph.intents(project.id, "claimed")) {
+        graph.releaseIntent(project.id, intent.id);
+      }
+    }
     this.promptLoader = new PromptLoader();
     this.graphReader = options.graphReader ?? new ServerSessionGraphReader(graph);
-    this.coordinator = new SessionCoordinator(graph);
-    this.coordinatorId = options.coordinatorId ?? `session:${process.pid}:${randomUUID()}`;
+    this.coordinator = new SessionCoordinator();
     this.federationBus = options.federationBus;
     this.sessionId = options.sessionId;
     this.federationScope = options.federationScope
@@ -118,7 +116,6 @@ export class SessionLoop {
     if (this.federationBus && this.sessionId && existingProjects.length === 1) {
       this.registerFederationMembership(this.federationBus, this.sessionId, this.federationScope);
     }
-    this.graph.sweepExpiredLeases();
   }
 
   requireProfilePermission(profileId: string, permission: Permission): void {
@@ -137,7 +134,7 @@ export class SessionLoop {
     this.federationBus = bus;
     this.sessionId = sessionId;
     this.federationScope = scope;
-    this.metacog?.setFederation(sessionId, scope);
+    this.metacog?.setFederation(bus, sessionId, scope);
   }
 
   unsetFederation(bus: FederationBus, sessionId: string): void {
@@ -208,7 +205,6 @@ export class SessionLoop {
       return false;
     }
     if (this.coordinator.recentVerdicts(projectId).length > 0) return false;
-    if (this.graph.federationOutbox(projectId, "pending").length > 0) return false;
     if ((this.activeExecutions.get(projectId)?.size ?? 0) > 0) return false;
 
     if (this.metacog) {
@@ -241,7 +237,9 @@ export class SessionLoop {
       throw new Error("session metacog supervisor is already bound");
     }
     this.metacog = metacog;
-    if (this.sessionId) metacog.setFederation(this.sessionId, this.federationScope);
+    if (this.federationBus && this.sessionId) {
+      metacog.setFederation(this.federationBus, this.sessionId, this.federationScope);
+    }
     if (this.resourceGovernor) metacog.setResourceGovernor(this.resourceGovernor);
   }
 
@@ -251,7 +249,6 @@ export class SessionLoop {
     for (const executions of this.activeExecutions.values()) {
       for (const execution of executions.values()) {
         execution.controller.abort(new Error("session loop closed"));
-        if (execution.heartbeatTimer) clearInterval(execution.heartbeatTimer);
       }
     }
     this.closePromise = (async () => {
@@ -307,7 +304,6 @@ export class SessionLoop {
 
   async tick(): Promise<StepResult[]> {
     if (this.closed) throw new Error("SessionLoop is closed");
-    this.graph.sweepExpiredLeases();
     const active = [
       ...this.graph.listProjects("active"),
       ...this.graph.listProjects("finish_proposed"),
@@ -341,8 +337,6 @@ export class SessionLoop {
     const project = this.graph.getProject(projectId);
     if (!project) return { type: "failed", reason: "project not found" };
 
-    this.graph.sweepExpiredLeases();
-
     await this.consumeDirectives(projectId);
     const current = this.graph.getProject(projectId)!;
     if (current.status !== "active" && current.status !== "finish_proposed") {
@@ -354,7 +348,6 @@ export class SessionLoop {
 
     const factsBefore = this.graph.facts(projectId, "pass").length;
 
-    this.flushFederationOutbox(projectId);
     await this.processFederationBroadcasts(projectId);
     await this.consumeDirectives(projectId);
     const afterBroadcastControl = this.controlResult(projectId);
@@ -375,8 +368,8 @@ export class SessionLoop {
     const afterEvaluatorControl = this.controlResult(projectId);
     if (afterEvaluatorControl) return afterEvaluatorControl;
 
-    // Metacog uses an in-flight promise plus a persistent Run claim, without
-    // holding a process-local mutex during worker I/O. It reviews the graph
+    // Metacog uses an in-flight promise without holding a process-local mutex
+    // during worker I/O. It reviews the graph
     // after evaluator verdicts and before termination, so correction hints are
     // visible to the planner on the next step.
     if (this.metacog) {
@@ -385,8 +378,6 @@ export class SessionLoop {
     await this.consumeDirectives(projectId);
     const afterMetacogControl = this.controlResult(projectId);
     if (afterMetacogControl) return afterMetacogControl;
-    this.flushFederationOutbox(projectId);
-
     if (!plannerSucceeded) {
       const status = this.graph.getProject(projectId)?.status;
       if (status === "failed") return { type: "failed", reason: "planner retry limit exhausted" };
@@ -411,31 +402,25 @@ export class SessionLoop {
         case "stop":
           this.graph.updateProjectStatus(projectId, "stopped");
           this.abortExecutions(projectId);
-          this.graph.logEvent(projectId, "directive.stop", { reason: dir.payload });
           return;
         case "pause":
           this.graph.updateProjectStatus(projectId, "paused");
           this.abortExecutions(projectId);
-          this.graph.logEvent(projectId, "directive.pause", { reason: dir.payload });
           return;
         case "resume":
           this.graph.updateProjectStatus(projectId, "active");
-          this.graph.logEvent(projectId, "directive.resume", {});
           break;
         case "hint":
           this.graph.addHint(projectId, { content: dir.payload, creator: "human" });
-          this.graph.logEvent(projectId, "directive.hint", { content: dir.payload });
           break;
         case "kill-intent":
           this.abortExecutions(projectId, dir.payload);
           try {
             this.graph.failIntent(projectId, dir.payload, "killed by directive", false, "directive");
-            this.graph.logEvent(projectId, "directive.kill", { intentId: dir.payload });
           } catch { /* intent may not exist */ }
           break;
         case "spawn-intent":
           this.graph.addIntent(projectId, { description: dir.payload, creator: "human" });
-          this.graph.logEvent(projectId, "directive.spawn", { description: dir.payload });
           break;
       }
     }
@@ -455,35 +440,19 @@ export class SessionLoop {
     key: string,
     role: SessionRole,
     intentId?: IntentId,
-    intentClaim?: IntentLeaseClaim,
   ): AbortController {
     const controller = new AbortController();
-    const leaseMs = this.config.scheduler?.workerLeaseMs ?? DEFAULT_SCHEDULER.workerLeaseMs;
-    const heartbeatTimer = intentId && intentClaim
-      ? setInterval(() => {
-        try {
-          this.graph.renewIntentLease(projectId, intentId, intentClaim, leaseMs);
-        } catch (error) {
-          controller.abort(error instanceof Error
-            ? error
-            : new Error(`intent lease lost: ${String(error)}`));
-        }
-      }, Math.max(5, Math.floor(leaseMs / 3)))
-      : undefined;
-    heartbeatTimer?.unref?.();
     let active = this.activeExecutions.get(projectId);
     if (!active) {
       active = new Map();
       this.activeExecutions.set(projectId, active);
     }
-    active.set(key, { controller, intentId, role, heartbeatTimer });
+    active.set(key, { controller, intentId, role });
     return controller;
   }
 
   private finishExecution(projectId: ProjectId, key: string): void {
     const active = this.activeExecutions.get(projectId);
-    const execution = active?.get(key);
-    if (execution?.heartbeatTimer) clearInterval(execution.heartbeatTimer);
     active?.delete(key);
     if (active?.size === 0) this.activeExecutions.delete(projectId);
   }
@@ -498,12 +467,12 @@ export class SessionLoop {
     }
   }
 
-  /** Per-project, per-intent explorer-failure counts. An intent whose explorer
+  /** Process-local, per-intent explorer-failure counts. An intent whose explorer
    *  keeps failing (bad output, backend crash) would otherwise be released back
    *  to "open" and re-dispatched forever — no verdict is ever produced to wake
    *  the planner, so the loop deadlocks. After the profile retry limit the intent
-   *  is auto-failed (mechanism, like lease expiry — not a planner policy call)
-   *  and recorded as a dead-end so the planner does not re-open the same path. */
+   *  causes the Project to fail without turning a transport error into a
+   *  semantic Intent denial or dead-end. */
   private async maybeRunPlanner(projectId: ProjectId): Promise<boolean> {
     const intents = this.graph.intents(projectId);
     const hints = this.graph.unconsumedHints(projectId);
@@ -533,9 +502,8 @@ export class SessionLoop {
     }
     if (this.coordinator.retryDelayRemaining(
       projectId,
-      "planner.error",
+      "planner",
       plannerProfile.retry?.backoffMs ?? 0,
-      this.coordinator.lastPlannerDecisionSeq(projectId),
     ) > 0) return true;
 
     const workerName = selectProfileWorker(plannerProfile, projectId, this.workerPool, this.config);
@@ -561,7 +529,6 @@ export class SessionLoop {
           status: "discarded",
           errorMessage: "planner result arrived after the project left active state",
         });
-        this.graph.logEvent(projectId, "planner.result_discarded", { agentId });
         return false;
       }
       this.graph.transaction(() => {
@@ -569,16 +536,8 @@ export class SessionLoop {
           projectId, graph: this.graph, config: this.config,
           decision, permissions,
         });
-        this.graph.logEvent(projectId, "planner.decision_applied", {
-          agentId,
-          createdIntents: decision.createIntents.length,
-          failedIntents: decision.failIntents.length,
-          stoppedExplorers: decision.stopExplorerIntentIds.length,
-          consumedHints: decision.consumeHintIds.length,
-          concluded: Boolean(decision.concludeRun),
-          stepsExecuted: this.graph.progress(projectId).stepsExecuted,
-        });
       });
+      this.coordinator.recordPlannerDecision(projectId, this.graph.progress(projectId).stepsExecuted);
       await agent.updateRecord(agentId, {
         status: "applied",
         outputSummary: `${decision.createIntents.length} create, ${decision.stopExplorerIntentIds.length} stop, ${decision.failIntents.length} fail, end=${Boolean(decision.concludeRun)}`,
@@ -590,19 +549,11 @@ export class SessionLoop {
       return true;
     } catch (err) {
       if (controller.signal.aborted) {
-        this.graph.logEvent(projectId, "planner.cancelled", {});
         return false;
       }
-      const failures = this.coordinator.plannerFailureCount(projectId) + 1;
-      this.graph.logEvent(projectId, "planner.error", {
-        error: err instanceof Error ? err.message : String(err),
-        failures,
-      });
+      const failures = this.coordinator.recordFailure(projectId, "planner");
       if (failures >= (plannerProfile.retry?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS)) {
         this.graph.updateProjectStatus(projectId, "failed");
-        this.graph.logEvent(projectId, "project.failed_retry_exhausted", {
-          stage: "planner", failures,
-        });
       }
       return false;
     } finally {
@@ -611,12 +562,6 @@ export class SessionLoop {
   }
 
   private async dispatchExplorers(projectId: ProjectId): Promise<number> {
-    // Sweep stale leases before counting claimed slots, so an expired claim
-    // (worker that crashed/abandoned) frees its slot within the same step
-    // rather than blocking dispatch until the next tick. Mirrors Cairn's
-    // expire_workers-before-claim pattern.
-    this.graph.sweepExpiredLeases();
-
     const open = this.graph.intents(projectId, "open");
     if (open.length === 0) return 0;
 
@@ -654,19 +599,15 @@ export class SessionLoop {
   }
 
   private async runOneExplorer(projectId: ProjectId, intent: Intent): Promise<void> {
-    const leaseMs = this.config.scheduler?.workerLeaseMs ?? DEFAULT_SCHEDULER.workerLeaseMs;
     const { profileId: explorerProfileId, profile: explorerProfile } = this.profileForRole("explorer");
     const explorerWorker = selectProfileWorker(explorerProfile, projectId, this.workerPool, this.config);
-    const workerId = `${this.coordinatorId}:${intent.id}:${Date.now()}`;
     const executionKey = `explorer:${intent.id}`;
     let controller: AbortController | undefined;
-    let claim: IntentLeaseClaim | undefined;
     let agent: ExplorerAgent | undefined;
 
     try {
-      const claimed = this.graph.claimIntent(projectId, intent.id, workerId, leaseMs);
-      claim = { workerId, epoch: claimed.leaseEpoch };
-      controller = this.startExecution(projectId, executionKey, "explorer", intent.id, claim);
+      this.graph.claimIntent(projectId, intent.id);
+      controller = this.startExecution(projectId, executionKey, "explorer", intent.id);
       agent = new ExplorerAgent({
         profile: explorerProfile,
         profileId: explorerProfileId,
@@ -699,41 +640,20 @@ export class SessionLoop {
         evidence: result.output.fact.evidence,
         source: "explorer",
         confidence: result.output.fact.confidence,
-      }, claim);
+      });
       await agent.updateRecord(result.agentId, {
         status: "applied",
         factId: fact.id,
         outputSummary: fact.description.slice(0, 200),
       });
-      this.graph.logEvent(projectId, "explorer.result_applied", {
-        agentId: result.agentId,
-        intentId: intent.id,
-        factId: fact.id,
-      });
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      if (!controller && !claim) return;
+      if (!controller) return;
       if (controller?.signal.aborted) {
-        if (claim) {
-          try { this.graph.releaseIntent(projectId, intent.id, claim); } catch { /* already concluded/reassigned */ }
-        }
-        this.graph.logEvent(projectId, "explorer.cancelled", { intentId: intent.id });
+        try { this.graph.releaseIntent(projectId, intent.id); } catch { /* already concluded */ }
         return;
       }
-      const currentIntent = this.graph.getIntent(projectId, intent.id);
-      const stillOwnsLease = Boolean(claim && currentIntent?.status === "claimed"
-        && currentIntent.lease?.workerId === claim.workerId
-        && currentIntent.lease.epoch === claim.epoch);
-      const leaseExpired = stillOwnsLease
-        && Boolean(currentIntent?.lease?.expiresAt && currentIntent.lease.expiresAt <= new Date().toISOString());
-      if (claim && (!stillOwnsLease || leaseExpired)) {
-        if (stillOwnsLease) {
-          try { this.graph.releaseIntent(projectId, intent.id, claim); } catch { /* already reassigned */ }
-        }
-        this.graph.logEvent(projectId, "explorer.result_discarded", {
-          intentId: intent.id,
-          leaseEpoch: claim.epoch,
-        });
+      if (this.graph.getIntent(projectId, intent.id)?.status !== "claimed") {
         return;
       }
       // A persistently broken explorer would otherwise re-dispatch forever.
@@ -741,27 +661,18 @@ export class SessionLoop {
       // Project without inventing a semantic dead-end or denying the Intent.
       const fails = this.bumpIntentFailure(projectId, intent.id);
       if (fails >= (explorerProfile.retry?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS)) {
-        if (claim) {
-          try { this.graph.releaseIntent(projectId, intent.id, claim); } catch { /* already concluded/reassigned */ }
-        }
+        try { this.graph.releaseIntent(projectId, intent.id); } catch { /* already concluded */ }
         this.graph.updateProjectStatus(projectId, "failed");
-        this.graph.logEvent(projectId, "project.failed_retry_exhausted", {
-          stage: "explorer", intentId: intent.id, failures: fails, lastError: reason,
-        });
       } else {
-        if (claim) {
-          try { this.graph.releaseIntent(projectId, intent.id, claim); } catch { /* already concluded/reassigned */ }
-        }
+        try { this.graph.releaseIntent(projectId, intent.id); } catch { /* already concluded */ }
       }
-      this.graph.logEvent(projectId, "explorer.error", { intentId: intent.id, error: reason });
     } finally {
       this.finishExecution(projectId, executionKey);
     }
   }
 
-  /** Count persisted explorer failures so restart cannot reset the retry cap. */
   private bumpIntentFailure(projectId: ProjectId, intentId: IntentId): number {
-    return this.coordinator.explorerFailureCount(projectId, intentId) + 1;
+    return this.coordinator.recordFailure(projectId, `explorer:${intentId}`);
   }
 
   private async runEvaluators(projectId: ProjectId): Promise<void> {
@@ -816,6 +727,11 @@ export class SessionLoop {
           const evaluatorPermissions = new PermissionChecker(evaluatorProfile);
           evaluatorPermissions.require("change_fact");
           this.graph.commitEvaluatorResult(projectId, candidate.id, result.output.verdict);
+          this.coordinator.recordVerdict(projectId, {
+            factId: candidate.id,
+            intentId: candidate.parentIntentId,
+            verdict: result.output.verdict,
+          });
           await agent.updateRecord(result.agentId, {
             status: "applied",
             outputSummary: `${result.output.verdict.decision}: ${result.output.verdict.reason.slice(0, 150)}`,
@@ -833,24 +749,16 @@ export class SessionLoop {
         } catch (err) {
           const reason = err instanceof Error ? err.message : String(err);
           if (controller.signal.aborted) {
-            this.graph.logEvent(projectId, "evaluator.cancelled", { factId: candidate.id });
             return;
           }
           // Do NOT resolve the fact as "deny" on a transient evaluator error
           // (network/timeout/parse). A spurious reject would permanently mark the
           // fact as a dead-end and pollute later planner decisions. Leave it as a
           // candidate so a later step can retry evaluation.
-          this.graph.logEvent(projectId, "evaluator.error", {
-            factId: candidate.id, error: reason,
-            failures: this.bumpEvaluatorFailure(projectId, candidate.id),
-          });
-          const failures = this.coordinator.evaluatorFailureCount(projectId, candidate.id);
+          const failures = this.bumpEvaluatorFailure(projectId, candidate.id);
           if (failures >= (evaluatorProfile.retry?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS)
             && this.graph.getProject(projectId)?.status === "active") {
             this.graph.updateProjectStatus(projectId, "failed");
-            this.graph.logEvent(projectId, "project.failed_retry_exhausted", {
-              stage: "evaluator", factId: candidate.id, failures,
-            });
           }
         } finally {
           this.finishExecution(projectId, executionKey);
@@ -866,20 +774,6 @@ export class SessionLoop {
     permissions.require("receive_fact_broadcast");
 
     for (const insight of this.federationBus.pendingForSession(this.sessionId)) {
-      const prior = this.graph.events(projectId).find(
-        (event) => event.type === "federation.broadcast_assessed"
-          && event.payload.broadcastId === insight.id,
-      );
-      if (prior) {
-        this.federationBus.acknowledge(
-          this.sessionId,
-          insight.id,
-          prior.payload.decision === "irrelevant" ? "irrelevant" : "evaluated",
-          undefined,
-        );
-        continue;
-      }
-
       const evaluatorWorker = selectProfileWorker(evaluatorProfile, projectId, this.workerPool, this.config);
       const executionKey = `broadcast:${insight.id}`;
       const controller = this.startExecution(projectId, executionKey, "evaluator");
@@ -919,6 +813,9 @@ export class SessionLoop {
           result.output.assessment,
           insight.kind,
         );
+        if (result.output.assessment.decision !== "irrelevant") {
+          this.coordinator.recordRelevantBroadcast(projectId);
+        }
         await agent.updateRecord(result.agentId, {
           status: "applied",
           outputSummary: `${result.output.assessment.decision}: ${result.output.assessment.reason.slice(0, 150)}`,
@@ -930,61 +827,18 @@ export class SessionLoop {
           result.agentId,
         );
       } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
         if (controller.signal.aborted) {
-          this.graph.logEvent(projectId, "federation.broadcast_cancelled", { broadcastId: insight.id });
           return;
         }
         this.federationBus.markFailed(this.sessionId, insight.id);
-        const failures = this.coordinator.broadcastFailureCount(projectId, insight.id) + 1;
-        this.graph.logEvent(projectId, "federation.broadcast_error", {
-          broadcastId: insight.id,
-          error: reason,
-          failures,
-        });
+        const failures = this.coordinator.recordFailure(projectId, `broadcast:${insight.id}`);
         if (failures >= (evaluatorProfile.retry?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS)
           && this.graph.getProject(projectId)?.status === "active") {
           this.graph.updateProjectStatus(projectId, "failed");
-          this.graph.logEvent(projectId, "project.failed_retry_exhausted", {
-            stage: "broadcast-evaluator",
-            broadcastId: insight.id,
-            failures,
-          });
           return;
         }
       } finally {
         this.finishExecution(projectId, executionKey);
-      }
-    }
-  }
-
-  private flushFederationOutbox(projectId: ProjectId): void {
-    if (!this.federationBus || !this.sessionId) return;
-    for (const item of this.graph.federationOutbox(projectId, "pending")) {
-      try {
-        const insight = this.federationBus.publishInsight(
-          item.kind,
-          {
-            sessionId: this.sessionId,
-            projectId,
-            factId: item.sourceFactId,
-          },
-          item.summary,
-          item.confidence,
-          undefined,
-          { id: item.eventId, scope: item.scope },
-        );
-        this.graph.markFederationOutboxPublished(
-          projectId,
-          item.eventId,
-          insight.id,
-          insight.seq,
-        );
-      } catch (error) {
-        this.graph.logEvent(projectId, "federation.outbox_publish_error", {
-          eventId: item.eventId,
-          error: error instanceof Error ? error.message : String(error),
-        });
       }
     }
   }
@@ -1008,10 +862,6 @@ export class SessionLoop {
       const met = fact.requiredConditions!.some((c) => c && lower.includes(c.toLowerCase()));
       if (met) {
         this.graph.clearFactConditions(projectId, fact.id);
-        this.graph.logEvent(projectId, "fact.reactivated", {
-          factId: fact.id,
-          byFactDescription: acceptedDescription.slice(0, 120),
-        });
       }
     }
   }
@@ -1079,7 +929,7 @@ export class SessionLoop {
   }
 
   private bumpEvaluatorFailure(projectId: ProjectId, factId: string): number {
-    return this.coordinator.evaluatorFailureCount(projectId, factId) + 1;
+    return this.coordinator.recordFailure(projectId, `evaluator:${factId}`);
   }
 
   private requireProject(projectId: ProjectId) {

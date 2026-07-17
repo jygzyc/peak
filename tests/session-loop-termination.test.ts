@@ -117,43 +117,20 @@ test("evaluator failure leaves the candidate as candidate (not auto-rejected)", 
   const rejected = graph.facts(p.id, "deny");
   assert.equal(candidate.length, 1, "candidate must remain a candidate (not resolved)");
   assert.equal(rejected.length, 0, "transient evaluator error must NOT auto-reject the fact");
-  const errEvents = graph.events(p.id).filter((e) => e.type === "evaluator.error");
-  assert.equal(errEvents.length, 1);
+  assert.equal(worker.calls().filter((call) => call.prompt.includes("# Evaluator Role")).length, 1);
 });
 
-test("dispatchExplorers sweeps expired leases before counting claimed slots", async () => {
-  // A stale claim (lease expired but status still "claimed") must not block
-  // dispatch of fresh intents. dispatchExplorers calls sweepExpiredLeases()
-  // before counting claimed intents, so the stale slot frees up within the
-  // same step. We verify: a stale claim that fills the only scheduler slot
-  // does NOT prevent a fresh open intent from dispatching in the same step.
+test("SessionLoop recovery reopens claimed task state without persisted leases", () => {
   const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
-  config.scheduler!.maxConcurrent = 1; // only 1 slot total
-  config.scheduler!.refillPerTick = 1;
   const p = createProject(graph);
-
-  // Stale claim: intent in "claimed" with an already-expired lease. It counts
-  // against maxConcurrent unless swept. We pre-create FRESH-TASK as an open
-  // intent (created by "planner") so dispatchExplorers sees only it.
-  const fresh = graph.addIntent(p.id, { description: "FRESH-TASK", creator: "planner" });
   const stale = graph.addIntent(p.id, { description: "STALE-CLAIMED", creator: "planner" });
-  graph.claimIntent(p.id, stale.id, "dead-worker", 1); // 1ms lease → instantly expired
-  await new Promise((r) => setTimeout(r, 5)); // let it expire
+  graph.claimIntent(p.id, stale.id);
 
-  worker.register(/FRESH-TASK/i, env("fact", { description: "fresh done", confidence: 0.9 }));
-  worker.register(/STALE-CLAIMED/i, env("fact", { description: "stale redone", confidence: 0.9 }));
-  worker.register(/Evaluator Role/i, env("verdict", { decision: "pass", reason: "ok" }));
-
-  const loop = new SessionLoop(graph, worker, config);
-  // SessionLoop recovery and dispatch both sweep leases. Construction already
-  // performs the first sweep, so verify the durable state/event rather than
-  // expecting a second sweep to count the same lease again.
-  assert.ok(graph.events(p.id).some((event) =>
-    event.type === "intent.lease_expired" && event.payload.intentId === stale.id));
-  // After sweep, no claimed intents remain → slot is free for FRESH-TASK.
-  assert.equal(graph.intents(p.id, "claimed").length, 0, "no claimed intents after sweep");
+  new SessionLoop(graph, worker, config);
+  assert.equal(graph.getIntent(p.id, stale.id)?.status, "open");
+  assert.equal("lease" in graph.getIntent(p.id, stale.id)!, false);
 });
 
 test("FederationBus: accepted facts are published only after metacog review", async () => {
@@ -169,7 +146,7 @@ test("FederationBus: accepted facts are published only after metacog review", as
     worker,
     config,
     undefined,
-    { sessionId: "s1", scope: "default" },
+    { bus, sessionId: "s1", scope: "default" },
   );
   loop.setMetacog(metacog);
 
@@ -240,8 +217,7 @@ test("persistently failing explorer fails the project without inventing a semant
   // auto-fail guard, release the intent back to "open" every step and be
   // re-dispatched forever — no verdict is ever produced to wake the planner,
   // so loop.run() would never terminate. After MAX_EXPLORER_RETRIES the loop
-  // fails the intent (mechanism, like lease expiry) and records a dead-end,
-  // so the planner sees an empty graph and concludes naturally.
+  // fails the Project without inventing an Intent denial or dead-end.
   const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
@@ -260,6 +236,5 @@ test("persistently failing explorer fails the project without inventing a semant
   assert.equal(intent.status, "open", "transport failure must not become planner semantic deny");
   const autoFailed = graph.events(p.id).find((e) => e.type === "intent.auto_failed");
   assert.equal(autoFailed, undefined);
-  const explorerErrors = graph.events(p.id).filter((e) => e.type === "explorer.error");
-  assert.ok(explorerErrors.length >= 3, `at least 3 explorer errors before auto-fail, got ${explorerErrors.length}`);
+  assert.equal(worker.calls().filter((call) => call.prompt.includes("# Explorer Role")).length, 3);
 });

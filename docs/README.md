@@ -1,71 +1,173 @@
-# peak 代码审计文档
+# Peak 整体架构
 
-> 当前基线：2026-07-16。本文描述当前工作树；目标以 [target.md](./target.md) 为准。
+`peak` 是配置驱动的多 Agent 运行时。源码只实现调度、权限、合同、持久化和 Worker 适配；领域行为放在 task、profile、prompt、rules、knowledge 与 skills 中。
 
-## 阅读入口
+详细时序见 [data-flow.md](./data-flow.md)。
 
-| 文档 | 主题 |
-|---|---|
-| [target.md](./target.md) | 目标状态：GlobalSupervisor、每 session 四角色、图状态与 TaskGroup 结束条件 |
-| [11-session-timing-federation-and-prompts.md](./11-session-timing-federation-and-prompts.md) | session 时序、角色协同、跨 session、恢复与 prompt 注入专题审计 |
-| [12-cairn-inspired-generic-graph-agent-plan.md](./12-cairn-inspired-generic-graph-agent-plan.md) | 已归档设计计划与当前边界 |
-| [02-app.md](./02-app.md) | 组合根、资源所有权与关闭顺序 |
-| [03-agent.md](./03-agent.md) | 类型、输出合同、权限、context 与 prompt 注入 |
-| [04-session.md](./04-session.md) | SessionLoop、Metacog、GlobalSupervisor 与持久协调状态 |
-| [05-worker-core.md](./05-worker-core.md) | WorkerPool、driver 映射、全局 permit 与外部 session id |
-| [08-graph.md](./08-graph.md) | Graph、SQLite、FederatedGraph 与 FederationBus |
-| [09-config.md](./09-config.md) | 第一版正式配置模型 |
-| [10-server.md](./10-server.md) | 统一 session POST REST 与 Dashboard |
-
-其余 `01`、`06`、`07`、`13`、`14` 分册分别记录入口、backend、provider 与验收案例。
-
-## 当前架构结论
+## 1. 组件与所有权
 
 ```text
-SessionRuntimeFactory
-  ├─ GlobalSupervisor + GlobalResourceGovernor + FederationBus
-  ├─ one HttpServer
-  └─ AgentRuntime(session) × N
-       ├─ one Graph / one Project
-       ├─ one SessionLoop / planner controller
-       ├─ one MetacogSupervisor
-       └─ BaseAgent roles + in-memory execution control
+SessionRuntimeFactory / AgentRuntime
+├─ GlobalSupervisor
+│  ├─ 调度多个 SessionLoop
+│  └─ GlobalResourceGovernor：限制全局 Worker 并发
+├─ HttpServer：统一 POST API 与 Dashboard
+├─ FederationBus：持久化跨 session 广播与 TaskGroup 屏障
+└─ SessionRuntime × N
+   ├─ SqliteGraph：一个 session、一个 Project
+   ├─ SessionLoop：planner、explorer、evaluator 调度
+   ├─ MetacogSupervisor：纠偏、终审与广播
+   └─ BaseAgent：角色调用与 JSON 审计
 ```
 
-- Graph 是 session 内分析真相源；只持久化 Fact/Intent 等语义状态、事件游标与 outbox。单次 Agent 调用不进入 Graph。
-- Intent 是由 `intent_sets` 记录有序输入 Fact 集合的有向超边；Fact 状态为 `candidate/pass/deny/pending`。
-- planner 显式创建 Intent 并决定是否派发 Explorer；Evaluator 是 candidate Fact 和跨 session broadcast 的验证门；Metacog 在 Fact 接受和最终审查时纠偏并通过 outbox 广播。
-- 未显式配置 `federation.scope` 的 session 默认使用自身 session id，互不组成 TaskGroup；只有相同 scope 的关联 session 共享完成屏障。
-- 角色 prompt 固定经过 `ServerSessionGraphReader → agents/<agentId>/context.json → PromptBuilder(file reference) → output.json`；角色不持有数据库对象，`record.json` 保存调用审计。
+| 组件 | 负责 | 不负责 |
+|---|---|---|
+| `GlobalSupervisor` | 多 session 调度、TaskGroup 完成协调 | session 内规划、跨 session Graph 写入 |
+| `SessionLoop` | 单 session 主循环、活动调用、运行时重试与防重 | 持久化单次 Agent 调用 |
+| `SqliteGraph` | Fact、Intent 等分析语义状态 | Worker 调用、取消、并发计数 |
+| `BaseAgent` | context/output/record JSON、prompt、合同验证、Worker 调用 | 直接读取或修改 Graph/SQLite |
+| `HttpServer` | session Graph 的统一读模型、控制 API、Dashboard | 角色策略与第二套状态 |
+| `FederationBus` | 广播、delivery、cursor、TaskGroup 屏障 | 直接改写任一 session Graph |
+| Worker/backend | prompt 输入、结构化文本输出 | Graph、调度和业务状态 |
 
-## 本轮审计已修复
+## 2. 核心边界
 
-1. `AgentRuntime.close()` 改为可等待的单向 shutdown：先从 supervisor 注销，再 abort/join SessionLoop 与 Metacog，停止 HTTP，最后关闭 Graph。
-2. HTTP `start()` 正确 reject 端口占用和重复启动；`stop()` 主动关闭连接并复位状态；所有 `/api` 路由统一为 POST。
-3. HTTP session binding 只依赖 session Graph，不再反向依赖 SessionLoop 或角色实现；server 从持久 TaskConfig 的 `profile.context` 生成职责范围 JSON，只有 metacog 拥有显式 `get_graph`。
-4. Federation 注册由 SessionLoop 记录唯一 binding，重复注册幂等；Metacog 不再直接注册 bus；GlobalSupervisor 注册失败会回滚 membership。
-5. standalone federation runtime 使用稳定 supervisor，不再在每次 `run()` 临时注册且遗留幽灵 session。
-6. broadcast evaluator 重复失败达到 profile retry 上限后显式失败 session，避免 delivery 永久 `failed → retry` 的活锁。
-7. 删除跨调用 worker session reuse、delta ContextCheckpoint、ContextLedger、WorkerSessionManager 和 fact tiering；每次角色调用只使用可独立审计的完整 snapshot artifact。
-8. 删除第一版不使用的配置/协议面：`workflow`、`federation.group/enabled`、`control.metacogIntervalSeconds`、`CONTRACTS` 注册表、`NullWorkerPool`、`expectedPayload`、`supportsConclude`、`partialOutput` 和 `app/version.ts`。
-9. WorkerRequest 现在要求 `workerName + role + projectId + cwd`，不再把缺失角色默认为 explorer；全局并发只接受正整数或 `Infinity`。
-10. Graph/Federation SQLite 仅接受各自 `application_id + user_version=1` 的第一版正式 schema，不包含迁移、回填、双写或旧路由兼容。
-11. supervisor 模式的 idle `run()` 由 runtime close signal 中断，关闭后所有启动/执行入口快速失败。
-12. 持久 AgentRuntime 必须在构造前绑定唯一 session，拒绝 task/options 身份冲突，避免 Project 与 DB 目录分裂。
-13. agent/task 名称拒绝路径成分，不能逃出 `PEAK_HOME`；providers 配置损坏或字段非法时 fail-fast。
-14. 删除 Graph 中的 SubagentRun 表、lease、heartbeat 与 CRUD；运行控制留在内存，BaseAgent 审计写到 session `agents/` JSON。
+1. 每个 session 对应一个任务、一个 Project 和一个持久 `analysis.db`。
+2. Graph 是 session 内分析状态的唯一真相源。
+3. planner、explorer、evaluator、metacog 都继承 `BaseAgent`，不得获得数据库对象或数据库文件。
+4. 角色只读取 server 按 profile 生成的 JSON 文件，只输出合同约束的 JSON。
+5. 活动调用、所有权、重试计数、planner cooldown、`AbortController` 和并发计数只存在于运行时内存；`AgentRecord` 只是 Graph 外的 JSON 审计。
+6. Intent 只持久化 `open/claimed/pass/deny` 任务状态，不保存 worker、lease、epoch、heartbeat 或超时；SessionLoop 启动时将遗留的 `claimed` 重新开放。
+7. 跨 session 只传摘要和引用；广播必须经目标 session 的 evaluator 判断。
+8. 第一版不提供 schema 迁移、兼容字段、内存数据库或临时数据库模式。
 
-## 仍需优先处理
+## 3. Graph 模型
 
-1. 对 SQLite 每个事务提交点、outbox publish/delivery/ack、artifact 写入/rename/hash 做系统故障注入，而不只覆盖代表性 crash/reopen。
-2. 常驻 daemon 从 `PEAK_HOME/sessions` 恢复 runtime registry、统一 HTTP 与 TaskGroup 所有权；当前 factory 只管理本进程创建的 runtime。
-3. Linux/macOS CI 实测进程组 TERM→KILL、descendant 清理与文件锁行为；当前自动回归以 Windows 为主。
-4. `worker-runtime.ts` 与 `worker/base.ts` 仍有两套同名 request/result 类型；它们分属 agent-facing 与 driver-internal 边界，后续应重命名而不是继续增加映射字段。
-5. Codex/Claude 的危险权限开关仍是安全产品决策；领域 prompt/Graph 文本可能是不可信输入。
+Fact 是 DAG 节点，Intent 是从一组已验证 Fact 指向后续工作的有向超边。多 parent 关系只保存在 `intent_sets` 中。
 
-## 验证基线
+```text
+Fact:    candidate -> pass | deny | pending
+Intent:  open -> claimed -> pass | deny
+Project: active | paused | finish_proposed | exhausted | completed | failed | stopped
+```
 
-- 源码与测试数量以当前工作树为准。
-- `npm run typecheck`、`npm test`、`npm run smoke`、`npm run pack` 是交付门槛。
-- 当前结果：355/355 测试通过；npm 包 SHA-256 为 `763888569d8e571dd081e049bf7dbaa2c7710142ca4fae2c4b9075b347cb5d7d`。
-- 本轮完整自动测试基线将在计划第 1.2 节持续更新；测试通过不能替代上述故障注入和跨平台证据。
+Graph 持久化：
+
+- Project、Fact、Intent、`intent_sets`
+- Hint、Directive、EndFact、任务状态变更 Event
+- dead-end route hash 与任务进度计数
+
+Graph 不持久化：
+
+- Agent 调用、Worker 进程、取消控制器
+- worker 所有权、lease/fencing、重试、cooldown、runtime 并发计数、活动 Promise
+- prompt context/output 审计文件
+- federation insight、delivery、cursor 与 TaskGroup 状态；它们只在 FederationBus 数据库中
+
+## 4. 固定角色协议
+
+Profile id 可以自定义并多开同一种角色，但协议角色只有四种，权限只能缩小，不能越过下表上限。
+
+内置 system prompt 也恰好四个：`builtin:planner`、`builtin:explorer`、`builtin:evaluator`、`builtin:metacog`。它们只描述职责与边界；`BaseAgent` 根据本次调用的有效 contract 统一追加精确 JSON 结构，prompt 文件不再复制合同 schema。
+
+| 角色 | 触发 | 输出合同 | 能力上限 |
+|---|---|---|---|
+| planner | 初始规划、Graph 变化、Hint、Verdict、结束复核 | `main_decision` | `create_intent`、`fail_intent`、`handle_hint`、`create_subagent_explorer`、`stop_subagent_explorer`、`create_end_fact` |
+| explorer | planner 派发并成功 claim Intent | `candidate_fact` | `handle_intent`、`write_candidate_fact` |
+| evaluator | candidate Fact 或收到广播 | `verdict` / `broadcast_assessment` | `change_fact`、`receive_fact_broadcast` |
+| metacog | pass Fact、配置 trigger、最终审查 | `hints` / `stop` | `create_hint`、`get_graph`、`send_fact_broadcast` |
+
+每个 profile 绑定：
+
+```text
+role
+runtime      worker / workers / model / provider
+prompt       file / instructions / rules / knowledge / skills
+context      graphView / maxFacts / relevance policy
+permissions  capability 子集
+output       contract
+maxActive / cooldownSteps / triggers / maxOutputTokens / retry
+```
+
+`control.*Profile` 将自定义 profile 绑定到四个协议槽。Agent 配置文件是 builtin slot 的 patch，不是另一套角色模型。
+
+## 5. 持久目录
+
+```text
+PEAK_HOME/
+├─ config.json
+├─ providers.json
+├─ agents/<name>.json
+├─ tasks/<name>.json
+├─ federation.db
+└─ sessions/<session>/
+   ├─ analysis.db
+   └─ agents/<agentId>/
+      ├─ context.json
+      ├─ output.json
+      └─ record.json
+```
+
+`context.json` 和 `output.json` 是一次角色调用的标准输入/输出；`record.json` 保存 profile、role、Worker、hash、artifact 和状态。它们可审计，但不参与 Graph 状态流转。
+
+## 6. Server
+
+所有 `/api` 接口使用 POST；只有 Dashboard 页面使用 `GET /`。
+
+| API | 用途 |
+|---|---|
+| `POST /api/sessions` | session 摘要 |
+| `POST /api/sessions/:sessionId` | session Graph 详情 |
+| `POST /api/sessions/:sessionId/graph/snapshot` | 按 profile 生成 Graph snapshot |
+| `POST /api/sessions/:sessionId/{facts,intents,end-facts,events}` | Graph 读模型 |
+| `POST /api/sessions/:sessionId/directives` | 注入控制指令 |
+| `POST /api/task-groups` | TaskGroup 列表 |
+| `POST /api/task-groups/:scope` | TaskGroup 状态 |
+
+Server 默认绑定 loopback；非 loopback 必须配置 token。Server 不依赖角色实现，也不维护 Graph 的副本。
+
+## 7. 配置与 Worker
+
+`TaskConfig` 顶层结构：
+
+```text
+task        target、goal、session/name/workspace
+profiles    profile 定义
+workers     agent/api/mock Worker 配置
+scheduler   maxConcurrent 与 refillPerTick
+control     四个协议槽和全局并发绑定
+federation  scope 与预期 members
+agents      可复用 Agent patch 名称
+```
+
+配置合并顺序为 `defaultConfig() <- PEAK_HOME/config.json <- task.json`。相对 prompt 路径按其声明文件解析。`workflow` 不属于第一版 schema。
+
+角色执行必须使用能够读取 session JSON 的 agent/mock Worker；直接 API Worker 不满足这个文件边界，会被拒绝。backend 保持 `prompt in -> structured text out`，不得拥有 Graph 或调度策略。
+
+## 8. 结束条件
+
+planner 通过 EndFact 提出 session 结束。完成前必须满足：
+
+- 没有 open/claimed Intent、candidate Fact 或活动 Agent 调用；
+- planner 的进程内 verdict inbox 已清空；
+- metacog 已完成最终审查；
+- 若属于 TaskGroup，所有成员均 finish-ready，所有 delivery 已处理，所有 cursor 到达稳定 head。
+
+## 9. 代码入口与验证
+
+核心入口：
+
+- `src/app/agent-runtime.ts`、`src/app/session-runtime-factory.ts`
+- `src/session/session-loop.ts`、`src/session/supervisor.ts`
+- `src/agent/base-agent.ts`
+- `src/graph/graph.ts`、`src/graph/sqlite-graph.ts`
+- `src/server/http-server.ts`
+
+交付检查：
+
+```bash
+npm run typecheck
+npm test
+npm run smoke
+npm run pack
+```

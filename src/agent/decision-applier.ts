@@ -54,15 +54,10 @@ export function applyMainDecision(ctx: ApplyDecisionContext): DecisionApplierRes
       const dispatchExplorer = spec.dispatchExplorer ?? true;
       if (dispatchExplorer) permissions.require("create_subagent_explorer");
       if (graph.isDeadEnd(projectId, spec.description)) {
-        graph.logEvent(projectId, "planner.dead_end_skipped", { description: spec.description });
         continue;
       }
       const dupOf = activeGoals.find((g) => nearDuplicateGoal(spec.description, g));
       if (dupOf) {
-        graph.logEvent(projectId, "planner.duplicate_intent_dropped", {
-          description: spec.description,
-          duplicateOf: dupOf,
-        });
         continue;
       }
       graph.addIntent(projectId, {
@@ -96,7 +91,6 @@ export function applyMainDecision(ctx: ApplyDecisionContext): DecisionApplierRes
       }
       try {
         graph.failIntent(projectId, fail.intentId, fail.reason, false, "planner");
-        graph.logEvent(projectId, "planner.kill_explorer", { intentId: fail.intentId, reason: fail.reason });
         result.intentsFailed += 1;
       } catch { /* intent may already be concluded */ }
     }

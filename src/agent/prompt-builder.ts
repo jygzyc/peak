@@ -6,7 +6,6 @@ export interface BuildPromptInput {
   spec: PromptSpec;
   context?: string;
   extra?: string;
-  primaryKind?: Extract<PromptComponentKind, "primary" | "conclude">;
   contextComponent?: DynamicPromptComponent;
   outputContract?: string;
 }
@@ -31,16 +30,13 @@ export interface BuiltPrompt {
 export class PromptBuilder {
   constructor(private readonly loader: PromptLoader) {}
 
-  resolve(
-    spec: PromptSpec,
-    primaryKind?: Extract<PromptComponentKind, "primary" | "conclude">,
-  ): ResolvedPrompt {
-    return this.loader.load(spec, primaryKind);
+  resolve(spec: PromptSpec): ResolvedPrompt {
+    return this.loader.load(spec);
   }
 
   build(input: BuildPromptInput): BuiltPrompt {
     return this.compose(
-      this.resolve(input.spec, input.primaryKind),
+      this.resolve(input.spec),
       input.context,
       input.extra,
       input.contextComponent,

@@ -53,7 +53,7 @@ test("claimIntent transitions open → claimed", () => {
   const g = new TestGraph();
   const p = createProject(g);
   const intent = g.addIntent(p.id, { description: "x", creator: "planner" });
-  const claimed = g.claimIntent(p.id, intent.id, "w1", 1000);
+  const claimed = g.claimIntent(p.id, intent.id);
   assert.equal(claimed.status, "claimed");
 });
 
@@ -61,7 +61,7 @@ test("failIntent records killedBy", () => {
   const g = new TestGraph();
   const p = createProject(g);
   const intent = g.addIntent(p.id, { description: "x", creator: "planner" });
-  g.claimIntent(p.id, intent.id, "w1", 1000);
+  g.claimIntent(p.id, intent.id);
   g.failIntent(p.id, intent.id, "wrong direction", false, "planner");
   const failed = g.getIntent(p.id, intent.id);
   assert.equal(failed!.status, "deny");
@@ -72,7 +72,7 @@ test("failIntent with recordDeadEnd=false does not record dead-end", () => {
   const g = new TestGraph();
   const p = createProject(g);
   const intent = g.addIntent(p.id, { description: "Investigate X", creator: "planner" });
-  g.claimIntent(p.id, intent.id, "w1", 1000);
+  g.claimIntent(p.id, intent.id);
   g.failIntent(p.id, intent.id, "transient", false);
   assert.ok(!g.isDeadEnd(p.id, "investigate x"));
 });
@@ -94,14 +94,14 @@ test("hint can carry stop-explorer kind + targetIntentId", () => {
   assert.equal(h.targetIntentId, intent.id);
 });
 
-test("sweepExpiredLeases releases claimed intents past expiry", async () => {
+test("Intent stores task state without runtime ownership", () => {
   const g = new TestGraph();
   const p = createProject(g);
   const intent = g.addIntent(p.id, { description: "x", creator: "planner" });
-  g.claimIntent(p.id, intent.id, "w1", 1);
-  await new Promise((r) => setTimeout(r, 10));
-  assert.ok(g.sweepExpiredLeases() >= 1);
-  assert.equal(g.getIntent(p.id, intent.id)!.status, "open");
+  const claimed = g.claimIntent(p.id, intent.id);
+  assert.equal(claimed.status, "claimed");
+  assert.equal("lease" in claimed, false);
+  assert.equal("leaseEpoch" in claimed, false);
 });
 
 test("directive queue filters by consumedAt", () => {
@@ -119,7 +119,7 @@ test("progress stagnation resets on fact accept", () => {
   const g = new TestGraph();
   const p = createProject(g);
   const intent = g.addIntent(p.id, { description: "x", creator: "planner" });
-  g.claimIntent(p.id, intent.id, "w1", 1000);
+  g.claimIntent(p.id, intent.id);
   g.failIntent(p.id, intent.id, "failed", false);
   assert.equal(g.progress(p.id).stagnationLevel, 1);
   const fact = g.addFact(p.id, { description: "good", source: "explorer" });

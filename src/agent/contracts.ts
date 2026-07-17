@@ -5,11 +5,11 @@
  * has a dedicated validator that takes a parsed WorkerEnvelope and
  * returns a typed, validated payload — or throws on shape mismatch.
  *
- * The subagent runner and decision applier share these validators, so output
+ * BaseAgent and the decision applier share these validators, so output
  * enforcement is centralized.
  */
 
-import type { BroadcastAssessment, Verdict } from "./types.js";
+import type { BroadcastAssessment, OutputContract, Verdict } from "./types.js";
 import type { HintInput } from "../graph/graph.js";
 import {
   asArray,
@@ -21,6 +21,56 @@ import {
   type WorkerEnvelope,
 } from "./parse-envelope.js";
 import { StageError } from "./parse-envelope.js";
+
+const OUTPUT_CONTRACT_SHAPES: Record<OutputContract, string> = {
+  main_decision: `{
+  "kind": "decisions",
+  "data": {
+    "createIntents": [{ "description": "bounded work", "from": [], "priority": 1, "dispatchExplorer": true }],
+    "dispatchExplorerIntentIds": [],
+    "stopExplorerIntentIds": [],
+    "failIntents": [],
+    "consumeHints": [],
+    "concludeRun": null
+  }
+}`,
+  candidate_fact: `{
+  "kind": "fact",
+  "data": { "description": "one objective finding", "evidence": ["how it was verified"], "confidence": 0.8 }
+}`,
+  verdict: `{
+  "kind": "verdict",
+  "data": { "decision": "pass | deny | pending", "reason": "assessment", "confidence": 0.8, "requiredConditions": [] }
+}`,
+  broadcast_assessment: `{
+  "kind": "broadcast_assessment",
+  "data": { "decision": "relevant | irrelevant | condition_satisfied", "reason": "assessment", "targetFactId": "required only for condition_satisfied" }
+}`,
+  hints: `{
+  "kind": "hints",
+  "data": { "hints": [{ "content": "specific actionable guidance" }] }
+}
+OR, only when completion should be challenged or recommended:
+{
+  "kind": "stop",
+  "data": { "reason": "why processing should stop" }
+}`,
+  stop: `{
+  "kind": "stop",
+  "data": { "reason": "why processing should stop" }
+}`,
+};
+
+/** Exact JSON shape appended to every role prompt from the active profile. */
+export function outputContractInstructions(contract: OutputContract): string {
+  return [
+    "## Output Contract",
+    `Contract: ${contract}`,
+    "Return exactly one raw JSON object matching the shape below.",
+    "Do not add prose, comments, or markdown fences.",
+    OUTPUT_CONTRACT_SHAPES[contract],
+  ].join("\n\n");
+}
 
 // ─── main_decision (planner output) ───
 
@@ -124,7 +174,7 @@ export function validateVerdict(envelope: WorkerEnvelope, stage: string): Verdic
   const decisionRaw = asString(data, "decision", stage);
   if (decisionRaw !== "pass" && decisionRaw !== "deny" && decisionRaw !== "pending") {
     throw new StageError(
-      `verdict decision must be accept|reject|defer, got: ${decisionRaw}`,
+      `verdict decision must be pass|deny|pending, got: ${decisionRaw}`,
       stage,
     );
   }

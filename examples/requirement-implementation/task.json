@@ -52,7 +52,7 @@
     }
   },
   "workers": { "codex": { "kind": "agent", "backend": "codex", "timeoutMs": 300000 } },
-  "scheduler": { "maxConcurrent": 1, "refillPerTick": 1, "workerLeaseMs": 300000 },
+  "scheduler": { "maxConcurrent": 1, "refillPerTick": 1 },
   "control": { "mainProfile": "planner", "metacogProfile": "metacog", "globalMaxConcurrent": 1 },
   "federation": { "scope": "requirement-implementation", "members": ["requirement-implementation"] }
 }

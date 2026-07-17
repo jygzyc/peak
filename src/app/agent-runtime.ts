@@ -101,8 +101,8 @@ export class AgentRuntime {
         this.workerPool,
         config,
         undefined,
-        federationSessionId
-          ? { sessionId: federationSessionId, scope: this.federationScope ?? federationSessionId }
+        federationSessionId && federationBus
+          ? { bus: federationBus, sessionId: federationSessionId, scope: this.federationScope ?? federationSessionId }
           : undefined,
         graphReader,
       );

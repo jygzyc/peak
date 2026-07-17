@@ -1,8 +1,8 @@
 /**
  * Graph interface shared by all peak storage backends.
  *
- * Defines the state protocol for projects, facts, intents, hints, directives,
- * events, intent claims, and progress. SessionLoops depend on this
+ * Defines the persistent task-state protocol for projects, facts, intents,
+ * hints, directives, events, and progress. SessionLoops depend on this
  * interface instead of a specific in-memory or SQLite implementation.
  */
 
@@ -69,36 +69,9 @@ export interface IntentInput {
   dispatchRequested?: boolean;
 }
 
-export interface IntentLeaseClaim {
-  workerId: string;
-  epoch: number;
-}
-
-export type FederationOutboxKind = "fact" | "session_summary";
-
-export interface FederationOutboxInput {
-  eventId: string;
-  scope: string;
-  kind: FederationOutboxKind;
-  sourceFactId?: FactId;
-  summary: string;
-  confidence: number;
-}
-
-export interface FederationOutboxItem extends FederationOutboxInput {
-  projectId: ProjectId;
-  status: "pending" | "published";
-  createdAt: ISOTime;
-  publishedAt?: ISOTime;
-  broadcastId?: string;
-  broadcastSeq?: number;
-}
-
 export interface MetacogCommitInput {
   hints: HintInput[];
-  outputSummary: string;
   reviewedFactId?: FactId;
-  broadcast?: FederationOutboxInput;
   finalReviewCompleted?: boolean;
 }
 
@@ -125,16 +98,14 @@ export interface Graph {
   intents(projectId: ProjectId, status?: IntentStatus): Intent[];
   requestExplorerDispatch(projectId: ProjectId, intentId: IntentId): void;
   stopExplorer(projectId: ProjectId, intentId: IntentId, reason: string): void;
-  claimIntent(projectId: ProjectId, intentId: IntentId, workerId: string, leaseMs: number): Intent;
-  renewIntentLease(projectId: ProjectId, intentId: IntentId, expected: IntentLeaseClaim, leaseMs: number): void;
-  releaseIntent(projectId: ProjectId, intentId: IntentId, expected?: IntentLeaseClaim): void;
+  claimIntent(projectId: ProjectId, intentId: IntentId): Intent;
+  releaseIntent(projectId: ProjectId, intentId: IntentId): void;
   concludeIntent(projectId: ProjectId, intentId: IntentId, factId?: FactId): void;
   failIntent(projectId: ProjectId, intentId: IntentId, reason: string, recordDeadEnd?: boolean, killedBy?: Intent["killedBy"]): void;
   /** Record a dead-end route by description, independent of intent lifecycle
    * (e.g. when an evaluator rejects a fact whose intent already concluded). */
   recordDeadEnd(projectId: ProjectId, description: string, reason: string): void;
   isDeadEnd(projectId: ProjectId, description: string): boolean;
-  sweepExpiredLeases(): number;
 
   createEndFact(projectId: ProjectId, description: string, fromFactIds: FactId[]): EndFact;
   activeEndFact(projectId: ProjectId): EndFact | undefined;
@@ -145,7 +116,6 @@ export interface Graph {
     projectId: ProjectId,
     intentId: IntentId,
     input: FactInput,
-    expected: IntentLeaseClaim,
   ): Fact;
   /** Atomic evaluator protocol commit: Fact verdict. */
   commitEvaluatorResult(
@@ -161,19 +131,11 @@ export interface Graph {
     assessment: BroadcastAssessment,
     broadcastKind?: string,
   ): void;
-  /** Atomically commits metacog hints and a durable federation outbox item. */
+  /** Atomically commits metacog-produced task state. */
   commitMetacogResult(
     projectId: ProjectId,
     input: MetacogCommitInput,
   ): void;
-  federationOutbox(projectId: ProjectId, status?: FederationOutboxItem["status"]): FederationOutboxItem[];
-  markFederationOutboxPublished(
-    projectId: ProjectId,
-    eventId: string,
-    broadcastId: string,
-    broadcastSeq: number,
-  ): void;
-
   addHint(projectId: ProjectId, input: HintInput): Hint;
   unconsumedHints(projectId: ProjectId): Hint[];
   consumeHint(projectId: ProjectId, hintId: HintId): void;

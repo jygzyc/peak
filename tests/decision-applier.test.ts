@@ -65,8 +65,7 @@ test("decision-applier: stopExplorer revokes the claim without denying the Inten
   const graph = new TestGraph();
   const p = createProject(graph);
   const intent = graph.addIntent(p.id, { description: "running", creator: "planner" });
-  const claimed = graph.claimIntent(p.id, intent.id, "worker", 300_000);
-  const claimedEpoch = claimed.lease!.epoch;
+  graph.claimIntent(p.id, intent.id);
   const result = applyMainDecision({
     projectId: p.id,
     graph,
@@ -79,14 +78,14 @@ test("decision-applier: stopExplorer revokes the claim without denying the Inten
   assert.equal(result.explorersStopped, 1);
   assert.equal(stopped.status, "open");
   assert.equal(stopped.dispatchRequested, false);
-  assert.ok(stopped.leaseEpoch > claimedEpoch);
+  assert.equal("lease" in stopped, false);
 });
 
 test("decision-applier: failing a claimed Intent also requires stop_subagent_explorer", () => {
   const graph = new TestGraph();
   const p = createProject(graph);
   const intent = graph.addIntent(p.id, { description: "running", creator: "planner" });
-  graph.claimIntent(p.id, intent.id, "worker", 300_000);
+  graph.claimIntent(p.id, intent.id);
 
   assert.throws(() => applyMainDecision({
     projectId: p.id,
@@ -375,8 +374,10 @@ test("decision-applier: drops near-duplicate intents already in flight", () => {
     permissions: perms(["create_intent", "create_subagent_explorer"]),
   });
   assert.equal(result.intentsCreated, 1, "near-duplicate should be dropped, only the new one created");
-  const dupEvent = graph.events(p.id).find((e) => e.type === "planner.duplicate_intent_dropped");
-  assert.ok(dupEvent, "a duplicate_intent_dropped event should be logged");
+  assert.deepEqual(
+    graph.intents(p.id).map((intent) => intent.description),
+    ["try the login SQL injection", "scan the upload endpoint for vulnerabilities"],
+  );
 });
 
 test("nearDuplicateGoal: filler-word rewordings match, distinct labels don't", () => {

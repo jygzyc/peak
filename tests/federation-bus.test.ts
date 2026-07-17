@@ -107,7 +107,7 @@ test("FederationBus: scope completion is atomic with durable broadcast quiescenc
       { id: "fact:source:p1:f1", scope: "group-a" },
     ).id,
     insight.id,
-    "idempotent outbox replay remains valid after completion",
+    "idempotent insight replay remains valid after completion",
   );
 });
 

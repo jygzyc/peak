@@ -19,6 +19,8 @@ peak run task.json
 
 Four built-in roles (`planner` / `explorer` / `evaluator` / `metacog`), each fully configurable. Workers (the LLM/agent backend) are swappable per-role without touching the loop or the graph.
 
+See [architecture](./docs/README.md) and [data flow](./docs/data-flow.md) for the complete first-version design.
+
 ## Quick start
 
 ```bash
@@ -86,10 +88,10 @@ Each role returns a JSON envelope validated against its contract before any grap
 
 | Role | Contract | Envelope shape |
 |---|---|---|
-| planner | `main_decision` | `{ "kind": "decisions", "data": { createIntents, failIntents, consumeHints, concludeRun } }` |
+| planner | `main_decision` | `{ "kind": "decisions", "data": { createIntents, dispatchExplorerIntentIds, stopExplorerIntentIds, failIntents, consumeHints, concludeRun } }` |
 | explorer | `candidate_fact` | `{ "kind": "fact", "data": { description, evidence, confidence } }` |
-| evaluator | `verdict` | `{ "kind": "verdict", "data": { decision, reason, confidence, requiredConditions } }` |
-| metacog | `hints` | `{ "kind": "hints", "data": { hints: [{ content }] } }` |
+| evaluator | `verdict` / runtime broadcast assessment | candidate verdict or `{ "kind": "broadcast_assessment", ... }` |
+| metacog | `hints` / `stop` | hints for correction or an explicit stop recommendation |
 
 ### Permissions
 
@@ -108,13 +110,14 @@ Capabilities a profile's output may trigger (enforced by the decision applier):
 
 A profile's prompt is assembled from its `prompt` spec:
 
+Peak has exactly four builtin role prompts: `builtin:planner`, `builtin:explorer`, `builtin:evaluator`, and `builtin:metacog`. They define responsibility and boundaries only. `BaseAgent` appends the active output contract and its exact JSON shape at runtime, so custom profiles and evaluator broadcast mode cannot drift from validation.
+
 - `file` (required) — the system prompt source: a compiled builtin such as `builtin:planner`, or a path to your own prompt file.
 - `knowledge` — domain-knowledge text appended to the preamble. Each entry is either a file path or **raw inline text** (if it isn't a path, it's used verbatim). This is how task-specific methodology is injected without editing the framework.
 - `rules` — short behavioral rules, appended the same way as `knowledge`.
 - `instructions` — a final instruction line appended last.
-- `concludeFile` — optional builtin source or prompt file for the conclude phase.
 
-At runtime the ContextBuilder also **prepends** dynamic graph state (objective, verified facts, open intents, dead-ends, recent verdicts) according to the profile's `context.graphView`.
+At runtime the PromptBuilder composes the system preamble, server-generated context JSON reference, assignment, and active output contract in that order.
 
 ## Complete annotated example
 
@@ -135,7 +138,7 @@ A fully self-contained task that customizes all roles with inline domain knowled
       "role": "planner",
       "runtime": { "worker": "codex" },          // which worker drives this role
       "prompt": {
-        "file": "builtin:planner",              // compiled role system prompt + output contract
+        "file": "builtin:planner",              // compiled planner responsibility and boundaries
         "knowledge": [                           // inline domain knowledge (or file paths)
           "Routing matrix: exported entry -> intent redirect -> private component; provider leak -> URI grant -> file disclosure; WebView/deeplink -> JS bridge -> sink."
         ],
@@ -152,7 +155,6 @@ A fully self-contained task that customizes all roles with inline domain knowled
       "runtime": { "worker": "codex" },
       "prompt": {
         "file": "builtin:explorer",
-        "concludeFile": "builtin:explorer-conclude",  // fallback summarize phase
         "knowledge": [
           "Probe-first: inspect manifest and exported components before reading source. Cite concrete evidence (manifest line, source location) in every fact."
         ],
@@ -200,7 +202,7 @@ A fully self-contained task that customizes all roles with inline domain knowled
   },
 
   // ── scheduler: optional execution knobs (NOT a workflow) ───────────────
-  "scheduler": { "maxConcurrent": 3, "refillPerTick": 1, "workerLeaseMs": 1800000 },
+  "scheduler": { "maxConcurrent": 3, "refillPerTick": 1 },
 
   // ── control: which profiles drive planning/metacog ─────────────────────
   "control": { "mainProfile": "planner", "metacogProfile": "metacog" }
@@ -212,6 +214,7 @@ A fully self-contained task that customizes all roles with inline domain knowled
 - `prompt.file` may point at a compiled role prompt (`builtin:planner`, `builtin:explorer`, `builtin:evaluator`, or `builtin:metacog`) or an external file. Domain behavior belongs in `knowledge`, `rules`, `skills`, and `instructions`.
 - Roles never receive a Graph/SQLite handle. The server writes a role-scoped graph snapshot to `sessions/<session>/agents/<agentId>/context.json`; the validated response is written to `output.json` before any permission-checked Graph commit. `record.json` is audit data, not Graph state.
 - Session Graphs and the FederationBus are always on-disk SQLite databases; there is no in-memory or temporary database mode.
+- Graph stores task state only. Active Agent ownership, retries, cooldowns, cancellation, and federation delivery state live in SessionLoop memory, audit JSON, or the FederationBus database.
 - Swapping backends is the **only** change needed to move a task between agent runtimes — edit `workers` and each profile's `runtime.worker`.
 - Omit any role from `profiles` to keep the builtin default for it. Omit `profiles` entirely for a minimal task.
 

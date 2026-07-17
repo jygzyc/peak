@@ -23,7 +23,6 @@ export { DEFAULT_SCHEDULER, DEFAULT_METACOG_TRIGGERS, BUILTIN_ROLES, BUILTIN_PER
 // Graph interface and helpers
 export type {
   Graph, ProjectInput, FactInput, IntentInput, HintInput,
-  FederationOutboxKind, FederationOutboxInput, FederationOutboxItem,
   MetacogCommitInput,
 } from "./graph/graph.js";
 export { routeHash, now, newProjectId } from "./graph/graph.js";

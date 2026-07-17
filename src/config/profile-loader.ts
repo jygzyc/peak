@@ -134,7 +134,7 @@ function normalizePrompt(profileId: string, r: Raw): PromptSpec {
     throw new Error(`profile "${profileId}" must declare prompt.file`);
   }
   const p = promptRaw as Raw;
-  assertKnownKeys(p, ["file", "rules", "knowledge", "skills", "instructions", "concludeFile"], `profile "${profileId}" prompt`);
+  assertKnownKeys(p, ["file", "rules", "knowledge", "skills", "instructions"], `profile "${profileId}" prompt`);
   const file = str(p.file);
   if (!file) {
     throw new Error(`profile "${profileId}" must declare prompt.file`);
@@ -148,8 +148,6 @@ function normalizePrompt(profileId: string, r: Raw): PromptSpec {
   if (skills.length > 0) spec.skills = skills;
   const instructions = str(p.instructions);
   if (instructions) spec.instructions = instructions;
-  const concludeFile = str(p.concludeFile);
-  if (concludeFile) spec.concludeFile = concludeFile;
   return spec;
 }
 
@@ -170,7 +168,7 @@ function normalizeContext(r: Raw): ContextSpec {
 
 function normalizePermissions(profileId: string, role: SessionRole, r: Raw): Permission[] {
   // A profile may narrow its role's capabilities, but cannot expand past the
-  // target.md role protocol. Domain specialization belongs in prompt/config.
+  // First-version role protocol. Domain specialization belongs in prompt/config.
   if (r.permissions !== undefined) {
     if (!Array.isArray(r.permissions)) {
       throw new Error(`profile "${profileId}" permissions must be an array`);

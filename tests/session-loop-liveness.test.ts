@@ -1,7 +1,6 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
 import { TestGraph } from "./test-graph.ts";
-import { SqliteGraph } from "../dist/graph/sqlite-graph.js";
 import { MockWorker } from "../dist/worker/mock-worker.js";
 import { SessionLoop } from "../dist/session/session-loop.js";
 import { agentRecords, minimalConfig, createProject, env } from "./helper.ts";
@@ -48,11 +47,10 @@ test("liveness: repeated planner failures fail the project instead of completing
 
   assert.equal(result.type, "failed");
   assert.equal(graph.getProject(p.id)!.status, "failed");
-  assert.equal(graph.events(p.id).filter((e) => e.type === "planner.error").length, 3);
-  assert.ok(graph.events(p.id).some((e) => e.type === "project.failed_retry_exhausted"));
+  assert.equal(worker.calls().length, 3);
 });
 
-test("liveness: profile retry.maxAttempts controls the durable failure threshold", async () => {
+test("liveness: profile retry.maxAttempts controls the runtime failure threshold", async () => {
   const graph = new TestGraph();
   const worker = new MockWorker();
   const p = createProject(graph);
@@ -63,49 +61,29 @@ test("liveness: profile retry.maxAttempts controls the durable failure threshold
   const result = await new SessionLoop(graph, worker, config).step(p.id);
 
   assert.equal(result.type, "failed");
-  assert.equal(graph.events(p.id).filter((event) => event.type === "planner.error").length, 1);
+  assert.equal(worker.calls().length, 1);
 });
 
-test("liveness: planner retry.backoffMs is reconstructed from event timestamps", async () => {
+test("liveness: planner retry.backoffMs is process-local", async () => {
   const graph = new TestGraph();
   const worker = new MockWorker();
   const p = createProject(graph);
   worker.register(/automated planning module/i, "not json");
   const config = minimalConfig();
   config.profiles.planner.retry = { maxAttempts: 2, backoffMs: 80 };
-  const first = new SessionLoop(graph, worker, config);
-  await first.step(p.id);
+  const loop = new SessionLoop(graph, worker, config);
+  await loop.step(p.id);
 
-  const resumed = new SessionLoop(graph, worker, config);
-  const deferred = await resumed.step(p.id);
-  assert.equal(deferred.type, "idle");
-  assert.equal(worker.calls().length, 1, "restart must preserve the retry delay");
+  await loop.step(p.id);
+  assert.equal(worker.calls().length, 1, "backoff must suppress another live retry");
 
   await new Promise((resolve) => setTimeout(resolve, 90));
-  const exhausted = await resumed.step(p.id);
+  const exhausted = await loop.step(p.id);
   assert.equal(exhausted.type, "failed");
   assert.equal(worker.calls().length, 2);
 });
 
-test("recovery: planner retry count is rebuilt from events after runtime restart", async () => {
-  const graph = new TestGraph();
-  const worker = new MockWorker();
-  const p = createProject(graph);
-  worker.register(/automated planning module/i, "not json");
-
-  const firstRuntime = new SessionLoop(graph, worker, minimalConfig());
-  await firstRuntime.step(p.id);
-  await firstRuntime.step(p.id);
-  assert.equal(graph.getProject(p.id)!.status, "active");
-
-  const resumedRuntime = new SessionLoop(graph, worker, minimalConfig());
-  const result = await resumedRuntime.step(p.id);
-
-  assert.equal(result.type, "failed");
-  assert.equal(graph.events(p.id).filter((event) => event.type === "planner.error").length, 3);
-});
-
-test("recovery: unresolved evaluator verdict is replayed into the resumed planner prompt", async () => {
+test("recovery: persisted Fact state is visible to a resumed planner", async () => {
   const graph = new TestGraph();
   const worker = new MockWorker();
   const p = createProject(graph);
@@ -114,21 +92,10 @@ test("recovery: unresolved evaluator verdict is replayed into the resumed planne
     source: "explorer",
   });
   graph.resolveFact(p.id, fact.id, { decision: "pass", reason: "persisted verdict" });
-  worker.register(/automated planning module/i, (request) => {
-    assert.match(request.prompt, /Recent Evaluator Verdicts/);
-    assert.match(request.prompt, /persisted verdict/);
-    return env("decisions", {
-      createIntents: [],
-      failIntents: [],
-      consumeHints: [],
-      concludeRun: { description: "done", from: [fact.id] },
-    });
-  });
-
   const resumedRuntime = new SessionLoop(graph, worker, minimalConfig());
-  const result = await resumedRuntime.step(p.id);
-
-  assert.equal(result.type, "completed");
+  assert.equal(resumedRuntime.projectStatus(p.id), "active");
+  assert.equal(graph.getFact(p.id, fact.id)?.status, "pass");
+  assert.equal(graph.getFact(p.id, fact.id)?.reviewerReason, "persisted verdict");
 });
 
 test("liveness: repeated evaluator failures fail explicitly and keep the candidate pending", async () => {
@@ -150,47 +117,18 @@ test("liveness: repeated evaluator failures fail explicitly and keep the candida
   assert.equal(result.type, "failed");
   assert.equal(graph.getProject(p.id)!.status, "failed");
   assert.equal(graph.candidateFacts(p.id).length, 1, "transient evaluator errors must not deny the fact");
-  assert.equal(graph.events(p.id).filter((e) => e.type === "evaluator.error").length, 3);
+  assert.equal(worker.calls().filter((call) => call.prompt.includes("# Evaluator Role")).length, 3);
 });
 
-test("recovery: another runtime preserves an unexpired claimed Intent", () => {
+test("recovery: a new runtime reopens orphaned claimed Intents", () => {
   const graph = new TestGraph();
   const p = createProject(graph);
   const intent = graph.addIntent(p.id, { description: "orphan", creator: "planner" });
-  graph.claimIntent(p.id, intent.id, "old-worker", 300_000);
-  new SessionLoop(graph, new MockWorker(), minimalConfig());
-
-  assert.equal(graph.getIntent(p.id, intent.id)!.status, "claimed");
-  graph.close();
-});
-
-test("recovery: an expired Intent claim is swept and requeued", () => {
-  const graph = new TestGraph();
-  const p = createProject(graph);
-  const intent = graph.addIntent(p.id, { description: "expired", creator: "planner" });
-  graph.claimIntent(p.id, intent.id, "old-worker", -1);
+  graph.claimIntent(p.id, intent.id);
   new SessionLoop(graph, new MockWorker(), minimalConfig());
 
   assert.equal(graph.getIntent(p.id, intent.id)!.status, "open");
   graph.close();
-});
-
-test("fencing: a late explorer cannot commit after its intent was re-leased", () => {
-  const graph = new TestGraph();
-  const p = createProject(graph);
-  const intent = graph.addIntent(p.id, { description: "fenced", creator: "planner" });
-  const first = graph.claimIntent(p.id, intent.id, "worker-1", 300_000);
-  const firstClaim = { workerId: "worker-1", epoch: first.leaseEpoch };
-  graph.releaseIntent(p.id, intent.id, firstClaim);
-  const second = graph.claimIntent(p.id, intent.id, "worker-2", 300_000);
-
-  assert.ok(second.leaseEpoch > firstClaim.epoch);
-  assert.throws(() => graph.commitExplorerResult(p.id, intent.id, {
-    description: "late result",
-    source: "explorer",
-  }, firstClaim), /stale or expired intent lease/);
-  assert.equal(graph.facts(p.id).length, 0);
-  assert.equal(graph.getIntent(p.id, intent.id)!.lease?.workerId, "worker-2");
 });
 
 test("cancellation: stop interrupts an in-flight planner and returns stopped", async () => {

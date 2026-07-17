@@ -65,7 +65,7 @@ export function attachScenario(
     worker,
     config,
     undefined,
-    { sessionId, scope },
+    { bus, sessionId, scope },
   );
   loop.setMetacog(metacog);
   return loop;

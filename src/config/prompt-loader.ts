@@ -32,11 +32,11 @@ export interface PromptLoaderOptions {
 export class PromptLoader {
   constructor(private readonly options: PromptLoaderOptions = {}) {}
 
-  load(spec: PromptSpec, primaryKind: Extract<PromptComponentKind, "primary" | "conclude"> = "primary"): ResolvedPrompt {
+  load(spec: PromptSpec): ResolvedPrompt {
     const parts: string[] = [];
     const components: PromptManifestComponent[] = [];
 
-    const primary = this.readPrimaryComponent(spec.file, primaryKind, 0);
+    const primary = this.readPrimaryComponent(spec.file, 0);
     if (!primary || primary.text.length === 0) {
       return { preamble: "", fromConfig: false, manifest: emptyManifest() };
     }
@@ -92,21 +92,20 @@ export class PromptLoader {
 
   private readPrimaryComponent(
     source: string,
-    kind: Extract<PromptComponentKind, "primary" | "conclude">,
     index: number,
   ): { text: string; component: PromptManifestComponent } | undefined {
     const builtin = resolveBuiltinPrompt(source);
     if (builtin !== undefined) {
       const text = normalizeText(builtin);
-      return { text, component: componentFor(kind, index, source, text) };
+      return { text, component: componentFor("primary", index, source, text) };
     }
     if (isBuiltinPromptSource(source)) return undefined;
-    return this.readFileComponent(source, kind, index);
+    return this.readFileComponent(source, "primary", index);
   }
 
   private readFileComponent(
     source: string,
-    kind: Extract<PromptComponentKind, "primary" | "conclude">,
+    kind: "primary",
     index: number,
   ): { text: string; component: PromptManifestComponent } | undefined {
     if (!source) return undefined;
@@ -147,11 +146,6 @@ export class PromptLoader {
 export function resolvePromptPaths<T extends Partial<PromptSpec>>(spec: T, baseDir: string): T {
   const out = { ...spec } as Partial<PromptSpec>;
   if (spec.file) out.file = isBuiltinPromptSource(spec.file) ? spec.file : resolve(baseDir, spec.file);
-  if (spec.concludeFile) {
-    out.concludeFile = isBuiltinPromptSource(spec.concludeFile)
-      ? spec.concludeFile
-      : resolve(baseDir, spec.concludeFile);
-  }
   if (spec.rules) {
     out.rules = spec.rules.map((source) => looksLikePath(source) ? resolve(baseDir, source) : source);
   }

@@ -14,7 +14,7 @@ import { MetacogAgent } from "../agent/role-agents.js";
 import { metacogExtra } from "../agent/prompt-builder.js";
 import { PromptLoader } from "../config/prompt-loader.js";
 import { PermissionChecker } from "../agent/permissions.js";
-import type { FederationOutboxInput } from "../graph/graph.js";
+import type { FederationBus, InsightKind } from "../graph/federation-bus.js";
 import type { GlobalResourceGovernor } from "../worker/resource-governor.js";
 import type { SessionGraphReader } from "../agent/context-builder.js";
 import { ServerSessionGraphReader } from "../server/session-graph-reader.js";
@@ -35,19 +35,20 @@ export class MetacogSupervisor {
   }>();
   private readonly inFlightProjects = new Map<ProjectId, Promise<boolean>>();
   private resourceGovernor?: GlobalResourceGovernor;
-  private federation?: { sessionId: string; scope: string };
+  private federation?: { bus: FederationBus; sessionId: string; scope: string };
 
   constructor(
     private readonly graph: Graph,
     private workerPool: WorkerPool,
     private readonly config: TaskConfig,
     intervalMs?: number,
-    federation?: { sessionId: string; scope?: string },
+    federation?: { bus: FederationBus; sessionId: string; scope?: string },
     graphReader?: SessionGraphReader,
   ) {
     this.graphReader = graphReader ?? new ServerSessionGraphReader(graph);
     if (federation) {
       this.setFederation(
+        federation.bus,
         federation.sessionId,
         federation.scope ?? config.federation?.scope ?? federation.sessionId,
       );
@@ -62,9 +63,9 @@ export class MetacogSupervisor {
     this.promptLoader = new PromptLoader();
   }
 
-  setFederation(sessionId: string, scope = "default"): void {
+  setFederation(bus: FederationBus, sessionId: string, scope = "default"): void {
     if (this.closed) throw new Error("MetacogSupervisor is closed");
-    this.federation = { sessionId, scope };
+    this.federation = { bus, sessionId, scope };
   }
 
   unsetFederation(sessionId: string): void {
@@ -146,7 +147,6 @@ export class MetacogSupervisor {
   }
 
   private async executeForProject(projectId: ProjectId): Promise<boolean> {
-    this.graph.sweepExpiredLeases();
     const project = this.graph.getProject(projectId);
     if (!project || (project.status !== "active" && project.status !== "finish_proposed")) return false;
     const progress = this.graph.progress(projectId);
@@ -215,27 +215,21 @@ export class MetacogSupervisor {
         const finalReviewCompleted = finalReview && !factToReview
           && result.output.hints.hints.length === 0
           && this.graph.getProject(projectId)?.status === "finish_proposed";
-        const broadcast = this.buildOutboxItem(
+        const broadcast = this.buildBroadcast(
           projectId,
           factToReview,
           finalReviewCompleted,
         );
         if (broadcast) permissions.require("send_fact_broadcast");
+        if (broadcast) this.publishBroadcast(projectId, broadcast);
         this.graph.commitMetacogResult(projectId, {
           hints: result.output.hints.hints,
-          outputSummary: `${result.output.hints.hints.length} hints`,
           reviewedFactId: factToReview?.id,
-          broadcast,
           finalReviewCompleted,
         });
         await agent.updateRecord(result.agentId, {
           status: "applied",
           outputSummary: `${result.output.hints.hints.length} hints`,
-        });
-        this.graph.logEvent(projectId, "metacog.completed", {
-          agentId: result.agentId,
-          trigger,
-          factId: factToReview?.id,
         });
         return result.output.hints.hints.length > 0;
       } else {
@@ -245,31 +239,20 @@ export class MetacogSupervisor {
           kind: "warning" as const,
           content: `Metacog recommends ending or redirecting the task: ${result.output.stop.reason}`,
         };
-        const broadcast = this.buildOutboxItem(projectId, factToReview, false);
+        const broadcast = this.buildBroadcast(projectId, factToReview, false);
         if (broadcast) permissions.require("send_fact_broadcast");
+        if (broadcast) this.publishBroadcast(projectId, broadcast);
         this.graph.commitMetacogResult(projectId, {
           hints: [hint],
-          outputSummary: `end recommendation: ${result.output.stop.reason}`,
           reviewedFactId: factToReview?.id,
-          broadcast,
         });
         await agent.updateRecord(result.agentId, {
           status: "applied",
           outputSummary: `end recommendation: ${result.output.stop.reason}`,
         });
-        this.graph.logEvent(projectId, "metacog.completed", {
-          agentId: result.agentId,
-          trigger,
-          factId: factToReview?.id,
-        });
-        this.graph.logEvent(projectId, "metacog.end_recommendation", { reason: result.output.stop.reason });
         return true;
       }
     } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
-      this.graph.logEvent(projectId, controller.signal.aborted ? "metacog.cancelled" : "metacog.error", {
-        error: reason,
-      });
       return false;
     } finally {
       const active = this.activeControllers.get(projectId);
@@ -279,16 +262,15 @@ export class MetacogSupervisor {
     }
   }
 
-  private buildOutboxItem(
+  private buildBroadcast(
     projectId: ProjectId,
     fact: Fact | undefined,
     finalReviewCompleted: boolean,
-  ): FederationOutboxInput | undefined {
+  ): BroadcastInput | undefined {
     if (!this.federation) return undefined;
     if (fact) {
       return {
         eventId: `fact:${this.federation.sessionId}:${projectId}:${fact.id}`,
-        scope: this.federation.scope,
         kind: "fact",
         sourceFactId: fact.id,
         summary: fact.description,
@@ -300,12 +282,36 @@ export class MetacogSupervisor {
     if (!endFact) return undefined;
     return {
       eventId: `summary:${this.federation.sessionId}:${projectId}:${endFact.id}`,
-      scope: this.federation.scope,
       kind: "session_summary",
       summary: endFact.description,
       confidence: 1,
     };
   }
 
+  private publishBroadcast(projectId: ProjectId, broadcast: BroadcastInput): void {
+    const federation = this.federation;
+    if (!federation) return;
+    federation.bus.publishInsight(
+      broadcast.kind,
+      {
+        sessionId: federation.sessionId,
+        projectId,
+        factId: broadcast.sourceFactId,
+      },
+      broadcast.summary,
+      broadcast.confidence,
+      undefined,
+      { id: broadcast.eventId, scope: federation.scope },
+    );
+  }
+
   private readonly graphReader: SessionGraphReader;
+}
+
+interface BroadcastInput {
+  eventId: string;
+  kind: Extract<InsightKind, "fact" | "session_summary">;
+  sourceFactId?: string;
+  summary: string;
+  confidence: number;
 }

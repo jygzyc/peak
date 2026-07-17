@@ -94,47 +94,20 @@ test("SqliteGraph: deferred fact persists and can be promoted", () => {
   g2.close();
 });
 
-test("SqliteGraph: metacog outbox commit is durable and idempotently publishable", () => {
+test("SqliteGraph: task graph schema excludes federation delivery state", () => {
   const dir = tempDir();
-  const dbPath = join(dir, "outbox.db");
+  const dbPath = join(dir, "task-state.db");
   const graph = new SqliteGraph(dbPath);
-  const project = graph.createProject({
+  graph.createProject({
     session: "outbox", name: "n", target: "T", goal: "G",
     worker: "w", sessionDir: dir, configPath: "/tmp", taskConfig: config(),
   });
-  graph.commitMetacogResult(project.id, {
-    hints: [],
-    outputSummary: "0 hints",
-    broadcast: {
-      eventId: "fact:s:project:f001",
-      scope: "group-a",
-      kind: "fact",
-      sourceFactId: "f001",
-      summary: "durable finding",
-      confidence: 0.9,
-    },
-  });
-  assert.equal(graph.federationOutbox(project.id, "pending").length, 1);
   graph.close();
-
-  const reopened = new SqliteGraph(dbPath);
-  const loaded = reopened.getProject("outbox")!;
-  assert.equal(reopened.federationOutbox(loaded.id, "pending").length, 1);
-  reopened.markFederationOutboxPublished(
-    loaded.id,
-    "fact:s:project:f001",
-    "fact:s:project:f001",
-    42,
-  );
-  reopened.markFederationOutboxPublished(
-    loaded.id,
-    "fact:s:project:f001",
-    "fact:s:project:f001",
-    42,
-  );
-  assert.equal(reopened.federationOutbox(loaded.id, "pending").length, 0);
-  assert.equal(reopened.federationOutbox(loaded.id, "published")[0]!.broadcastSeq, 42);
-  reopened.close();
+  const raw = new DatabaseSync(dbPath);
+  assert.equal(raw.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'federation_outbox'",
+  ).get(), undefined);
+  raw.close();
 });
 
 
@@ -257,11 +230,13 @@ test("SqliteGraph: intent_sets is the canonical ordered source store", () => {
 
   const raw = new DatabaseSync(dbPath);
   assert.equal((raw.prepare("PRAGMA application_id").get() as { application_id: number }).application_id, 1346715981);
-  assert.equal((raw.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 1);
+  assert.equal((raw.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 2);
   const intentColumns = raw.prepare("PRAGMA table_info(intents)").all()
     .map((row) => String((row as { name: string }).name));
   assert.equal(intentColumns.includes("parent_fact_ids_json"), false);
   assert.equal(intentColumns.includes("chain_json"), false);
+  assert.equal(intentColumns.includes("lease_worker_id"), false);
+  assert.equal(intentColumns.includes("lease_epoch"), false);
   assert.equal(raw.prepare(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'subagent_runs'",
   ).get(), undefined);

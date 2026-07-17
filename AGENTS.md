@@ -43,7 +43,7 @@ Core principles:
 6. Each active session has its own MainAgent/Planner and Metacog; the global layer only supervises.
 7. Session-internal sync goes through Graph/events; cross-session insight goes through FederationBus (read-only summary + refs, never cross-session graph writes).
 
-Per-file audit of `src/` (purpose, exports, dependencies, bugs, dead code per file) lives in `docs/` — start at `docs/README.md` for the cross-cutting findings summary and recommended audit order before touching `src/agent/`, `src/session/`, or `src/config/`.
+Architecture and runtime data flow are documented in `docs/README.md` and `docs/data-flow.md`.
 
 ## Source layout
 
@@ -79,7 +79,7 @@ Important points:
 - `profiles` declares SubagentProfiles. The built-in slots are `planner`, `explorer`, `evaluator`, and optional `metacog`; custom profiles (e.g. `source-finder`, `strict-reviewer`) live under arbitrary keys.
 - A SubagentProfile binds together: `runtime` (worker + optional model), `prompt` (file/text/rules/knowledge), `context` (graphView + maxFacts), `permissions` (capability tokens), `output` (contract name), plus per-agent tuning knobs: `maxActive`, `cooldownSteps` (planner), `triggers` (metacog), `intervalSeconds`.
 - `workers` defines low-level worker configs (`kind: "agent" | "api" | "mock"`).
-- **There is no `workflow` concept.** Termination is natural (planner produces no new intent). `scheduler` (`maxConcurrent`/`refillPerTick`/`workerLeaseMs`) is the only top-level execution knob and is optional. A `workflow` field is rejected as outside the first-version config schema.
+- **There is no `workflow` concept.** Termination is natural (planner produces no new intent). `scheduler` (`maxConcurrent`/`refillPerTick`) is the only top-level execution knob and is optional. A `workflow` field is rejected as outside the first-version config schema.
 - `control.mainProfile` and `control.metacogProfile` select which profiles drive planning and metacognition. Metacog cadence belongs to `profiles.<id>.triggers.everySeconds`.
 
 ## Peak home layout (`~/.peak/`)
@@ -115,6 +115,8 @@ Graph state is session-local and is the source of truth:
 - Dead-end route hashes
 
 Role invocation state is intentionally not part of Graph. Active controllers, cancellation, and concurrency live in the runtime; `agents/<agentId>/record.json` records the invocation after the fact.
+
+Intent stores only task state (`open/claimed/pass/deny`). Worker ownership, lease epochs, heartbeats, retry counters, planner cooldowns, and federation delivery state are not Graph data. A new SessionLoop reopens orphaned `claimed` Intents; the FederationBus persists its own insights, deliveries, and cursors.
 
 Do not introduce domain-specific fact enums. Keep domain meaning in descriptions, evidence, prompts, and references.
 

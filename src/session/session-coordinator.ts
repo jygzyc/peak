@@ -1,11 +1,9 @@
-/** Durable coordinator queries derived exclusively from Graph events.
+/** Process-local coordination state for one SessionLoop.
  *
- * This class intentionally owns no mutable cursor Map. Reconstructing it after
- * a process restart produces the same verdict inbox, retry counters, and
- * planner cooldown position as the previous coordinator observed.
+ * Retry counters, planner cooldowns and delivery notifications control live
+ * execution. They are deliberately not part of the persistent task Graph.
  */
 import type { ProjectId, Verdict } from "../agent/types.js";
-import type { Graph } from "../graph/graph.js";
 
 export interface RecentVerdict {
   factId: string;
@@ -13,79 +11,78 @@ export interface RecentVerdict {
   intentId?: string;
 }
 
-export class SessionCoordinator {
-  constructor(private readonly graph: Graph) {}
+interface FailureState {
+  count: number;
+  lastAt: number;
+}
 
-  lastPlannerDecisionSeq(projectId: ProjectId): number {
-    return this.lastEvent(projectId, "planner.decision_applied")?.seq ?? 0;
-  }
+interface ProjectRuntimeState {
+  lastPlannerStep: number;
+  recentVerdicts: RecentVerdict[];
+  relevantBroadcast: boolean;
+  failures: Map<string, FailureState>;
+}
+
+export class SessionCoordinator {
+  private readonly projects = new Map<ProjectId, ProjectRuntimeState>();
 
   lastPlannerStep(projectId: ProjectId): number {
-    return Number(this.lastEvent(projectId, "planner.decision_applied")?.payload.stepsExecuted ?? -99);
+    return this.state(projectId).lastPlannerStep;
+  }
+
+  recordPlannerDecision(projectId: ProjectId, step: number): void {
+    const state = this.state(projectId);
+    state.lastPlannerStep = step;
+    state.recentVerdicts = [];
+    state.relevantBroadcast = false;
+    state.failures.delete("planner");
   }
 
   recentVerdicts(projectId: ProjectId): RecentVerdict[] {
-    const cursor = this.lastPlannerDecisionSeq(projectId);
-    return this.graph.events(projectId).flatMap((event) => {
-      if (event.seq <= cursor || event.type !== "fact.resolved") return [];
-      const factId = typeof event.payload.factId === "string" ? event.payload.factId : undefined;
-      const verdict = event.payload.verdict;
-      if (!factId || !verdict || typeof verdict !== "object" || Array.isArray(verdict)) return [];
-      const decision = (verdict as Record<string, unknown>).decision;
-      const reason = (verdict as Record<string, unknown>).reason;
-      if ((decision !== "pass" && decision !== "deny" && decision !== "pending")
-        || typeof reason !== "string") return [];
-      return [{
-        factId,
-        verdict: verdict as Verdict,
-        intentId: this.graph.getFact(projectId, factId)?.parentIntentId,
-      }];
-    });
+    return [...this.state(projectId).recentVerdicts];
+  }
+
+  recordVerdict(projectId: ProjectId, verdict: RecentVerdict): void {
+    this.state(projectId).recentVerdicts.push(verdict);
   }
 
   hasRelevantBroadcastSincePlanner(projectId: ProjectId): boolean {
-    const cursor = this.lastPlannerDecisionSeq(projectId);
-    return this.graph.events(projectId).some((event) =>
-      event.seq > cursor
-      && event.type === "federation.broadcast_assessed"
-      && event.payload.decision !== "irrelevant");
+    return this.state(projectId).relevantBroadcast;
   }
 
-  plannerFailureCount(projectId: ProjectId): number {
-    const cursor = this.lastPlannerDecisionSeq(projectId);
-    return this.graph.events(projectId).filter((event) =>
-      event.seq > cursor && event.type === "planner.error").length;
+  recordRelevantBroadcast(projectId: ProjectId): void {
+    this.state(projectId).relevantBroadcast = true;
   }
 
-  explorerFailureCount(projectId: ProjectId, intentId: string): number {
-    return this.graph.events(projectId).filter((event) =>
-      event.type === "explorer.error" && event.payload.intentId === intentId).length;
+  recordFailure(projectId: ProjectId, key: string): number {
+    const failures = this.state(projectId).failures;
+    const current = failures.get(key);
+    const next = { count: (current?.count ?? 0) + 1, lastAt: Date.now() };
+    failures.set(key, next);
+    return next.count;
   }
 
-  evaluatorFailureCount(projectId: ProjectId, factId: string): number {
-    return this.graph.events(projectId).filter((event) =>
-      event.type === "evaluator.error" && event.payload.factId === factId).length;
+  failureCount(projectId: ProjectId, key: string): number {
+    return this.state(projectId).failures.get(key)?.count ?? 0;
   }
 
-  broadcastFailureCount(projectId: ProjectId, broadcastId: string): number {
-    return this.graph.events(projectId).filter((event) =>
-      event.type === "federation.broadcast_error" && event.payload.broadcastId === broadcastId).length;
-  }
-
-  retryDelayRemaining(
-    projectId: ProjectId,
-    eventType: string,
-    backoffMs: number,
-    afterSeq = 0,
-  ): number {
+  retryDelayRemaining(projectId: ProjectId, key: string, backoffMs: number): number {
     if (backoffMs <= 0) return 0;
-    const event = [...this.graph.events(projectId)].reverse().find((candidate) =>
-      candidate.seq > afterSeq && candidate.type === eventType);
-    if (!event) return 0;
-    return Math.max(0, Date.parse(event.timestamp) + backoffMs - Date.now());
+    const failure = this.state(projectId).failures.get(key);
+    return failure ? Math.max(0, failure.lastAt + backoffMs - Date.now()) : 0;
   }
 
-  private lastEvent(projectId: ProjectId, type: string) {
-    return [...this.graph.events(projectId)].reverse().find((event) => event.type === type);
+  private state(projectId: ProjectId): ProjectRuntimeState {
+    let state = this.projects.get(projectId);
+    if (!state) {
+      state = {
+        lastPlannerStep: -99,
+        recentVerdicts: [],
+        relevantBroadcast: false,
+        failures: new Map(),
+      };
+      this.projects.set(projectId, state);
+    }
+    return state;
   }
 }

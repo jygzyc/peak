@@ -105,7 +105,6 @@ export class FederatedGraph {
               status: String(row.status) as Intent["status"],
               dispatchRequested: Number(row.dispatch_requested ?? 1) !== 0,
               parentIntentId: row.parent_intent_id ? String(row.parent_intent_id) : undefined,
-              leaseEpoch: Number(row.lease_epoch ?? 0),
               priority: Number(row.priority),
               createdAt: String(row.created_at),
             },

@@ -16,7 +16,7 @@ function builtinProfile(
   promptId: string,
   contract: string,
   graphView: string,
-  extra?: { cooldownSteps?: number; triggers?: MetacogTriggers; concludeFile?: string },
+  extra?: { cooldownSteps?: number; triggers?: MetacogTriggers },
 ): SubagentProfile {
   const profile: SubagentProfile = {
     role,
@@ -28,7 +28,6 @@ function builtinProfile(
   };
   if (extra?.cooldownSteps !== undefined) profile.cooldownSteps = extra.cooldownSteps;
   if (extra?.triggers) profile.triggers = extra.triggers;
-  if (extra?.concludeFile) profile.prompt.concludeFile = `builtin:${extra.concludeFile}`;
   return profile;
 }
 
@@ -38,12 +37,12 @@ export function minimalConfig(workerName = "mock"): TaskConfig {
     task: { target: "test-target", goal: "test-goal" },
     profiles: {
       planner: builtinProfile("planner", "planner", "main_decision", "full", { cooldownSteps: 3 }),
-      explorer: builtinProfile("explorer", "explorer", "candidate_fact", "focused", { concludeFile: "explorer-conclude" }),
+      explorer: builtinProfile("explorer", "explorer", "candidate_fact", "focused"),
       evaluator: builtinProfile("evaluator", "evaluator", "verdict", "evidence-only"),
       metacog: builtinProfile("metacog", "metacog", "hints", "summary", { triggers: { ...DEFAULT_METACOG_TRIGGERS } }),
     },
     workers,
-    scheduler: { maxConcurrent: 2, refillPerTick: 1, workerLeaseMs: 300_000 },
+    scheduler: { maxConcurrent: 2, refillPerTick: 1 },
     control: { mainProfile: "planner", metacogProfile: "metacog" },
   };
 }

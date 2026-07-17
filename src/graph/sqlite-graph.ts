@@ -2,7 +2,7 @@
  * SQLite-backed Graph implementation.
  *
  * Persists projects, facts, intents, hints, directives, events, counters,
- * leases, and dead-end records for resumable agent runs. It is the production
+ * and dead-end records. It is the production
  * state store used by CLI/runtime sessions.
  */
 
@@ -15,8 +15,7 @@ import type {
 } from "../agent/types.js";
 import {
   type FactInput, type HintInput, type IntentInput, type ProjectInput,
-  type IntentLeaseClaim,
-  type FederationOutboxItem, type Graph, type MetacogCommitInput,
+  type Graph, type MetacogCommitInput,
   newProjectId, now, routeHash,
 } from "./graph.js";
 
@@ -27,7 +26,7 @@ PRAGMA journal_mode=WAL;
 PRAGMA busy_timeout=5000;
 PRAGMA foreign_keys=ON;
 PRAGMA application_id=${GRAPH_APPLICATION_ID};
-PRAGMA user_version=1;
+PRAGMA user_version=2;
 
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
@@ -70,10 +69,6 @@ CREATE TABLE IF NOT EXISTS intents (
   parent_intent_id TEXT,
   priority INTEGER NOT NULL DEFAULT 0,
   dispatch_requested INTEGER NOT NULL,
-  lease_worker_id TEXT,
-  lease_epoch INTEGER NOT NULL DEFAULT 0,
-  lease_claimed_at TEXT,
-  lease_expires_at TEXT,
   created_at TEXT NOT NULL,
   concluded_at TEXT,
   concluded_fact_id TEXT,
@@ -105,31 +100,6 @@ CREATE TABLE IF NOT EXISTS end_facts (
   PRIMARY KEY (project_id, id),
   FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
-
-CREATE TABLE IF NOT EXISTS federation_outbox (
-  event_id TEXT NOT NULL,
-  project_id TEXT NOT NULL,
-  scope TEXT NOT NULL,
-  kind TEXT NOT NULL,
-  source_fact_id TEXT,
-  summary TEXT NOT NULL,
-  confidence REAL NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
-  dispatch_key TEXT,
-  owner_id TEXT,
-  attempt INTEGER NOT NULL DEFAULT 0,
-  lease_epoch INTEGER NOT NULL DEFAULT 0,
-  heartbeat_at TEXT,
-  lease_expires_at TEXT,
-  created_at TEXT NOT NULL,
-  published_at TEXT,
-  broadcast_id TEXT,
-  broadcast_seq INTEGER,
-  PRIMARY KEY (project_id, event_id),
-  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS idx_federation_outbox_project_status
-  ON federation_outbox(project_id, status);
 
 CREATE TABLE IF NOT EXISTS hints (
   id TEXT NOT NULL,
@@ -376,7 +346,7 @@ export class SqliteGraph implements Graph {
         id, projectId, description: input.description, creator: input.creator,
         parentFactIds: parentIds, status: "open",
         dispatchRequested: input.dispatchRequested ?? false,
-        parentIntentId: input.parentIntentId, leaseEpoch: 0,
+        parentIntentId: input.parentIntentId,
         priority: input.priority ?? 0, createdAt: ts,
       };
       this.run(
@@ -420,7 +390,7 @@ export class SqliteGraph implements Graph {
   stopExplorer(projectId: ProjectId, intentId: IntentId, reason: string): void {
     this.transaction(() => {
       const intent = this.get(
-        "SELECT status, lease_epoch FROM intents WHERE project_id = ? AND id = ?",
+        "SELECT status FROM intents WHERE project_id = ? AND id = ?",
         projectId,
         intentId,
       );
@@ -428,21 +398,16 @@ export class SqliteGraph implements Graph {
       if (intent.status === "pass" || intent.status === "deny") {
         throw new Error(`intent is already terminal: ${intentId}`);
       }
-      const revoke = intent.status === "claimed" ? 1 : 0;
       this.run(
         `UPDATE intents
-         SET status = 'open', dispatch_requested = 0,
-             lease_worker_id = NULL, lease_claimed_at = NULL, lease_expires_at = NULL,
-             lease_epoch = lease_epoch + ?
+         SET status = 'open', dispatch_requested = 0
          WHERE project_id = ? AND id = ?`,
-        revoke,
         projectId,
         intentId,
       );
       this.logEvent(projectId, "planner.explorer_stopped", {
         intentId,
         reason,
-        leaseEpoch: Number(intent.lease_epoch ?? 0) + revoke,
       });
     });
   }
@@ -460,58 +425,32 @@ export class SqliteGraph implements Graph {
     return rows.map((r) => intentFromRow(r, this.loadIntentSources(projectId, String(r.id))));
   }
 
-  claimIntent(projectId: ProjectId, intentId: IntentId, workerId: string, leaseMs: number): Intent {
+  claimIntent(projectId: ProjectId, intentId: IntentId): Intent {
     return this.transaction(() => {
-      const t = Date.now();
-      const claimedAt = new Date(t).toISOString();
-      const expiresAt = new Date(t + leaseMs).toISOString();
-      const result = this.run("UPDATE intents SET status = 'claimed', lease_worker_id = ?, lease_epoch = lease_epoch + 1, lease_claimed_at = ?, lease_expires_at = ? WHERE project_id = ? AND id = ? AND status = 'open'",
-        workerId, claimedAt, expiresAt, projectId, intentId);
+      const result = this.run(
+        "UPDATE intents SET status = 'claimed' WHERE project_id = ? AND id = ? AND status = 'open'",
+        projectId,
+        intentId,
+      );
       if (result.changes !== 1) {
         const row = this.get("SELECT status FROM intents WHERE project_id = ? AND id = ?", projectId, intentId);
         if (!row) throw new Error(`intent not found: ${intentId}`);
         throw new Error(`intent is not open: ${intentId} (status=${row.status})`);
       }
       const claimed = this.getIntent(projectId, intentId)!;
-      this.logEvent(projectId, "intent.claimed", { intentId, workerId, epoch: claimed.leaseEpoch });
+      this.logEvent(projectId, "intent.claimed", { intentId });
       return claimed;
     });
   }
 
-  renewIntentLease(
-    projectId: ProjectId,
-    intentId: IntentId,
-    expected: IntentLeaseClaim,
-    leaseMs: number,
-  ): void {
-    const current = now();
-    const result = this.run(
-      `UPDATE intents
-       SET lease_expires_at = ?
-       WHERE project_id = ? AND id = ? AND status = 'claimed'
-         AND lease_worker_id = ? AND lease_epoch = ?
-         AND lease_expires_at IS NOT NULL AND lease_expires_at > ?`,
-      new Date(Date.now() + leaseMs).toISOString(),
-      projectId,
-      intentId,
-      expected.workerId,
-      expected.epoch,
-      current,
-    );
-    if (result.changes !== 1) throw new Error(`stale or expired intent lease: ${intentId}`);
-  }
-
-  releaseIntent(projectId: ProjectId, intentId: IntentId, expected?: IntentLeaseClaim): void {
+  releaseIntent(projectId: ProjectId, intentId: IntentId): void {
     this.transaction(() => {
-      const row = this.get("SELECT status, lease_worker_id, lease_epoch FROM intents WHERE project_id = ? AND id = ?", projectId, intentId);
+      const row = this.get("SELECT status FROM intents WHERE project_id = ? AND id = ?", projectId, intentId);
       if (!row) throw new Error(`intent not found: ${intentId}`);
       if (row.status === "claimed") {
-        if (expected && (row.lease_worker_id !== expected.workerId || Number(row.lease_epoch) !== expected.epoch)) {
-          throw new Error(`stale intent lease: ${intentId}`);
-        }
-        this.run("UPDATE intents SET status = 'open', lease_worker_id = NULL, lease_claimed_at = NULL, lease_expires_at = NULL WHERE project_id = ? AND id = ?",
+        this.run("UPDATE intents SET status = 'open' WHERE project_id = ? AND id = ?",
           projectId, intentId);
-        this.logEvent(projectId, "intent.released", { intentId, epoch: expected?.epoch });
+        this.logEvent(projectId, "intent.released", { intentId });
       }
     });
   }
@@ -522,7 +461,7 @@ export class SqliteGraph implements Graph {
       if (!row) throw new Error(`intent not found: ${intentId}`);
       if (row.status === "pass" || row.status === "deny") throw new Error(`intent already concluded: ${intentId}`);
       const ts = now();
-      this.run("UPDATE intents SET status = 'pass', concluded_at = ?, concluded_fact_id = ?, lease_worker_id = NULL, lease_claimed_at = NULL, lease_expires_at = NULL WHERE project_id = ? AND id = ?",
+      this.run("UPDATE intents SET status = 'pass', concluded_at = ?, concluded_fact_id = ? WHERE project_id = ? AND id = ?",
         ts, factId ?? null, projectId, intentId);
       this.bumpStep(projectId);
       this.logEvent(projectId, "intent.concluded", { intentId, factId });
@@ -536,7 +475,7 @@ export class SqliteGraph implements Graph {
       if (row.status === "deny") throw new Error(`intent already failed: ${intentId}`);
       const wasDone = row.status === "pass";
       const ts = now();
-      this.run("UPDATE intents SET status = 'deny', concluded_at = ?, failure_reason = ?, killed_by = ?, lease_worker_id = NULL, lease_claimed_at = NULL, lease_expires_at = NULL WHERE project_id = ? AND id = ?",
+      this.run("UPDATE intents SET status = 'deny', concluded_at = ?, failure_reason = ?, killed_by = ? WHERE project_id = ? AND id = ?",
         ts, reason, killedBy ?? null, projectId, intentId);
       if (recordDeadEnd) {
         const descRow = this.get("SELECT description FROM intents WHERE project_id = ? AND id = ?", projectId, intentId);
@@ -557,37 +496,6 @@ export class SqliteGraph implements Graph {
     const hash = routeHash(description);
     const row = this.get("SELECT 1 FROM dead_ends WHERE project_id = ? AND route_hash = ?", projectId, hash);
     return !!row;
-  }
-
-  sweepExpiredLeases(): number {
-    return this.transaction(() => {
-      const nowIso = now();
-      let swept = 0;
-      const intents = this.all(
-        "SELECT project_id, id, lease_epoch FROM intents WHERE status = 'claimed' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?",
-        nowIso,
-      );
-      for (const row of intents) {
-        const result = this.run(
-          `UPDATE intents
-           SET status = 'open', lease_worker_id = NULL, lease_claimed_at = NULL, lease_expires_at = NULL
-           WHERE project_id = ? AND id = ? AND status = 'claimed' AND lease_epoch = ?
-             AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`,
-          row.project_id,
-          row.id,
-          row.lease_epoch,
-          nowIso,
-        );
-        if (result.changes !== 1) continue;
-        swept += 1;
-        this.logEvent(String(row.project_id), "intent.lease_expired", {
-          intentId: String(row.id),
-          epoch: Number(row.lease_epoch ?? 0),
-        });
-      }
-
-      return swept;
-    });
   }
 
   createEndFact(projectId: ProjectId, description: string, fromFactIds: FactId[]): EndFact {
@@ -643,7 +551,6 @@ export class SqliteGraph implements Graph {
     projectId: ProjectId,
     intentId: IntentId,
     input: FactInput,
-    expected: IntentLeaseClaim,
   ): Fact {
     return this.transaction(() => {
       const project = this.get("SELECT status FROM projects WHERE id = ?", projectId);
@@ -651,16 +558,11 @@ export class SqliteGraph implements Graph {
         throw new Error("explorer result cannot commit after project leaves active state");
       }
       const intent = this.get(
-        "SELECT status, lease_worker_id, lease_epoch, lease_expires_at FROM intents WHERE project_id = ? AND id = ?",
+        "SELECT status FROM intents WHERE project_id = ? AND id = ?",
         projectId,
         intentId,
       );
       if (!intent || intent.status !== "claimed") throw new Error(`intent is not claimed: ${intentId}`);
-      if (intent.lease_worker_id !== expected.workerId
-        || Number(intent.lease_epoch) !== expected.epoch
-        || String(intent.lease_expires_at ?? "") <= now()) {
-        throw new Error(`stale or expired intent lease: ${intentId}`);
-      }
       const fact = this.addFact(projectId, { ...input, parentIntentId: intentId });
       this.concludeIntent(projectId, intentId, fact.id);
       return fact;
@@ -723,85 +625,14 @@ export class SqliteGraph implements Graph {
         throw new Error("metacog result cannot commit after project stops");
       }
       for (const hint of input.hints) this.addHint(projectId, hint);
-      if (input.broadcast) {
-        const createdAt = now();
-        const inserted = this.run(
-          `INSERT OR IGNORE INTO federation_outbox
-           (event_id, project_id, scope, kind, source_fact_id, summary, confidence, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
-          input.broadcast.eventId,
-          projectId,
-          input.broadcast.scope,
-          input.broadcast.kind,
-          input.broadcast.sourceFactId ?? null,
-          input.broadcast.summary,
-          input.broadcast.confidence,
-          createdAt,
-        );
-        if (inserted.changes > 0) {
-          this.logEvent(projectId, "federation.outbox_enqueued", {
-            eventId: input.broadcast.eventId,
-            kind: input.broadcast.kind,
-            sourceFactId: input.broadcast.sourceFactId,
-          });
-        }
-      }
       if (input.reviewedFactId) {
         this.logEvent(projectId, "metacog.fact_reviewed", {
           factId: input.reviewedFactId,
-          outboxEventId: input.broadcast?.eventId,
         });
       }
       if (input.finalReviewCompleted && this.getProject(projectId)?.status === "finish_proposed") {
-        this.logEvent(projectId, "metacog.final_review_completed", {
-          outboxEventId: input.broadcast?.eventId,
-        });
+        this.logEvent(projectId, "metacog.final_review_completed");
       }
-    });
-  }
-
-  federationOutbox(
-    projectId: ProjectId,
-    status?: FederationOutboxItem["status"],
-  ): FederationOutboxItem[] {
-    const rows = status
-      ? this.all(
-          "SELECT * FROM federation_outbox WHERE project_id = ? AND status = ? ORDER BY created_at, event_id",
-          projectId,
-          status,
-        )
-      : this.all(
-          "SELECT * FROM federation_outbox WHERE project_id = ? ORDER BY created_at, event_id",
-          projectId,
-        );
-    return rows.map(federationOutboxFromRow);
-  }
-
-  markFederationOutboxPublished(
-    projectId: ProjectId,
-    eventId: string,
-    broadcastId: string,
-    broadcastSeq: number,
-  ): void {
-    this.transaction(() => {
-      const existing = this.get(
-        "SELECT status FROM federation_outbox WHERE project_id = ? AND event_id = ?",
-        projectId,
-        eventId,
-      );
-      if (!existing) throw new Error(`federation outbox item not found: ${eventId}`);
-      if (existing.status === "published") return;
-      this.run(
-        `UPDATE federation_outbox
-         SET status = 'published', published_at = ?, broadcast_id = ?, broadcast_seq = ?
-         WHERE project_id = ? AND event_id = ? AND status = 'pending'`,
-        now(), broadcastId, broadcastSeq, projectId, eventId,
-      );
-      this.logEvent(projectId, "federation.outbox_published", {
-        eventId,
-        broadcastId,
-        broadcastSeq,
-      });
     });
   }
 
@@ -996,8 +827,8 @@ function assertDatabaseIdentity(db: DatabaseSync, applicationId: number, label: 
     throw new Error(`${label} database does not use the first-version schema`);
   }
   const version = db.prepare("PRAGMA user_version").get() as { user_version: number };
-  if (Number(version.user_version) !== 1) {
-    throw new Error(`${label} database schema version must be 1`);
+  if (Number(version.user_version) !== 2) {
+    throw new Error(`${label} database schema version must be 2`);
   }
 }
 
@@ -1052,13 +883,6 @@ function intentFromRow(row: Record<string, unknown>, sources: string[]): Intent 
     status: String(row.status) as IntentStatus,
     dispatchRequested: Number(row.dispatch_requested) !== 0,
     parentIntentId: row.parent_intent_id ? String(row.parent_intent_id) : undefined,
-    leaseEpoch: Number(row.lease_epoch),
-    lease: row.lease_worker_id ? {
-      workerId: String(row.lease_worker_id),
-      epoch: Number(row.lease_epoch),
-      claimedAt: String(row.lease_claimed_at),
-      expiresAt: String(row.lease_expires_at),
-    } : undefined,
     priority: Number(row.priority),
     createdAt: String(row.created_at),
     concludedAt: row.concluded_at ? String(row.concluded_at) : undefined,
@@ -1095,24 +919,5 @@ function eventFromRow(row: Record<string, unknown>): GraphEvent {
     type: String(row.type),
     payload: JSON.parse(String(row.payload_json ?? "{}")),
     timestamp: String(row.timestamp),
-  };
-}
-
-function federationOutboxFromRow(row: Record<string, unknown>): FederationOutboxItem {
-  return {
-    eventId: String(row.event_id),
-    projectId: String(row.project_id),
-    scope: String(row.scope),
-    kind: String(row.kind) as FederationOutboxItem["kind"],
-    sourceFactId: row.source_fact_id ? String(row.source_fact_id) : undefined,
-    summary: String(row.summary),
-    confidence: Number(row.confidence),
-    status: String(row.status) as FederationOutboxItem["status"],
-    createdAt: String(row.created_at),
-    publishedAt: row.published_at ? String(row.published_at) : undefined,
-    broadcastId: row.broadcast_id ? String(row.broadcast_id) : undefined,
-    broadcastSeq: row.broadcast_seq !== null && row.broadcast_seq !== undefined
-      ? Number(row.broadcast_seq)
-      : undefined,
   };
 }

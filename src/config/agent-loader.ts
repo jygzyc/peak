@@ -171,7 +171,6 @@ function mergePrompt(base: PromptSpec, patch?: Partial<PromptSpec>): PromptSpec 
     ...(patch.knowledge ? { knowledge: patch.knowledge } : base.knowledge ? { knowledge: base.knowledge } : {}),
     ...(patch.skills ? { skills: patch.skills } : base.skills ? { skills: base.skills } : {}),
     ...(patch.instructions ? { instructions: patch.instructions } : base.instructions ? { instructions: base.instructions } : {}),
-    ...(patch.concludeFile ? { concludeFile: patch.concludeFile } : base.concludeFile ? { concludeFile: base.concludeFile } : {}),
   };
 }
 

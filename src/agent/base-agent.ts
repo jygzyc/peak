@@ -17,6 +17,7 @@ import {
   validateCandidateFact,
   validateHints,
   validateMainDecision,
+  outputContractInstructions,
   validateStop,
   validateVerdict,
   type CandidateFact,
@@ -68,7 +69,6 @@ export interface BaseAgentResult {
   output: AgentOutput;
   rawText: string;
   prompt: string;
-  usedConclude?: boolean;
   promptHash: string;
   promptManifest: PromptManifest;
 }
@@ -160,11 +160,7 @@ export class BaseAgent {
       "## Assignment",
       `Execute the current ${profile.role} responsibility for project ${project.id}.`,
     ].join("\n");
-    const outputContract = [
-      "## Output Contract Binding",
-      `Contract: ${effectiveProfile.output.contract}`,
-      "Return one response that conforms to the contract declared by the role system prompt.",
-    ].join("\n");
+    const outputContract = outputContractInstructions(effectiveProfile.output.contract);
     const built = promptBuilder.compose(resolved, contextBlock, assignment, contextComponent, outputContract);
     await this.records.update(agentId, {
       promptHash: built.promptHash,
@@ -188,46 +184,14 @@ export class BaseAgent {
     }
     if (result.sessionId) await this.records.update(agentId, { workerSessionId: result.sessionId });
 
-    try {
-      return await this.validateAndPersist(agentId, result.text, built.prompt, built.promptHash, built.manifest, effectiveProfile);
-    } catch (parseError) {
-      if (input.signal?.aborted || !profile.prompt.concludeFile) throw parseError;
-      const concludeBuilt = promptBuilder.build({
-        spec: { file: profile.prompt.concludeFile },
-        primaryKind: "conclude",
-        context: contextBlock,
-        extra: [assignment, `## Prior Worker Output (failed to parse)\n${result.text.slice(0, 4000)}`].join("\n\n"),
-        contextComponent,
-        outputContract,
-      });
-      if (!concludeBuilt.fromConfig) throw parseError;
-      const concludeResult = await workerPool.execute({
-        prompt: concludeBuilt.prompt,
-        config: workerConfig,
-        workerName,
-        role: profile.role,
-        projectId: project.id,
-        cwd: project.workspaceDir,
-        maxOutputTokens: profile.maxOutputTokens,
-        sessionId: result.sessionId,
-        conclude: true,
-        signal: input.signal,
-      });
-      if (concludeResult.returncode !== 0) throw parseError;
-      if (concludeResult.sessionId ?? result.sessionId) {
-        await this.records.update(agentId, { workerSessionId: concludeResult.sessionId ?? result.sessionId });
-      }
-      const validated = await this.validateAndPersist(
-        agentId,
-        concludeResult.text,
-        concludeBuilt.prompt,
-        concludeBuilt.promptHash,
-        concludeBuilt.manifest,
-        effectiveProfile,
-      );
-      await this.records.update(agentId, { usedConclude: true });
-      return { ...validated, usedConclude: true };
-    }
+    return this.validateAndPersist(
+      agentId,
+      result.text,
+      built.prompt,
+      built.promptHash,
+      built.manifest,
+      effectiveProfile,
+    );
   }
 
   private async validateAndPersist(
@@ -279,6 +243,7 @@ const CONTRACT_KIND_MAP: Record<string, Set<string>> = {
   verdict: new Set(["verdict"]),
   broadcast_assessment: new Set(["broadcast_assessment"]),
   hints: new Set(["hints", "stop"]),
+  stop: new Set(["stop"]),
 };
 
 function validateOutput(envelope: WorkerEnvelope, profile: SubagentProfile, profileId: string): AgentOutput {

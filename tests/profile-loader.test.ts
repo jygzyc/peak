@@ -31,10 +31,8 @@ test("PromptLoader: loads builtin system prompt from TypeScript registry", () =>
 test("resolvePromptPaths: preserves builtin sources", () => {
   const resolved = resolvePromptPaths({
     file: "builtin:explorer",
-    concludeFile: "builtin:explorer-conclude",
   }, "C:/task");
   assert.equal(resolved.file, "builtin:explorer");
-  assert.equal(resolved.concludeFile, "builtin:explorer-conclude");
 });
 
 test("PromptLoader: returns fromConfig=false when file not found", () => {
@@ -245,5 +243,12 @@ test("profile-loader: rejects removed first-version fields", () => {
       context: { graphView: "full", rotateOnContextFull: true },
     }),
     /unknown field "rotateOnContextFull"/,
+  );
+  assert.throws(
+    () => normalizeProfile("planner", {
+      ...planner,
+      prompt: { file: "x.md", concludeFile: "legacy.md" },
+    }),
+    /unknown field "concludeFile"/,
   );
 });

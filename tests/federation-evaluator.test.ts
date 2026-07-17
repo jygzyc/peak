@@ -25,7 +25,7 @@ function attachMetacog(
     worker,
     config,
     undefined,
-    { sessionId, scope: "app-group" },
+    { bus, sessionId, scope: "app-group" },
   );
   loop.setMetacog(metacog);
   return metacog;
@@ -151,9 +151,8 @@ test("repeated broadcast evaluator failures fail the session instead of livelock
   assert.equal(result.type, "failed");
   assert.equal(graph.getProject(project.id)?.status, "failed");
   assert.equal(bus.pendingForSession("poison-target")[0]?.id, insight.id);
-  assert.ok(graph.events(project.id).some((event) =>
-    event.type === "project.failed_retry_exhausted"
-      && event.payload.stage === "broadcast-evaluator"));
+  assert.equal(worker.calls().filter((call) =>
+    call.prompt.includes("Cross-session FactBroadcast Under Review")).length, 2);
 });
 
 test("condition_satisfied may only reactivate an existing local pending Fact", async () => {

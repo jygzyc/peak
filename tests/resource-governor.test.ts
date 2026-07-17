@@ -73,7 +73,7 @@ test("GlobalSupervisor: globalMaxConcurrent limits actual explorer/evaluator cal
   graph.addIntent(project.id, { description: "work-a", creator: "planner", dispatchRequested: true });
   graph.addIntent(project.id, { description: "work-b", creator: "planner", dispatchRequested: true });
   const config = minimalConfig();
-  config.scheduler = { maxConcurrent: 4, refillPerTick: 4, workerLeaseMs: 10_000 };
+  config.scheduler = { maxConcurrent: 4, refillPerTick: 4 };
   const worker = new TrackingWorker();
   const loop = new SessionLoop(graph, worker, config);
   const supervisor = new GlobalSupervisor({ federationBus: new TestFederationBus(), globalMaxConcurrent: 1 });

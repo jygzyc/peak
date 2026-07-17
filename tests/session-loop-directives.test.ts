@@ -79,8 +79,6 @@ test("directive hint: adds hint to graph, consumed by planner", async () => {
   // hint should be consumed after planner sees it
   const hints = graph.unconsumedHints(p.id);
   assert.equal(hints.length, 0);
-  const events = graph.events(p.id).filter((e) => e.type === "directive.hint");
-  assert.equal(events.length, 1);
 });
 
 test("directive kill-intent: fails the targeted intent", async () => {

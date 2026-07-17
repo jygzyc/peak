@@ -8,7 +8,7 @@
 - `app-entrypoints`：分析 Manifest、deep link 与入口 guard，证明外部可达性和攻击者控制。
 - `app-dataflow`：分析 `DeepLinkActivity`、WebView 与 JS bridge，证明敏感 token 的读取路径；缺少入口证据时先产生 `pending` Fact。
 - 两个 session 属于 `app-vuln-demo` scope。Metacog 只广播已通过 evaluator 的 Fact；目标 session 的 evaluator 决定广播是否相关或满足 pending 条件。
-- TaskGroup 只有在两个 planner 都创建 EndFact、完成 final metacog、outbox/delivery 清空且 cursor 到达稳定 head 后才结束。
+- TaskGroup 只有在两个 planner 都创建 EndFact、完成 final metacog、delivery 清空且 cursor 到达稳定 head 后才结束。
 
 任务配置位于 `tasks/`，角色领域材料分别位于 `knowledge/`、`rules/` 与 `skills/`。所有 prompt 组件都会进入 `PromptManifest` 并记录 SHA-256。
 

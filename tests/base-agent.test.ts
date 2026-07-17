@@ -22,6 +22,10 @@ test("BaseAgent: planner writes role-safe JSON records outside Graph", async () 
   const records = await agentRecords(project);
 
   assert.equal(result.decision.createIntents[0]?.description, "scan");
+  assert.match(
+    worker.calls()[0]!.prompt,
+    /# Planner Role[\s\S]*Contract: main_decision[\s\S]*"kind": "decisions"/,
+  );
   assert.equal(records.length, 1);
   assert.equal(records[0]!.status, "validated");
   assert.match(records[0]!.promptHash!, /^[a-f0-9]{64}$/);
@@ -44,14 +48,11 @@ test("BaseAgent: worker cwd is the configured workspace", async () => {
   assert.equal(worker.calls()[0]!.cwd, "configured-workspace");
 });
 
-test("ExplorerAgent: validates candidate output and conclude fallback", async () => {
+test("ExplorerAgent: rejects output outside the candidate_fact contract", async () => {
   const { graph, worker, config } = freshSetup();
   const project = createProject(graph);
   const intent = graph.addIntent(project.id, { description: "find Y", creator: "planner" });
   worker.register(/Explorer Role/i, "unstructured result");
-  worker.register(/CONCLUDE/i, env("fact", {
-    description: "Y is blocked", evidence: ["access denied"], confidence: 0.2,
-  }));
   const agent = new ExplorerAgent({
     profile: config.profiles.explorer,
     profileId: "explorer",
@@ -61,14 +62,15 @@ test("ExplorerAgent: validates candidate output and conclude fallback", async ()
     graphReader: new ServerSessionGraphReader(graph),
   });
 
-  const result = await agent.run({
-    intent,
-    promptExtra: explorerExtra(intent.id, intent.description, [], []),
-  });
-
-  assert.equal(result.output.fact.description, "Y is blocked");
-  assert.equal(result.usedConclude, true);
-  assert.equal((await agentRecords(project))[0]!.usedConclude, true);
+  await assert.rejects(
+    agent.run({
+      intent,
+      promptExtra: explorerExtra(intent.id, intent.description, [], []),
+    }),
+    /no JSON object/,
+  );
+  assert.equal(worker.calls().length, 1);
+  assert.equal((await agentRecords(project))[0]!.status, "failed");
 });
 
 test("EvaluatorAgent: enforces the verdict contract", async () => {

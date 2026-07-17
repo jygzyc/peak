@@ -107,20 +107,12 @@ export interface Intent {
    * create_subagent_explorer has explicitly requested an explorer. */
   dispatchRequested: boolean;
   parentIntentId?: IntentId;
-  /** Monotonic fencing token. It is never reset when a lease is released. */
-  leaseEpoch: number;
-  lease?: {
-    workerId: string;
-    epoch: number;
-    claimedAt: ISOTime;
-    expiresAt: ISOTime;
-  };
   priority: number;
   createdAt: ISOTime;
   concludedAt?: ISOTime;
   concludedFactId?: FactId;
   failureReason?: string;
-  killedBy?: "planner" | "directive" | "lease-expired";
+  killedBy?: "planner" | "directive";
 }
 
 export type HintKind = "direction" | "warning" | "stop-explorer";
@@ -216,7 +208,6 @@ export interface AgentRecord {
   inputSummary?: string;
   outputSummary?: string;
   errorMessage?: string;
-  usedConclude?: boolean;
   inputTokens?: number;
   outputTokens?: number;
   promptHash?: string;
@@ -276,15 +267,6 @@ export interface PromptSpec {
   /** Versioned task skill instructions. Paths and inline text are both allowed. */
   skills?: string[];
   instructions?: string;
-  /**
-   * Optional conclude-phase builtin source or external prompt file. When set,
-   * a profile enables conclude
-   * fallback: if the worker's first output fails to parse into a valid envelope,
-   * the worker is re-invoked (in the same session when the backend supports
-   * resume) with this prompt, which forces it to summarize already-confirmed
-   * findings into the required JSON shape. Modeled on Cairn's conclude phase.
-   */
-  concludeFile?: string;
 }
 
 export type PromptComponentKind =
@@ -293,7 +275,6 @@ export type PromptComponentKind =
   | "knowledge"
   | "skill"
   | "instructions"
-  | "conclude"
   | "graph-context"
   | "assignment"
   | "output-contract";
@@ -480,7 +461,7 @@ export interface ControlConfig {
 
 /**
  * Scheduler resource parameters — low-level execution knobs only
- * (concurrency, refill rate, intent-claim lease). These are NOT a workflow:
+ * (concurrency and refill rate). These are NOT a workflow:
  * there is no depth limit, no stop gate, no forced termination. Termination is
  * natural (planner produces no new intent) with metacog hints as the course-
  * correction mechanism.
@@ -488,7 +469,6 @@ export interface ControlConfig {
 export interface SchedulerConfig {
   maxConcurrent?: number;
   refillPerTick?: number;
-  workerLeaseMs?: number;
 }
 
 /**
@@ -503,7 +483,6 @@ export interface SchedulerConfig {
 export const DEFAULT_SCHEDULER = {
   maxConcurrent: 10,
   refillPerTick: 10,
-  workerLeaseMs: 300_000,
 } as const;
 
 /** Default metacog triggers (used when the metacog profile omits `triggers`). */
