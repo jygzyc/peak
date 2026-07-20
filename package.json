@@ -18,13 +18,10 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test tests/*.test.ts",
     "smoke": "node scripts/smoke.mjs",
-    "pack": "node scripts/pack.mjs",
-    "prepack": "node scripts/pack.mjs"
+    "pack": "node scripts/pack.mjs archive",
+    "prepack": "node scripts/pack.mjs prepare"
   },
   "dependencies": {
-    "@ai-sdk/anthropic": "^4.0.12",
-    "@ai-sdk/openai": "^4.0.11",
-    "ai": "^7.0.22",
     "commander": "^15.0.0"
   },
   "devDependencies": {

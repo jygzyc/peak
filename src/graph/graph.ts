@@ -3,12 +3,11 @@
  *
  * Defines the persistent task-state protocol for projects, facts, intents,
  * hints, directives, events, and progress. SessionLoops depend on this
- * interface instead of a specific in-memory or SQLite implementation.
+ * interface instead of issuing SQL from the control loop.
  */
 
 import type {
   Directive,
-  BroadcastAssessment,
   DirectiveId,
   DirectiveInput,
   Fact,
@@ -40,6 +39,7 @@ export interface HintInput {
 }
 
 export interface ProjectInput {
+  sessionId: string;
   session: string;
   name: string;
   target: string;
@@ -71,8 +71,6 @@ export interface IntentInput {
 
 export interface MetacogCommitInput {
   hints: HintInput[];
-  reviewedFactId?: FactId;
-  finalReviewCompleted?: boolean;
 }
 
 export interface Graph {
@@ -122,14 +120,6 @@ export interface Graph {
     projectId: ProjectId,
     factId: FactId,
     verdict: Verdict,
-  ): void;
-  /** Atomic broadcast evaluator commit. External broadcasts remain references;
-   * this records the assessment and may only reactivate an existing pending Fact. */
-  commitBroadcastAssessment(
-    projectId: ProjectId,
-    broadcastId: string,
-    assessment: BroadcastAssessment,
-    broadcastKind?: string,
   ): void;
   /** Atomically commits metacog-produced task state. */
   commitMetacogResult(

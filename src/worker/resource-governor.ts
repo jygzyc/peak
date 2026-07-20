@@ -6,7 +6,7 @@
  * a single tick from spawning more workers than the global quota permits.
  */
 import type { WorkerPool, WorkerRequest, WorkerResult } from "./worker-runtime.js";
-import type { ProjectId, TaskConfig, WorkerName } from "../agent/types.js";
+import type { TaskConfig, WorkerName } from "../agent/types.js";
 
 interface Waiter {
   resolve: (release: () => void) => void;
@@ -102,12 +102,8 @@ class GovernedWorkerPool implements WorkerPool {
     return this.governor.execute(request.signal, () => this.inner.execute(request));
   }
 
-  pickWorker(projectId: ProjectId, config: TaskConfig, candidates?: WorkerName[]): WorkerName {
-    return this.inner.pickWorker(projectId, config, candidates);
-  }
-
-  runningCount(projectId: ProjectId): number {
-    return this.inner.runningCount(projectId);
+  pickWorker(config: TaskConfig, candidates?: WorkerName[]): WorkerName {
+    return this.inner.pickWorker(config, candidates);
   }
 }
 

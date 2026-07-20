@@ -1,12 +1,12 @@
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentRecord, Project, TaskConfig, WorkerConfig, SubagentProfile, MetacogTriggers } from "../dist/agent/types.js";
-import { BUILTIN_PERMISSIONS, DEFAULT_METACOG_TRIGGERS } from "../dist/agent/types.js";
+import type { Project, TaskConfig, WorkerConfig, SubagentProfile } from "../dist/agent/types.js";
+import { BUILTIN_PERMISSIONS } from "../dist/agent/types.js";
 import { TestGraph } from "./test-graph.ts";
 import { MockWorker } from "../dist/worker/mock-worker.js";
 import type { Graph } from "../dist/graph/graph.js";
-import { AgentRecordStore } from "../dist/agent/agent-record-store.js";
 
 const TEMP_DIRS: string[] = [];
 let sessionCounter = 0;
@@ -16,7 +16,7 @@ function builtinProfile(
   promptId: string,
   contract: string,
   graphView: string,
-  extra?: { cooldownSteps?: number; triggers?: MetacogTriggers },
+  extra?: { cooldownSteps?: number },
 ): SubagentProfile {
   const profile: SubagentProfile = {
     role,
@@ -27,23 +27,21 @@ function builtinProfile(
     output: { contract: contract as never },
   };
   if (extra?.cooldownSteps !== undefined) profile.cooldownSteps = extra.cooldownSteps;
-  if (extra?.triggers) profile.triggers = extra.triggers;
   return profile;
 }
 
 export function minimalConfig(workerName = "mock"): TaskConfig {
-  const workers: Record<string, WorkerConfig> = { [workerName]: { kind: "mock" } };
+  const workers: Record<string, WorkerConfig> = { [workerName]: { type: "opencode" } };
   return {
     task: { target: "test-target", goal: "test-goal" },
     profiles: {
       planner: builtinProfile("planner", "planner", "main_decision", "full", { cooldownSteps: 3 }),
       explorer: builtinProfile("explorer", "explorer", "candidate_fact", "focused"),
       evaluator: builtinProfile("evaluator", "evaluator", "verdict", "evidence-only"),
-      metacog: builtinProfile("metacog", "metacog", "hints", "summary", { triggers: { ...DEFAULT_METACOG_TRIGGERS } }),
+      metacog: builtinProfile("metacog", "metacog", "hints", "summary"),
     },
     workers,
     scheduler: { maxConcurrent: 2, refillPerTick: 1 },
-    control: { mainProfile: "planner", metacogProfile: "metacog" },
   };
 }
 
@@ -58,9 +56,11 @@ export function createProject(graph: Graph, overrides: Partial<{
   workspaceDir: string;
   taskConfig: TaskConfig;
 }> = {}) {
-  const dir = mkdtempSync(join(tmpdir(), "peak-"));
-  TEMP_DIRS.push(dir);
+  const dir = (graph as Graph & { sessionDir?: string }).sessionDir
+    ?? mkdtempSync(join(tmpdir(), "peak-"));
+  if (!(graph as Graph & { sessionDir?: string }).sessionDir) TEMP_DIRS.push(dir);
   return graph.createProject({
+    sessionId: (graph as Graph & { sessionId?: string }).sessionId ?? randomUUID(),
     session: overrides.session ?? `s-${sessionCounter++}`,
     name: "test",
     target: overrides.target ?? "test-target",
@@ -73,8 +73,25 @@ export function createProject(graph: Graph, overrides: Partial<{
   });
 }
 
-export function agentRecords(project: Project): Promise<AgentRecord[]> {
-  return new AgentRecordStore(project.sessionDir).list();
+export function roleLogs(project: Project): Array<{
+  role: string;
+  kind: "context" | "output";
+  path: string;
+  data: unknown;
+}> {
+  const logsDir = join(project.sessionDir, "logs");
+  try {
+    return readdirSync(logsDir)
+      .filter((name) => /^\d{8}T\d{9}Z-.+-(context|output)\.json$/.test(name))
+      .sort()
+      .map((name) => {
+        const match = /^\d{8}T\d{9}Z-(.+)-(context|output)\.json$/.exec(name)!;
+        const path = join(logsDir, name);
+        return { role: match[1]!, kind: match[2] as "context" | "output", path, data: JSON.parse(readFileSync(path, "utf8")) };
+      });
+  } catch {
+    return [];
+  }
 }
 
 export function env(kind: string, data: unknown): string {

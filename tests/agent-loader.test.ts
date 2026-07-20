@@ -1,175 +1,92 @@
-import { test } from "node:test";
-import { strict as assert } from "node:assert";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadAgent, applyAgentPatch, injectAgents, type AgentFile } from "../dist/config/agent-loader.js";
-import { defaultConfig } from "../dist/config/default-config.js";
-import type { SubagentProfile } from "../dist/agent/types.js";
+import test from "node:test";
+import { loadAgent } from "../dist/config/agent-loader.js";
 
-/**
- * Agent loader tests — verifies the deep-merge injection model: an agent file is
- * a PATCH over a builtin profile slot, overriding declared fields and keeping
- * builtin defaults for the rest.
- */
-
-function withAgents<T>(files: Record<string, AgentFile>, fn: (dir: string) => T): T {
-  const dir = mkdtempSync(join(tmpdir(), "peak-agents-"));
-  try {
-    for (const [name, content] of Object.entries(files)) {
-      writeFileSync(join(dir, `${name}.json`), JSON.stringify(content));
-    }
-    return fn(dir);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+function bundle(value: unknown): { dir: string } {
+  const dir = mkdtempSync(join(tmpdir(), "peak-agent-bundle-"));
+  writeFileSync(join(dir, "bundle.json"), JSON.stringify(value), "utf8");
+  return { dir };
 }
 
-const baseExplorer: SubagentProfile = defaultConfig().profiles.explorer;
-
-test("loadAgent: reads and validates an agent file", () => {
-  withAgents({ foo: { slot: "explorer", runtime: { worker: "codex" } } }, (dir) => {
-    const a = loadAgent("foo", { agentsDir: dir });
-    assert.equal(a.name, "foo");
-    assert.equal(a.slot, "explorer");
-    assert.equal(a.file.runtime?.worker, "codex");
-  });
-});
-
-test("loadAgent: prompt paths resolve relative to the agent file", () => {
-  withAgents({
-    foo: { slot: "explorer", prompt: { file: "prompts/agent.md", rules: ["inline rule"] } },
-  }, (dir) => {
-    const loaded = loadAgent("foo", { agentsDir: dir });
-    assert.equal(loaded.file.prompt?.file, join(dir, "prompts", "agent.md"));
-    assert.deepEqual(loaded.file.prompt?.rules, ["inline rule"]);
-  });
-});
-
-test("loadAgent: throws on missing file", () => {
-  withAgents({}, (dir) => {
-    assert.throws(() => loadAgent("nope", { agentsDir: dir }), /agent config not found/);
-  });
-});
-
-test("loadAgent: rejects path traversal even with an injected agents directory", () => {
-  withAgents({}, (dir) => {
-    assert.throws(() => loadAgent("../outside", { agentsDir: dir }), /must not contain a path/);
-  });
-});
-
-test("loadAgent: throws on invalid slot", () => {
-  withAgents({ bad: { slot: "not-a-slot" } }, (dir) => {
-    assert.throws(() => loadAgent("bad", { agentsDir: dir }), /invalid slot/);
-  });
-});
-
-test("loadAgent: throws when slot missing", () => {
-  withAgents({ bad: { runtime: { worker: "codex" } } as AgentFile }, (dir) => {
-    assert.throws(() => loadAgent("bad", { agentsDir: dir }), /slot/);
-  });
-});
-
-test("applyAgentPatch: declared fields override, omitted fields keep builtin", () => {
-  const agent: AgentFile = {
-    slot: "explorer",
-    runtime: { worker: "codex", model: "gpt-5.5" },
-    context: { graphView: "focused", maxFacts: 30 },
-  };
-  const merged = applyAgentPatch(baseExplorer, agent);
-  // overridden
-  assert.equal(merged.runtime.worker, "codex");
-  assert.equal(merged.runtime.model, "gpt-5.5");
-  assert.equal(merged.context.graphView, "focused");
-  assert.equal(merged.context.maxFacts, 30);
-  // preserved builtin (prompt, permissions, output contract)
-  assert.equal(merged.prompt.file, baseExplorer.prompt.file);
-  assert.deepEqual(merged.permissions, baseExplorer.permissions);
-  assert.equal(merged.output.contract, baseExplorer.output.contract);
-});
-
-test("applyAgentPatch: permissions may narrow the explorer role", () => {
-  const agent: AgentFile = { slot: "explorer", permissions: ["handle_intent"] };
-  const merged = applyAgentPatch(baseExplorer, agent);
-  assert.deepEqual(merged.permissions, ["handle_intent"], "permissions replaced, not concatenated");
-});
-
-test("applyAgentPatch: permissions cannot expand across role boundaries", () => {
-  const agent: AgentFile = { slot: "explorer", permissions: ["change_fact"] };
-  assert.throws(
-    () => applyAgentPatch(baseExplorer, agent),
-    /cannot declare permissions: change_fact/,
-  );
-});
-
-test("applyAgentPatch: output contract must match the role", () => {
-  const agent: AgentFile = { slot: "explorer", output: { contract: "verdict" } };
-  assert.throws(
-    () => applyAgentPatch(baseExplorer, agent),
-    /cannot use output contract "verdict"/,
-  );
-});
-
-test("applyAgentPatch: metacog triggers attach to the metacog slot", () => {
-  const baseMetacog = defaultConfig().profiles.metacog!;
-  const agent: AgentFile = { slot: "metacog", triggers: { everySteps: 10, everySeconds: 60 } };
-  const merged = applyAgentPatch(baseMetacog, agent);
-  assert.equal(merged.triggers?.everySteps, 10);
-  assert.equal(merged.triggers?.everySeconds, 60);
-  // base triggers replaced wholesale (declared object wins)
-  assert.equal(merged.triggers?.stagnationLevel, undefined);
-});
-
-test("applyAgentPatch: preserves typed skills and merges retry policy", () => {
-  const base: SubagentProfile = {
-    ...baseExplorer,
-    prompt: { ...baseExplorer.prompt, skills: ["base-skill.md"] },
-    retry: { maxAttempts: 3, backoffMs: 10 },
-  };
-  const merged = applyAgentPatch(base, {
-    slot: "explorer",
-    prompt: { skills: ["agent-skill.md"] },
-    retry: { maxAttempts: 5 },
-  });
-  assert.deepEqual(merged.prompt.skills, ["agent-skill.md"]);
-  assert.deepEqual(merged.retry, { maxAttempts: 5, backoffMs: 10 });
-});
-
-test("injectAgents: patches the declared slot and collects workers", () => {
-  withAgents(
-    {
-      "android-source-finder": {
-        slot: "explorer",
-        runtime: { worker: "codex" },
-        context: { graphView: "focused" },
-        workers: { codex: { kind: "agent", backend: "codex", model: "o4-mini" } },
+test("loadAgent loads one reusable role bundle and keeps native roles when omitted", () => {
+  const { dir } = bundle({
+    roles: {
+      planner_vuln: {
+        role: "planner",
+        worker: "planner-worker",
+        prompt: { instructions: "Plan an application vulnerability hunt." },
+        tools: ["read", "grep"],
+        skills: ["android-security"],
+        context: { graphView: "focused", maxFacts: 120 },
       },
     },
-    (dir) => {
-      const base = defaultConfig();
-      const { profiles, workers } = injectAgents(base.profiles, ["android-source-finder"], { agentsDir: dir });
-      assert.equal(profiles.explorer.runtime.worker, "codex");
-      assert.equal(profiles.explorer.context.graphView, "focused");
-      // planner/evaluator untouched
-      assert.equal(profiles.planner.runtime.worker, base.profiles.planner.runtime.worker);
-      // worker collected
-      assert.equal(workers.codex.backend, "codex");
-      assert.equal(workers.codex.model, "o4-mini");
-    },
-  );
+  });
+  const profiles = loadAgent("bundle", dir);
+  assert.equal(profiles.planner_vuln?.role, "planner");
+  assert.equal(profiles.planner_vuln?.runtime.worker, "planner-worker");
+  assert.deepEqual(profiles.planner_vuln?.tools, ["read", "grep"]);
+  assert.deepEqual(profiles.planner_vuln?.prompt.skills, ["android-security"]);
+  assert.equal(profiles.planner_vuln?.permissions.includes("create_intent"), true);
+  assert.equal(profiles.planner_vuln?.output.contract, "main_decision");
+  assert.equal(profiles.explorer?.role, "explorer");
+  assert.equal(profiles.evaluator?.role, "evaluator");
+  assert.equal(profiles.metacog?.role, "metacog");
+  assert.equal(profiles.planner, undefined, "custom planner replaces the native planner profile");
 });
 
-test("injectAgents: multiple agents can target different slots", () => {
-  withAgents(
-    {
-      "strict-reviewer": { slot: "evaluator", context: { graphView: "full" } },
-      "deep-planner": { slot: "planner", cooldownSteps: 1 },
+test("loadAgent supports multiple explorer configurations with different workers", () => {
+  const { dir } = bundle({
+    roles: {
+      explorer_gather: { role: "explorer", worker: "fast", tools: ["grep"] },
+      explorer_analysis: { role: "explorer", worker: "deep", tools: ["read", "bash"] },
     },
-    (dir) => {
-      const base = defaultConfig();
-      const { profiles } = injectAgents(base.profiles, ["strict-reviewer", "deep-planner"], { agentsDir: dir });
-      assert.equal(profiles.evaluator.context.graphView, "full");
-      assert.equal(profiles.planner.cooldownSteps, 1);
-    },
-  );
+  });
+  const profiles = loadAgent("bundle", dir);
+  assert.equal(profiles.explorer, undefined);
+  assert.equal(profiles.explorer_gather?.runtime.worker, "fast");
+  assert.equal(profiles.explorer_analysis?.runtime.worker, "deep");
+});
+
+test("loadAgent rejects old single-slot files and permission/output overrides", () => {
+  for (const value of [
+    { slot: "explorer", runtime: { worker: "x" } },
+    { roles: { x: { role: "explorer", permissions: ["get_graph"] } } },
+    { roles: { x: { role: "explorer", output: { contract: "hints" } } } },
+  ]) {
+    const { dir } = bundle(value);
+    assert.throws(() => loadAgent("bundle", dir), /unknown field|roles/);
+  }
+});
+
+test("loadAgent rejects missing files, paths, and custom ids without a role", () => {
+  const dir = mkdtempSync(join(tmpdir(), "peak-agent-bundle-"));
+  assert.throws(() => loadAgent("missing", dir), /not found/);
+  assert.throws(() => loadAgent("..\/outside", dir), /must not contain a path/);
+  writeFileSync(join(dir, "bundle.json"), JSON.stringify({ roles: { custom: { worker: "x" } } }));
+  assert.throws(() => loadAgent("bundle", dir), /must declare role/);
+});
+
+test("loadAgent rejects malformed prompt, context, tools, and execution fields", () => {
+  for (const role of [
+    { role: "explorer", prompt: { unknown: "x" } },
+    { role: "explorer", context: { graphView: "everything" } },
+    { role: "explorer", tools: "read" },
+    { role: "explorer", maxActive: 0 },
+  ]) {
+    const { dir } = bundle({ roles: { custom: role } });
+    assert.throws(() => loadAgent("bundle", dir), /unknown field|must be one of|array|greater than zero/);
+  }
+});
+
+test("loadAgent accepts Skill names and rejects Skill paths", () => {
+  const { dir } = bundle({ roles: { explorer: { skills: ["decx-cli", "app-vulnhunt"] } } });
+  assert.deepEqual(loadAgent("bundle", dir).explorer?.prompt.skills, ["decx-cli", "app-vulnhunt"]);
+
+  for (const skill of ["../skill", "skills/local", "local\\skill", "SKILL.md", "UpperCase"]) {
+    const item = bundle({ roles: { explorer: { skills: [skill] } } });
+    assert.throws(() => loadAgent("bundle", item.dir), /skill name/);
+  }
 });

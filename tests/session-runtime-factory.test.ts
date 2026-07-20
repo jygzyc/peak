@@ -3,6 +3,7 @@ import { strict as assert } from "node:assert";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { SessionRuntimeFactory } from "../dist/app/session-runtime-factory.js";
 import { GlobalSupervisor } from "../dist/session/supervisor.js";
 import { TestFederationBus } from "./test-graph.ts";
@@ -24,9 +25,9 @@ test("SessionRuntimeFactory creates and registers one complete runtime per sessi
 
   try {
     const configA = minimalConfig();
-    configA.task.session = "factory-a";
+    configA.task.name = "factory-a";
     const configB = minimalConfig();
-    configB.task.session = "factory-b";
+    configB.task.name = "factory-b";
 
     const a = await factory.create(configA);
     const b = await factory.create(configB);
@@ -39,11 +40,11 @@ test("SessionRuntimeFactory creates and registers one complete runtime per sessi
     assert.equal(supervisor.listSessions().length, 2);
     assert.deepEqual(
       supervisor.listSessions().map((session) => session.scope).sort(),
-      ["factory-a", "factory-b"],
+      [a.sessionId, b.sessionId].sort(),
       "sessions without an explicit federation scope must not share a task group",
     );
-    assert.equal(supervisor.get("factory-a"), a.runtime.sessionLoop);
-    assert.equal(supervisor.get("factory-b"), b.runtime.sessionLoop);
+    assert.equal(supervisor.get(a.sessionId), a.runtime.sessionLoop);
+    assert.equal(supervisor.get(b.sessionId), b.runtime.sessionLoop);
     assert.equal(a.runtime.graph.getProject(a.projectId)?.session, "factory-a");
     assert.equal(b.runtime.graph.getProject(b.projectId)?.session, "factory-b");
   } finally {
@@ -62,11 +63,12 @@ test("SessionRuntimeFactory rejects duplicate session ownership", async () => {
     supervisor,
   });
   const config = minimalConfig();
-  config.task.session = "factory-duplicate";
+  config.task.name = "factory-duplicate";
+  const sessionId = randomUUID();
 
   try {
-    await factory.create(config);
-    await assert.rejects(factory.create(config), /session already exists/);
+    await factory.create(config, { sessionId });
+    await assert.rejects(factory.create(config, { sessionId }), /session already exists/);
   } finally {
     await factory.close();
     supervisor.federationBus.close();
@@ -80,10 +82,9 @@ test("factory-created runtime.run reuses its bound supervisor and governor", asy
   const baseDir = mkdtempSync(join(tmpdir(), "peak-runtime-run-"));
   const factory = new SessionRuntimeFactory({ baseDir, workerPool: worker, supervisor });
   const config = minimalConfig();
-  config.task.session = "factory-run";
+  config.task.name = "factory-run";
   config.federation = {
     scope: "factory-run-scope",
-    members: ["factory-run"],
   };
   let plannerRound = 0;
   worker.register(/automated planning module/i, () => {
@@ -124,9 +125,9 @@ test("SessionRuntimeFactory owns one HTTP server for every registered session", 
     useHttp: true,
   });
   const configA = minimalConfig();
-  configA.task.session = "http-a";
+  configA.task.name = "http-a";
   const configB = minimalConfig();
-  configB.task.session = "http-b";
+  configB.task.name = "http-b";
 
   try {
     const a = await factory.create(configA);
@@ -140,7 +141,7 @@ test("SessionRuntimeFactory owns one HTTP server for every registered session", 
       method: "POST",
     });
     const sessions = await response.json() as Array<{ sessionId: string }>;
-    assert.deepEqual(sessions.map((item) => item.sessionId), ["http-a", "http-b"]);
+    assert.deepEqual(sessions.map((item) => item.sessionId), [a.sessionId, b.sessionId]);
   } finally {
     await factory.close();
     assert.equal(factory.httpServer?.port, 0);

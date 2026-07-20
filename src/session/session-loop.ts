@@ -28,6 +28,7 @@ import { SessionCoordinator } from "./session-coordinator.js";
 import type { Permission } from "../agent/types.js";
 import type { SessionGraphReader } from "../agent/context-builder.js";
 import { ServerSessionGraphReader } from "../server/session-graph-reader.js";
+import { appendGraphOperation } from "../server/graph-operation-log.js";
 
 /** Max times an explorer may fail the same intent before the loop auto-fails it.
  *  Without this cap a persistently-broken explorer (bad output, flaky backend)
@@ -48,10 +49,9 @@ export interface RunOptions {
 }
 
 export interface SessionLoopOptions {
-  /** Cross-session insight bus. When set, accepted facts and dead-ends are
-   * published so other sessions can learn from them (read-only). */
+  /** Process-local coordinator for metacog's pass-Fact broadcasts. */
   federationBus?: FederationBus;
-  /** This session's id, used as the source attribution on published insights. */
+  /** This Session's source identity in `{sessionId, factId, reason}`. */
   sessionId?: string;
   /** Task-group broadcast visibility boundary. */
   federationScope?: string;
@@ -92,6 +92,11 @@ export class SessionLoop {
     private readonly config: TaskConfig,
     options: SessionLoopOptions = {},
   ) {
+    for (const role of ["planner", "explorer", "evaluator", "metacog"] as const) {
+      if (!Object.values(config.profiles).some((profile) => profile.role === role)) {
+        throw new Error(`${role} role is not configured`);
+      }
+    }
     const existingProjects = graph.listProjects();
     if (existingProjects.length > 1) {
       throw new Error(
@@ -156,14 +161,12 @@ export class SessionLoop {
   }
 
   private registerFederationMembership(bus: FederationBus, sessionId: string, scope: string): void {
-    const members = this.config.federation?.members;
     const projects = this.graph.listProjects();
     const projectId = projects.length === 1 ? projects[0]!.id : undefined;
     const current = this.federationRegistration;
     if (current?.bus === bus && current.sessionId === sessionId
       && current.scope === scope && current.projectId === projectId) return;
-    if (members && members.length > 0) bus.registerExpectedSessions(scope, members);
-    bus.registerSession(sessionId, scope, projectId);
+    bus.registerSession(sessionId, scope, projectId, this.graph);
     this.federationRegistration = { bus, sessionId, scope, projectId };
   }
 
@@ -180,19 +183,19 @@ export class SessionLoop {
   }
 
   private profileForRole(role: SessionRole): { profileId: string; profile: SubagentProfile } {
-    const profileId = role === "planner"
-      ? this.config.control?.mainProfile ?? "planner"
-      : role === "explorer"
-        ? this.config.control?.explorerProfile ?? "explorer"
-        : role === "evaluator"
-          ? this.config.control?.evaluatorProfile ?? "evaluator"
-          : this.config.control?.metacogProfile ?? "metacog";
-    const profile = this.config.profiles[profileId];
-    if (!profile) throw new Error(`${role} profile not found: ${profileId}`);
-    if (profile.role !== role) {
-      throw new Error(`profile "${profileId}" binds role "${profile.role}", expected "${role}"`);
-    }
-    return { profileId, profile };
+    const found = Object.entries(this.config.profiles).find(([, profile]) => profile.role === role);
+    if (!found) throw new Error(`${role} role is not configured`);
+    return { profileId: found[0], profile: found[1] };
+  }
+
+  private explorerProfileForIntent(intentId: string): { profileId: string; profile: SubagentProfile } {
+    const profiles = Object.entries(this.config.profiles)
+      .filter(([, profile]) => profile.role === "explorer");
+    if (profiles.length === 0) throw new Error("explorer role is not configured");
+    let hash = 0;
+    for (const char of intentId) hash = ((hash * 31) + char.charCodeAt(0)) >>> 0;
+    const selected = profiles[hash % profiles.length]!;
+    return { profileId: selected[0], profile: selected[1] };
   }
 
   canCompleteFromSupervisor(projectId: ProjectId): boolean {
@@ -207,14 +210,7 @@ export class SessionLoop {
     if (this.coordinator.recentVerdicts(projectId).length > 0) return false;
     if ((this.activeExecutions.get(projectId)?.size ?? 0) > 0) return false;
 
-    if (this.metacog) {
-      const events = this.graph.events(projectId);
-      const proposalSeq = [...events].reverse()
-        .find((event) => event.type === "planner.end_fact_created")?.seq ?? 0;
-      const finalReviewSeq = [...events].reverse()
-        .find((event) => event.type === "metacog.final_review_completed")?.seq ?? 0;
-      if (finalReviewSeq <= proposalSeq) return false;
-    }
+    if (this.metacog && !this.metacog.hasCompletedFinalReview(projectId)) return false;
     return true;
   }
 
@@ -348,13 +344,7 @@ export class SessionLoop {
 
     const factsBefore = this.graph.facts(projectId, "pass").length;
 
-    await this.processFederationBroadcasts(projectId);
-    await this.consumeDirectives(projectId);
-    const afterBroadcastControl = this.controlResult(projectId);
-    if (afterBroadcastControl) return afterBroadcastControl;
-    const afterFederation = this.graph.getProject(projectId)!;
-
-    const finishing = afterFederation.status === "finish_proposed";
+    const finishing = current.status === "finish_proposed";
     const plannerSucceeded = finishing ? true : await this.maybeRunPlanner(projectId);
     await this.consumeDirectives(projectId);
     const afterPlannerControl = this.controlResult(projectId);
@@ -367,6 +357,10 @@ export class SessionLoop {
     await this.consumeDirectives(projectId);
     const afterEvaluatorControl = this.controlResult(projectId);
     if (afterEvaluatorControl) return afterEvaluatorControl;
+    await this.processFederationBroadcasts(projectId);
+    await this.consumeDirectives(projectId);
+    const afterBroadcastControl = this.controlResult(projectId);
+    if (afterBroadcastControl) return afterBroadcastControl;
 
     // Metacog uses an in-flight promise without holding a process-local mutex
     // during worker I/O. It reviews the graph
@@ -480,24 +474,24 @@ export class SessionLoop {
 
     const isEmpty = intents.length === 0;
     const hasRecentVerdict = recentVerdicts.length > 0;
-    const hasActionableHint = hints.some((h) => h.kind === "stop-explorer" || h.kind === "direction");
+    const hasHint = hints.length > 0;
     const hasRelevantBroadcast = this.coordinator.hasRelevantBroadcastSincePlanner(projectId);
 
-    const needsPlanning = isEmpty || hasActionableHint || hasRecentVerdict || hasRelevantBroadcast;
+    const needsPlanning = isEmpty || hasHint || hasRecentVerdict || hasRelevantBroadcast;
     if (!needsPlanning) {
       return true;
     }
 
     const progress = this.graph.progress(projectId);
     const lastStep = this.coordinator.lastPlannerStep(projectId);
-    const { profile: plannerProfile } = this.profileForRole("planner");
+    const { profileId: plannerProfileId, profile: plannerProfile } = this.profileForRole("planner");
     const cooldown = plannerProfile?.cooldownSteps ?? 3;
     const inCooldown = progress.stepsExecuted - lastStep < cooldown;
 
     // Cooldown only gates re-planning when there is nothing NEW to react to.
-    // Any new verdict, actionable hint, or relevant broadcast bypasses cooldown;
+    // Any new verdict, Hint, or relevant broadcast bypasses cooldown;
     // only repeated empty-state polling is throttled.
-    if (inCooldown && !hasRecentVerdict && !hasActionableHint && !hasRelevantBroadcast) {
+    if (inCooldown && !hasRecentVerdict && !hasHint && !hasRelevantBroadcast) {
       return true;
     }
     if (this.coordinator.retryDelayRemaining(
@@ -506,7 +500,7 @@ export class SessionLoop {
       plannerProfile.retry?.backoffMs ?? 0,
     ) > 0) return true;
 
-    const workerName = selectProfileWorker(plannerProfile, projectId, this.workerPool, this.config);
+    const workerName = selectProfileWorker(plannerProfile, this.workerPool, this.config);
     const executionKey = "planner";
     const controller = this.startExecution(projectId, executionKey, "planner");
     const agent = new MainAgent({
@@ -517,7 +511,7 @@ export class SessionLoop {
       graphReader: this.graphReader,
     });
     try {
-      const { decision, permissions, agentId } = await agent.run({
+      const { decision, permissions } = await agent.run({
         hints: hints.length > 0 ? hints : undefined,
         recentVerdicts: hasRecentVerdict ? recentVerdicts : undefined,
         signal: controller.signal,
@@ -525,29 +519,25 @@ export class SessionLoop {
       });
 
       if (this.graph.getProject(projectId)?.status !== "active") {
-        await agent.updateRecord(agentId, {
-          status: "discarded",
-          errorMessage: "planner result arrived after the project left active state",
-        });
         return false;
       }
-      this.graph.transaction(() => {
-        applyMainDecision({
+      const applied = this.graph.transaction(() => {
+        return applyMainDecision({
           projectId, graph: this.graph, config: this.config,
           decision, permissions,
         });
       });
+      if (applied.intentsCreated || applied.explorersStopped || applied.intentsFailed
+        || applied.hintsConsumed || applied.concluded) {
+        appendGraphOperation(this.requireProject(projectId), plannerProfileId, "apply_decision", { ...applied });
+      }
       this.coordinator.recordPlannerDecision(projectId, this.graph.progress(projectId).stepsExecuted);
-      await agent.updateRecord(agentId, {
-        status: "applied",
-        outputSummary: `${decision.createIntents.length} create, ${decision.stopExplorerIntentIds.length} stop, ${decision.failIntents.length} fail, end=${Boolean(decision.concludeRun)}`,
-      });
       for (const intentId of decision.stopExplorerIntentIds) {
         this.abortExecutions(projectId, intentId);
       }
 
       return true;
-    } catch (err) {
+    } catch {
       if (controller.signal.aborted) {
         return false;
       }
@@ -582,25 +572,13 @@ export class SessionLoop {
 
     let batch = dispatchable.slice(0, slots);
 
-    const { profileId: explorerProfileId, profile: explorerProfile } = this.profileForRole("explorer");
-    if (explorerProfile.maxActive !== undefined) {
-      const inFlight = Math.max(
-        [...this.activeExecutions.get(projectId)?.values() ?? []]
-          .filter((execution) => execution.role === "explorer").length,
-        claimedCount,
-      );
-      if (inFlight >= explorerProfile.maxActive) return 0;
-      batch = batch.slice(0, explorerProfile.maxActive - inFlight);
-      if (batch.length === 0) return 0;
-    }
-
     await Promise.allSettled(batch.map((intent) => this.runOneExplorer(projectId, intent)));
     return batch.length;
   }
 
   private async runOneExplorer(projectId: ProjectId, intent: Intent): Promise<void> {
-    const { profileId: explorerProfileId, profile: explorerProfile } = this.profileForRole("explorer");
-    const explorerWorker = selectProfileWorker(explorerProfile, projectId, this.workerPool, this.config);
+    const { profileId: explorerProfileId, profile: explorerProfile } = this.explorerProfileForIntent(intent.id);
+    const explorerWorker = selectProfileWorker(explorerProfile, this.workerPool, this.config);
     const executionKey = `explorer:${intent.id}`;
     let controller: AbortController | undefined;
     let agent: ExplorerAgent | undefined;
@@ -641,13 +619,11 @@ export class SessionLoop {
         source: "explorer",
         confidence: result.output.fact.confidence,
       });
-      await agent.updateRecord(result.agentId, {
-        status: "applied",
+      appendGraphOperation(this.requireProject(projectId), explorerProfileId, "write_candidate_fact", {
+        intentId: intent.id,
         factId: fact.id,
-        outputSummary: fact.description.slice(0, 200),
       });
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
+    } catch {
       if (!controller) return;
       if (controller?.signal.aborted) {
         try { this.graph.releaseIntent(projectId, intent.id); } catch { /* already concluded */ }
@@ -688,7 +664,7 @@ export class SessionLoop {
     }
     await Promise.allSettled(
       candidates.map(async (candidate) => {
-        const evaluatorWorker = selectProfileWorker(evaluatorProfile, projectId, this.workerPool, this.config);
+        const evaluatorWorker = selectProfileWorker(evaluatorProfile, this.workerPool, this.config);
         const executionKey = `evaluator:${candidate.id}`;
         const controller = this.startExecution(projectId, executionKey, "evaluator");
         const agent = new EvaluatorAgent({
@@ -727,27 +703,27 @@ export class SessionLoop {
           const evaluatorPermissions = new PermissionChecker(evaluatorProfile);
           evaluatorPermissions.require("change_fact");
           this.graph.commitEvaluatorResult(projectId, candidate.id, result.output.verdict);
+          appendGraphOperation(this.requireProject(projectId), evaluatorProfileId, "change_fact", {
+            factId: candidate.id,
+            decision: result.output.verdict.decision,
+            reason: result.output.verdict.reason,
+          });
           this.coordinator.recordVerdict(projectId, {
             factId: candidate.id,
             intentId: candidate.parentIntentId,
             verdict: result.output.verdict,
           });
-          await agent.updateRecord(result.agentId, {
-            status: "applied",
-            outputSummary: `${result.output.verdict.decision}: ${result.output.verdict.reason.slice(0, 150)}`,
-          });
 
           // Deferred re-evaluation: an accepted fact may satisfy the
           // requiredConditions of a deferred pending fact in this session.
           // This is a LOCAL mechanism (no bus needed); cross-session
-          // reactivation goes through the FederationBus deferred/condition_met
-          // insights below.
+          // reactivation is decided when the target evaluator handles the
+          // source Session's unified Fact broadcast.
           if (result.output.verdict.decision === "pass") {
             this.tryReactivateDeferred(projectId, candidate.description);
           }
 
-        } catch (err) {
-          const reason = err instanceof Error ? err.message : String(err);
+        } catch {
           if (controller.signal.aborted) {
             return;
           }
@@ -773,9 +749,11 @@ export class SessionLoop {
     const permissions = new PermissionChecker(evaluatorProfile);
     permissions.require("receive_fact_broadcast");
 
-    for (const insight of this.federationBus.pendingForSession(this.sessionId)) {
-      const evaluatorWorker = selectProfileWorker(evaluatorProfile, projectId, this.workerPool, this.config);
-      const executionKey = `broadcast:${insight.id}`;
+    for (const broadcast of this.federationBus.pendingForSession(this.sessionId)) {
+      const sourceFact = this.federationBus.sourceFact(broadcast);
+      if (!sourceFact) continue;
+      const evaluatorWorker = selectProfileWorker(evaluatorProfile, this.workerPool, this.config);
+      const executionKey = `broadcast:${broadcast.sessionId}:${broadcast.factId}`;
       const controller = this.startExecution(projectId, executionKey, "evaluator");
       const agent = new EvaluatorAgent({
         profileId: evaluatorProfileId,
@@ -790,48 +768,37 @@ export class SessionLoop {
         const result = await agent.runBroadcast({
           workerName: evaluatorWorker,
           signal: controller.signal,
-          inputSummary: `broadcast ${insight.id}: ${insight.summary.slice(0, 160)}`,
+          inputSummary: `broadcast ${broadcast.sessionId}/${broadcast.factId}`,
           promptExtra: broadcastEvaluatorExtra({
-            id: insight.id,
-            kind: insight.kind,
-            sourceSessionId: insight.source.sessionId,
-            sourceProjectId: insight.source.projectId,
-            sourceFactId: insight.source.factId,
-            summary: insight.summary,
-            confidence: insight.confidence,
+            ...broadcast,
+            fact: sourceFact,
           }, this.graph.facts(projectId, "pending")),
         });
-        if (insight.kind === "session_summary" && result.output.assessment.decision === "condition_satisfied") {
-          throw new StageError(
-            "session_summary cannot satisfy a pending Fact condition",
-            "evaluator",
-          );
+        if (result.output.assessment.decision === "condition_satisfied") {
+          const targetFactId = result.output.assessment.targetFactId!;
+          if (this.graph.getFact(projectId, targetFactId)?.status !== "pending") {
+            throw new StageError(`broadcast target is not a pending Fact: ${targetFactId}`, "evaluator");
+          }
+          this.graph.clearFactConditions(projectId, targetFactId);
         }
-        this.graph.commitBroadcastAssessment(
-          projectId,
-          insight.id,
-          result.output.assessment,
-          insight.kind,
-        );
+        appendGraphOperation(this.requireProject(projectId), evaluatorProfileId, "receive_fact_broadcast", {
+          sourceSessionId: broadcast.sessionId,
+          factId: broadcast.factId,
+          reason: broadcast.reason,
+          decision: result.output.assessment.decision,
+        });
         if (result.output.assessment.decision !== "irrelevant") {
           this.coordinator.recordRelevantBroadcast(projectId);
         }
-        await agent.updateRecord(result.agentId, {
-          status: "applied",
-          outputSummary: `${result.output.assessment.decision}: ${result.output.assessment.reason.slice(0, 150)}`,
-        });
-        this.federationBus.acknowledge(
-          this.sessionId,
-          insight.id,
-          result.output.assessment.decision === "irrelevant" ? "irrelevant" : "evaluated",
-          result.agentId,
-        );
+        this.federationBus.markHandled(this.sessionId, broadcast);
       } catch (error) {
         if (controller.signal.aborted) {
           return;
         }
-        this.federationBus.markFailed(this.sessionId, insight.id);
-        const failures = this.coordinator.recordFailure(projectId, `broadcast:${insight.id}`);
+        const failures = this.coordinator.recordFailure(
+          projectId,
+          `broadcast:${broadcast.sessionId}:${broadcast.factId}`,
+        );
         if (failures >= (evaluatorProfile.retry?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS)
           && this.graph.getProject(projectId)?.status === "active") {
           this.graph.updateProjectStatus(projectId, "failed");
@@ -898,10 +865,7 @@ export class SessionLoop {
     if (project.status === "finish_proposed"
       && progress.openIntents === 0 && progress.claimedIntents === 0
       && !hasCandidates && !hasUnconsumedVerdict) {
-      const events = this.graph.events(projectId);
-      const proposalSeq = [...events].reverse().find((event) => event.type === "planner.end_fact_created")?.seq ?? 0;
-      const finalReviewSeq = [...events].reverse().find((event) => event.type === "metacog.final_review_completed")?.seq ?? 0;
-      if (this.metacog && finalReviewSeq <= proposalSeq) {
+      if (this.metacog && !this.metacog.hasCompletedFinalReview(projectId)) {
         return { type: "idle", reason: "awaiting final metacog review" };
       }
       if (this.federationBus) {

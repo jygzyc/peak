@@ -4,11 +4,9 @@
  * Centralizes all filesystem locations under a single root (default ~/.peak):
  *
  *   ~/.peak/
- *   ├── config.json          global baseline (default workers/control)
- *   ├── agents/<name>.json   reusable role configs injected into builtin slots
- *   ├── tasks/<name>.json    task configs (target/goal/session + agent refs)
- *   ├── sessions/<session>/  per-session execution state (analysis.db)
- *   └── providers.json       model provider configs
+ *   ├── sessions/.session.yaml
+ *   ├── sessions/<uuid>/analysis.db
+ *   ├── sessions/<uuid>/logs/
  *
  * Override the root with the PEAK_HOME env var. This is the single source of
  * truth for the layout — SessionManager, loadConfig, and the CLI all route
@@ -31,63 +29,19 @@ export function peakPath(...segments: string[]): string {
   return join(peakHome(), ...segments);
 }
 
-/** ~/.peak/agents — reusable role configs. */
-export function agentsDir(): string {
-  return peakPath("agents");
-}
-
-/** ~/.peak/tasks — task configs. */
-export function tasksDir(): string {
-  return peakPath("tasks");
-}
-
 /** ~/.peak/sessions — per-session execution state. */
 export function sessionsDir(): string {
   return peakPath("sessions");
 }
 
-/** ~/.peak/providers.json — model provider configs. */
-export function providersFile(): string {
-  return peakPath("providers.json");
-}
-
-/** ~/.peak/config.json — global baseline config. */
-export function configFile(): string {
-  return peakPath("config.json");
-}
-
-/** ~/.peak/federation.db — durable cross-session broadcast/task-group state. */
-export function federationFile(): string {
-  return peakPath("federation.db");
-}
-
 /**
  * Idempotently ensure the peak home subdirectories exist. Safe to call on every
- * run; creates {agents,tasks,sessions} if missing, never throws on existing.
+ * run; creates sessions if missing, never throws on existing.
  */
 export function ensurePeakLayout(): void {
   const root = peakHome();
-  for (const sub of ["agents", "tasks", "sessions"]) {
+  for (const sub of ["sessions"]) {
     const dir = join(root, sub);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  }
-}
-
-/** Path to a named agent config: ~/.peak/agents/<name>.json. */
-export function agentFile(name: string): string {
-  assertConfigEntryName(name, "agent");
-  return join(agentsDir(), `${name}.json`);
-}
-
-/** Path to a named task config: ~/.peak/tasks/<name>.json. */
-export function taskFile(name: string): string {
-  assertConfigEntryName(name, "task");
-  return join(tasksDir(), `${name}.json`);
-}
-
-/** Named configs are direct children of their PEAK_HOME directory. */
-export function assertConfigEntryName(name: string, kind = "config"): void {
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || name === "." || name === "..") {
-    throw new Error(`${kind} name must contain only letters, digits, dot, underscore, or hyphen and must not contain a path`);
   }
 }

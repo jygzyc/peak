@@ -3,51 +3,30 @@
  *
  * Runs OpenCode as a subprocess worker via `opencode run --format json`, which
  * emits an NDJSON event stream (one JSON object per line). The assistant's
- * response text is extracted from message events. Session resume is supported
- * via `--session <id>`.
+ * response text is extracted from message events.
  *
- * HTTP transport lives in opencode-http.ts.
+ * Authentication and model selection are owned by the user's OpenCode config.
  */
 
 import type { WorkerConfig } from "../../agent/types.js";
-import { SubprocessBackend, type BuildArgvOptions } from "./subprocess.js";
+import { BaseWorker } from "./subprocess.js";
 
-export class OpencodeCliBackend extends SubprocessBackend {
-  readonly id = "opencode";
+export class OpenCodeWorker extends BaseWorker {
+  readonly type = "opencode";
 
-  buildArgv(config: WorkerConfig, prompt: string, opts?: BuildArgvOptions): { argv: string[]; env?: Record<string, string>; input?: string } {
+  buildArgv(config: WorkerConfig, prompt: string): { argv: string[]; env?: Record<string, string>; input?: string } {
     const args: string[] = ["run"];
     if (config.model) args.push("--model", config.model);
-    if (opts?.sessionId) args.push("--session", opts.sessionId);
-    args.push("--format", "json");
     if (config.args) args.push(...config.args);
+    args.push("--format", "json");
     // Pass prompt via stdin to avoid Windows cmd.exe arg-length/quoting issues
     // with long prompts containing newlines and special chars.
     args.push("-");
 
-    const env: Record<string, string> = {};
-    if (config.baseUrl) env.OPENCODE_BASE_URL = config.baseUrl;
-    const keyEnv = config.apiKeyEnv ?? "OPENCODE_API_KEY";
-    const key = process.env[keyEnv];
-    if (key) env.OPENCODE_API_KEY = key;
-
     return {
       argv: ["opencode", ...args],
-      env: Object.keys(env).length > 0 ? env : undefined,
       input: prompt,
     };
-  }
-
-  extractSession(stdout: string, _stderr: string): string | undefined {
-    for (const line of stdout.split(/\r?\n/)) {
-      try {
-        const event = JSON.parse(line) as Record<string, unknown>;
-        if (typeof event.sessionID === "string" && /^ses_[0-9a-zA-Z]{10,}$/.test(event.sessionID)) {
-          return event.sessionID;
-        }
-      } catch { /* ignore non-event diagnostics */ }
-    }
-    return undefined;
   }
 
   /**
@@ -55,20 +34,12 @@ export class OpencodeCliBackend extends SubprocessBackend {
    * Each line is a JSON event. The assistant's text is in events of type
    * "text", nested under `part.text`:
    *   {"type":"text","part":{"type":"text","text":"response"}}
-   * Recovery paths (opencode `run -` is non-deterministic and the model
-   * sometimes returns its answer in a tool-call step instead of a final text
-   * step):
-   *   - When no `text` event is emitted, fall back to `tool_use` event
-   *     `part.state.output` — the model frequently emits the JSON envelope by
-   *     running it through the bash tool (e.g. `echo {...}`), and that output
-   *     appears here rather than in a text event.
-   *   - When neither is present (model stopped early with near-empty output),
-   *     return "" so parseEnvelope reports a clear "empty output" error instead
-   *     of leaking raw NDJSON into the error message.
+   * Tool results are never role results. When no text event is emitted, return
+   * "" so the role retry path records a clear empty-output failure instead of
+   * treating a file read, web response, or shell output as the Agent answer.
    */
-  extractResponseText(stdout: string, _stderr: string): string {
+  extractResponseText(stdout: string): string {
     const texts: string[] = [];
-    const toolOutputs: string[] = [];
     for (const line of stdout.split("\n")) {
       const trimmed = line.trim();
       if (!trimmed) continue;
@@ -88,26 +59,8 @@ export class OpencodeCliBackend extends SubprocessBackend {
         }
       }
 
-      // Tool-call step: { type: "tool_use", part: { state: { output: "..." } } }
-      // Collected as a fallback only — used when no text event is emitted but
-      // the model produced its answer via a tool (e.g. bash echo of the JSON).
-      if (obj.type === "tool_use" && typeof obj.part === "object" && obj.part !== null) {
-        const part = obj.part as Record<string, unknown>;
-        const state = part.state as Record<string, unknown> | undefined;
-        if (state && typeof state.output === "string") {
-          toolOutputs.push(state.output);
-        }
-      }
     }
 
-    if (texts.length > 0) {
-      return texts.join("\n").trim();
-    }
-    // No assistant text event: try tool-call outputs (model answered via tool).
-    const fromTools = toolOutputs.map((t) => t.trim()).filter(Boolean).join("\n");
-    if (fromTools) {
-      return fromTools;
-    }
-    return "";
+    return texts.join("\n").trim();
   }
 }

@@ -4,21 +4,19 @@
 
 // Core types
 export type {
-  ProjectId, FactId, IntentId, HintId, DirectiveId, AgentId, EndFactId,
+  ProjectId, FactId, IntentId, HintId, DirectiveId, EndFactId,
   SessionRole, RoleId, ISOTime,
   Project, ProjectStatus, Fact, FactStatus, EndFact, Intent, IntentStatus,
   Hint, HintKind, GraphEvent, Verdict, Progress,
   Directive, DirectiveInput, DirectiveKind,
-  AgentRecord, AgentRecordStatus,
-  WorkerName, WorkerKind, WorkerConfig, TaskConfig,
+  WorkerName, WorkerType, WorkerConfig, TaskConfig,
   SubagentProfile, RuntimeSpec, PromptSpec, ContextSpec, GraphView,
   PromptComponentKind, PromptManifestComponent, PromptManifest, ContextArtifact, RoleOutputArtifact,
   Permission, OutputContract, OutputSpec,
-  BuiltinProfiles, ControlConfig,
-  SchedulerConfig, MetacogTriggers, FederationConfig, BroadcastAssessment,
-  AgentBackendId, ToolKind,
+  SchedulerConfig, FederationConfig, BroadcastAssessment,
+  ToolKind,
 } from "./agent/types.js";
-export { DEFAULT_SCHEDULER, DEFAULT_METACOG_TRIGGERS, BUILTIN_ROLES, BUILTIN_PERMISSIONS } from "./agent/types.js";
+export { DEFAULT_SCHEDULER, BUILTIN_ROLES, BUILTIN_PERMISSIONS } from "./agent/types.js";
 
 // Graph interface and helpers
 export type {
@@ -36,14 +34,13 @@ export type { FederatedFact, FederatedIntent, FederatedEvent, SearchOptions } fr
 
 export { FederationBus } from "./graph/federation-bus.js";
 export type {
-  InsightKind, DeliveryStatus, GlobalInsight, GlobalInsightRef,
-  GlobalInsightListener, FederationBusOptions,
+  FactBroadcast, TaskGroupState, TaskGroupStatus, TaskGroupMemberStatus,
 } from "./graph/federation-bus.js";
 export { defaultConfig } from "./config/default-config.js";
-export { federationFile } from "./config/peak-home.js";
 export { loadConfig } from "./config/task-config.js";
 export type { LoadedConfig } from "./config/task-config.js";
-export { normalizeProfile } from "./config/profile-loader.js";
+export { installTaskSkills, assertSkillName } from "./config/task-skill-installer.js";
+export type { TaskSkillInstallOptions, InstalledTaskSkill } from "./config/task-skill-installer.js";
 export { PromptLoader, resolvePromptPaths } from "./config/prompt-loader.js";
 export type { ResolvedPrompt, PromptLoaderOptions } from "./config/prompt-loader.js";
 export {
@@ -69,6 +66,12 @@ export type { HttpServerOptions, HttpSessionBinding } from "./server/http-server
 
 // Worker layer
 export type { WorkerPool, WorkerRequest, WorkerResult } from "./worker/worker-runtime.js";
+export { BaseWorker } from "./worker/backends/subprocess.js";
+export { registerWorker } from "./worker/registry.js";
+export { OpenCodeWorker } from "./worker/backends/opencode-cli.js";
+export { CodexWorker } from "./worker/backends/codex.js";
+export { PiWorker } from "./worker/backends/pi.js";
+export { ClaudeCodeWorker } from "./worker/backends/claude.js";
 export { MockWorker } from "./worker/mock-worker.js";
 export { AgentDriverPool } from "./worker/agent-driver-pool.js";
 
@@ -100,8 +103,6 @@ export { GlobalResourceGovernor } from "./worker/resource-governor.js";
 export { BaseAgent, selectProfileWorker } from "./agent/base-agent.js";
 export type { BaseAgentContext, BaseAgentRunInput, BaseAgentResult, AgentOutput } from "./agent/base-agent.js";
 export { ExplorerAgent, EvaluatorAgent, MetacogAgent } from "./agent/role-agents.js";
-export { AgentRecordStore, newAgentId } from "./agent/agent-record-store.js";
-export type { CreateAgentRecordInput, AgentRecordPatch } from "./agent/agent-record-store.js";
 export { MainAgent } from "./agent/main-agent.js";
 export type { MainAgentContext, MainAgentRunInput, MainAgentResult } from "./agent/main-agent.js";
 export { applyMainDecision } from "./agent/decision-applier.js";

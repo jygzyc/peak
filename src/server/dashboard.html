@@ -627,13 +627,13 @@
         if (scope && scope !== lastGroup) {
           var groupHeader = document.createElement('div');
           groupHeader.className = 'section-title';
-          groupHeader.textContent = 'TaskGroup ' + scope + ' · gen ' + p.taskGroup.generation + ' · ' + p.taskGroup.status;
+          groupHeader.textContent = 'TaskGroup ' + scope + ' · pending broadcasts ' + p.taskGroup.pendingBroadcasts + ' · ' + p.taskGroup.status;
           list.appendChild(groupHeader);
           lastGroup = scope;
         }
         const div = document.createElement('div');
         div.className = 'project-item' + (currentSession === p.sessionId ? ' active' : '');
-        div.title = p.taskGroup ? ('TaskGroup ' + p.taskGroup.scope + ' · generation ' + p.taskGroup.generation) : '';
+        div.title = p.taskGroup ? ('TaskGroup ' + p.taskGroup.scope) : '';
         div.innerHTML = '<span class="pname">' + esc(p.name || p.sessionId) + '</span><span class="badge ' + safeClass(p.status) + '">' + esc(p.status) + '</span>';
         div.onclick = () => selectProject(p.sessionId, p.projectId);
         list.appendChild(div);
@@ -659,7 +659,7 @@
       var group = data.session && data.session.taskGroup;
       var endFact = (data.endFacts || []).find(function(item){ return item.status === 'active'; });
       document.getElementById('task-group-status').textContent = group
-        ? ('TaskGroup ' + group.scope + ' · gen ' + group.generation + ' · head ' + group.cursor + '/' + group.headSeq + ' · ' + group.status + (endFact ? ' · EndFact ' + endFact.id : ''))
+        ? ('TaskGroup ' + group.scope + ' · pending broadcasts ' + group.pendingBroadcasts + ' · ' + group.status + (endFact ? ' · EndFact ' + endFact.id : ''))
         : (endFact ? 'EndFact ' + endFact.id : '');
 
       var pr = data.progress;

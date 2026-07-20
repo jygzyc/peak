@@ -139,13 +139,11 @@ test("FederationBus: accepted facts are published only after metacog review", as
   const config = minimalConfig();
   const p = createProject(graph);
   const bus = new TestFederationBus();
-  const insights = bus.recentInsights.bind(bus);
   const loop = new SessionLoop(graph, worker, config, { federationBus: bus, sessionId: "s1" });
   const metacog = new MetacogSupervisor(
     graph,
     worker,
     config,
-    undefined,
     { bus, sessionId: "s1", scope: "default" },
   );
   loop.setMetacog(metacog);
@@ -156,14 +154,11 @@ test("FederationBus: accepted facts are published only after metacog review", as
   worker.register(/Metacog Role/i, env("hints", { hints: [] }));
 
   await loop.step(p.id);
-  const all = insights(20);
-  const facts = all.filter((i) => i.kind === "fact");
-  const deadEnds = all.filter((i) => i.kind === "dead_end");
-  assert.ok(facts.length >= 1, "accepted fact should be published as a fact insight");
-  assert.ok(facts.some((i) => i.summary.includes("X confirmed")));
-  assert.equal(deadEnds.length, 0, "evaluator must not bypass metacog to publish dead-ends");
-  // Source attribution carries the session id.
-  assert.equal(facts[0]!.source.sessionId, "s1");
+  const broadcasts = bus.recentBroadcasts(20);
+  assert.equal(broadcasts.length, 1);
+  assert.equal(broadcasts[0]!.sessionId, "s1");
+  assert.equal(broadcasts[0]!.factId, "f001");
+  assert.equal(broadcasts[0]!.reason, "ok");
 });
 
 test("deferred fact is reactivated when a later accepted fact matches its condition", async () => {

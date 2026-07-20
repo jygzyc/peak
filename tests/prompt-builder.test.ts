@@ -23,3 +23,21 @@ test("PromptBuilder: composes system, graph context, and role task in order", ()
 test("joinPromptSections: omits empty sections without extra separators", () => {
   assert.equal(joinPromptSections("system", "", undefined, "task"), "system\n\ntask");
 });
+
+test("PromptBuilder: renders task Skills as preinstalled names", () => {
+  const built = new PromptBuilder(new PromptLoader()).build({
+    spec: {
+      file: "builtin:explorer",
+      skills: ["decx-cli", "app-vulnhunt"],
+    },
+  });
+
+  assert.match(built.prompt, /Configured Skill: decx-cli/);
+  assert.match(built.prompt, /Configured Skill: app-vulnhunt/);
+  assert.match(built.prompt, /Load it by name/);
+  assert.deepEqual(
+    built.manifest.components.filter((component) => component.kind === "skill")
+      .map((component) => component.source),
+    ["skill:decx-cli", "skill:app-vulnhunt"],
+  );
+});

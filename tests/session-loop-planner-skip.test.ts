@@ -101,6 +101,35 @@ test("planner-skip: stop-explorer hint triggers planner even during cooldown", a
   assert.equal(plannerWithHintsCalled, true);
 });
 
+test("planner-skip: metacog warning hint triggers planner even during cooldown", async () => {
+  const graph = new TestGraph();
+  const worker = new MockWorker();
+  const config = minimalConfig();
+  config.profiles.planner.cooldownSteps = 99;
+
+  const p = createProject(graph);
+  worker.register(/automated planning module/i, decisions([{
+    description: "HELD-WORK",
+    dispatchExplorer: false,
+  }]));
+  const loop = new SessionLoop(graph, worker, config);
+  await loop.step(p.id);
+
+  graph.addHint(p.id, {
+    content: "final review found a coverage gap",
+    creator: "metacog",
+    kind: "warning",
+  });
+  let plannerWithHintsCalled = false;
+  worker.register(/## Hints Requiring Response/i, () => {
+    plannerWithHintsCalled = true;
+    return decisions();
+  });
+  await loop.step(p.id);
+
+  assert.equal(plannerWithHintsCalled, true);
+});
+
 test("planner-skip: empty graph always runs planner", async () => {
   const graph = new TestGraph();
   const worker = new MockWorker();

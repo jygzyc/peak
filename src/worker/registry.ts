@@ -1,61 +1,45 @@
 /**
- * Worker driver registry.
+ * Registry for the four BaseWorker implementations.
  *
  * Resolves named workers from task configuration or built-ins, dispatches to the
  * appropriate driver kind, and exposes capability metadata for CLI/status
  * commands. This is the bridge from WorkerPool to concrete drivers.
  */
 
-import type { WorkerConfig, WorkerKind, WorkerName } from "../agent/types.js";
-import { listProviderIds } from "./providers/registry.js";
-import type { WorkerDriver, WorkerRequest, WorkerResult } from "./base.js";
-import { AgentDriver } from "./agent-driver.js";
-import { ApiDriver } from "./api-driver.js";
-import { listAgentBackendIds } from "./backends/registry.js";
+import type { WorkerType } from "../agent/types.js";
+import { ClaudeCodeWorker } from "./backends/claude.js";
+import { CodexWorker } from "./backends/codex.js";
+import { OpenCodeWorker } from "./backends/opencode-cli.js";
+import { PiWorker } from "./backends/pi.js";
+import type { BaseWorker } from "./backends/subprocess.js";
 
-export type { WorkerDriver, WorkerRequest, WorkerResult } from "./base.js";
+const WORKERS = new Map<string, BaseWorker>();
+for (const worker of [
+  new OpenCodeWorker(),
+  new CodexWorker(),
+  new PiWorker(),
+  new ClaudeCodeWorker(),
+]) WORKERS.set(worker.type, worker);
 
-type DriverFactory = (name: WorkerName, config: WorkerConfig) => WorkerDriver;
-
-const DRIVER_FACTORIES: Partial<Record<WorkerKind, DriverFactory>> = {
-  agent: (name, config) => new AgentDriver(name, config),
-  api: (name, config) => new ApiDriver(name, config),
-};
-
-const BUILTIN_WORKER_CONFIGS: Record<string, WorkerConfig> = {
-  "claude-code": { kind: "agent", backend: "claude-code" },
-  codex: { kind: "agent", backend: "codex" },
-  opencode: { kind: "agent", backend: "opencode" },
-  api: { kind: "api" },
-};
-
-export const WORKERS: WorkerName[] = Object.keys(BUILTIN_WORKER_CONFIGS);
-
-export function executeWorker(request: WorkerRequest): Promise<WorkerResult> | WorkerResult {
-  const config = resolveWorkerConfig(request.worker, request.config);
-  if (!config) {
-    return { worker: request.worker, returncode: 2, stdout: "", stderr: `unsupported worker: ${request.worker}` };
-  }
-  const factory = DRIVER_FACTORIES[config.kind];
-  if (!factory) {
-    return { worker: request.worker, returncode: 2, stdout: "", stderr: `unsupported worker kind: ${config.kind}` };
-  }
-  return factory(request.worker, config).execute({ ...request, config });
+export function getWorker(type: WorkerType): BaseWorker {
+  const worker = WORKERS.get(type);
+  if (!worker) throw new Error(`unsupported worker type: ${type}`);
+  return worker;
 }
 
-export function knownWorkers(configured: Record<string, WorkerConfig> | undefined): WorkerName[] {
-  return [...new Set([...WORKERS, ...Object.keys(configured ?? {})])];
+/** Programmatic extension point; Task JSON remains limited to the four built-ins. */
+export function registerWorker(worker: BaseWorker): () => void {
+  const previous = WORKERS.get(worker.type);
+  WORKERS.set(worker.type, worker);
+  return () => {
+    if (WORKERS.get(worker.type) !== worker) return;
+    if (previous) WORKERS.set(worker.type, previous);
+    else WORKERS.delete(worker.type);
+  };
 }
 
 export function workerCapabilities(): Record<string, unknown> {
   return {
-    workers: WORKERS,
-    driverKinds: Object.keys(DRIVER_FACTORIES),
-    agentBackends: listAgentBackendIds(),
-    modelProviders: listProviderIds(),
+    workerTypes: ["opencode", "codex", "pi", "claude-code"] satisfies WorkerType[],
   };
-}
-
-function resolveWorkerConfig(worker: WorkerName, configured: WorkerConfig | undefined): WorkerConfig | undefined {
-  return configured ?? BUILTIN_WORKER_CONFIGS[worker];
 }

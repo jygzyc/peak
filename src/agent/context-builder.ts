@@ -16,7 +16,7 @@ import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { relative, resolve, sep } from "node:path";
 import type {
   ContextArtifact, ContextSpec, Fact, GraphView, Hint, Intent, Verdict, ProjectId,
-  AgentId, RoleId, RoleOutputArtifact,
+  RoleOutputArtifact,
 } from "./types.js";
 
 export interface GraphSnapshotRequest {
@@ -82,24 +82,20 @@ export function createGraphContextSnapshot(input: Omit<GraphContextSnapshot, "ve
   return { ...input, version: 1, content, contentHash: sha256(content) };
 }
 
-/** Persist the exact dynamic context sent to a tracked run. The artifact is
- * immutable and derived; Graph remains the source of truth. */
+/** Persist the exact Server-generated JSON supplied to one role execution. */
 export async function materializeGraphContext(
   sessionDir: string,
-  agentId: AgentId,
+  timestamp: string,
+  role: string,
   snapshot: GraphContextSnapshot,
   delivery: ContextArtifact["delivery"] = "reference",
 ): Promise<ContextArtifact> {
-  if (!/^[A-Za-z0-9_.-]+$/.test(agentId)) throw new Error(`invalid agent id for context artifact: ${agentId}`);
+  assertLogName(timestamp, role);
   const root = resolve(sessionDir);
-  const artifactDir = resolve(root, "agents", agentId);
+  const artifactDir = resolve(root, "logs");
   assertWithin(root, artifactDir);
   await mkdir(artifactDir, { recursive: true });
-
-  const artifactPath = resolve(
-    artifactDir,
-    "context.json",
-  );
+  const artifactPath = resolve(artifactDir, `${timestamp}-${role}-context.json`);
   assertWithin(root, artifactPath);
   const expected = Buffer.from(`${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
   await writeImmutableFile(artifactDir, artifactPath, expected);
@@ -144,16 +140,16 @@ export async function materializeRoleOutput(
   sessionDir: string,
   sessionId: string,
   projectId: ProjectId,
-  agentId: AgentId,
-  role: RoleId,
+  timestamp: string,
+  role: string,
   output: unknown,
 ): Promise<RoleOutputArtifact> {
-  if (!/^[A-Za-z0-9_.-]+$/.test(agentId)) throw new Error(`invalid agent id for output artifact: ${agentId}`);
+  assertLogName(timestamp, role);
   const root = resolve(sessionDir);
-  const artifactDir = resolve(root, "agents", agentId);
+  const artifactDir = resolve(root, "logs");
   assertWithin(root, artifactDir);
   await mkdir(artifactDir, { recursive: true });
-  const artifactPath = resolve(artifactDir, "output.json");
+  const artifactPath = resolve(artifactDir, `${timestamp}-${role}-output.json`);
   assertWithin(root, artifactPath);
   const expected = Buffer.from(`${JSON.stringify(output, null, 2)}\n`, "utf8");
   await writeImmutableFile(artifactDir, artifactPath, expected);
@@ -163,7 +159,6 @@ export async function materializeRoleOutput(
     version: 1,
     sessionId,
     projectId,
-    agentId,
     role,
     relativePath: relative(root, artifactPath).split(sep).join("/"),
     resolvedPath: artifactPath,
@@ -171,6 +166,19 @@ export async function materializeRoleOutput(
     bytes: actual.byteLength,
     createdAt: new Date().toISOString(),
   };
+}
+
+let lastRoleLogTime = 0;
+
+/** Files are ordered lexically and need no additional execution identifier. */
+export function roleLogTimestamp(date = new Date()): string {
+  lastRoleLogTime = Math.max(date.getTime(), lastRoleLogTime + 1);
+  return new Date(lastRoleLogTime).toISOString().replace(/[-:.]/g, "");
+}
+
+function assertLogName(timestamp: string, role: string): void {
+  if (!/^\d{8}T\d{9}Z$/.test(timestamp)) throw new Error(`invalid role log timestamp: ${timestamp}`);
+  if (!/^[A-Za-z0-9_.-]+$/.test(role)) throw new Error(`invalid role log role: ${role}`);
 }
 
 async function writeImmutableFile(directory: string, path: string, expected: Buffer): Promise<void> {

@@ -67,12 +67,13 @@ export class PromptLoader {
 
     if (spec.skills) {
       for (let index = 0; index < spec.skills.length; index += 1) {
-        const source = spec.skills[index]!;
-        const item = this.readFileOrInline(source, "skill", index);
-        if (item.text) {
-          parts.push("---\n" + item.text);
-          components.push(item.component);
-        }
+        const name = spec.skills[index]!;
+        const text = [
+          `Configured Skill: ${name}`,
+          "This Skill is preinstalled for the selected Agent CLI. Load it by name when its instructions apply to the assignment.",
+        ].join("\n");
+        parts.push("---\n" + text);
+        components.push(componentFor("skill", index, `skill:${name}`, text));
       }
     }
 
@@ -117,7 +118,7 @@ export class PromptLoader {
 
   private readFileOrInline(
     source: string,
-    kind: Extract<PromptComponentKind, "rule" | "knowledge" | "skill">,
+    kind: Extract<PromptComponentKind, "rule" | "knowledge">,
     index: number,
   ): { text: string; component: PromptManifestComponent } {
     if (looksLikePath(source)) {
@@ -153,7 +154,7 @@ export function resolvePromptPaths<T extends Partial<PromptSpec>>(spec: T, baseD
     out.knowledge = spec.knowledge.map((source) => looksLikePath(source) ? resolve(baseDir, source) : source);
   }
   if (spec.skills) {
-    out.skills = spec.skills.map((source) => looksLikePath(source) ? resolve(baseDir, source) : source);
+    out.skills = [...spec.skills];
   }
   return out as T;
 }

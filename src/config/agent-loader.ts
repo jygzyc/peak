@@ -1,219 +1,239 @@
-/**
- * Agent loader — injects reusable role configs from ~/.peak/agents/ into the
- * four builtin profile slots (planner/explorer/evaluator/metacog).
- *
- * An agent file is a PATCH over a builtin profile, not a standalone profile:
- * it declares which slot it targets and which fields to override. Fields it
- * omits keep the builtin default. This preserves the graph-generation +
- * blackboard architecture (SessionLoop still only knows the four builtin slots)
- * while letting users customize each role without editing task.json.
- *
- * Agent files may also carry a `workers` map (worker definitions the role
- * brings with it), merged into the task's workers (task-level wins on conflict).
- */
-
-import { readFileSync, existsSync } from "node:fs";
+/** Load one task-local role bundle from <task-dir>/<name>.json. */
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type {
-  SubagentProfile,
-  BuiltinProfiles,
-  WorkerConfig,
-  WorkerName,
-  Permission,
-  RuntimeSpec,
-  PromptSpec,
   ContextSpec,
-  GraphView,
-  OutputContract,
-  MetacogTriggers,
+  PromptSpec,
   RetryPolicy,
+  SessionRole,
+  SubagentProfile,
+  WorkerName,
 } from "../agent/types.js";
-import { agentFile, assertConfigEntryName } from "./peak-home.js";
 import { BUILTIN_PERMISSIONS } from "../agent/types.js";
+import { defaultConfig } from "./default-config.js";
+import { assertSkillName } from "./task-skill-installer.js";
 import { resolvePromptPaths } from "./prompt-loader.js";
 
-export const BUILTIN_SLOTS = ["planner", "explorer", "evaluator", "metacog"] as const;
-export type BuiltinSlot = (typeof BUILTIN_SLOTS)[number];
+const ROLES = new Set<SessionRole>(["planner", "explorer", "evaluator", "metacog"]);
+const CONTRACTS = {
+  planner: "main_decision",
+  explorer: "candidate_fact",
+  evaluator: "verdict",
+  metacog: "hints",
+} as const;
 
-/** Raw shape of an agent JSON file on disk. */
-export interface AgentFile {
-  /** Which builtin profile slot this agent patches. */
-  slot: string;
-  runtime?: Partial<RuntimeSpec>;
+export interface AgentRoleConfig {
+  role?: SessionRole;
+  worker?: WorkerName;
+  workers?: WorkerName[];
   prompt?: Partial<PromptSpec>;
-  context?: Partial<{ graphView: GraphView } & Omit<ContextSpec, "graphView">>;
-  permissions?: Permission[];
-  output?: Partial<{ contract: OutputContract }>;
+  tools?: string[];
+  skills?: string[];
+  context?: Partial<ContextSpec>;
   maxActive?: number;
   cooldownSteps?: number;
-  triggers?: MetacogTriggers;
-  intervalSeconds?: number;
-  maxOutputTokens?: number;
   retry?: RetryPolicy;
-  /** Worker definitions this role brings; merged into the task workers. */
-  workers?: Record<WorkerName, WorkerConfig>;
 }
 
-export interface LoadedAgent {
-  name: string;
-  slot: BuiltinSlot;
-  file: AgentFile;
+export interface AgentFile {
+  roles: Record<string, AgentRoleConfig>;
 }
 
-export interface InjectionOptions {
-  /** Override the agents directory (testing). When set, agentFile() is bypassed. */
-  agentsDir?: string;
-}
+export function loadAgent(
+  name: string,
+  taskDir: string,
+): Record<string, SubagentProfile> {
+  assertAgentName(name);
+  const path = join(taskDir, `${name}.json`);
+  if (!existsSync(path)) throw new Error(`agent config not found: ${name} (looked for ${path})`);
 
-/**
- * Load and validate a single agent file by name. Throws if the file is missing,
- * not an object, or declares an invalid slot.
- */
-export function loadAgent(name: string, opts: InjectionOptions = {}): LoadedAgent {
-  assertConfigEntryName(name, "agent");
-  const path = opts.agentsDir ? join(opts.agentsDir, `${name}.json`) : agentFile(name);
-  if (!existsSync(path)) {
-    throw new Error(`agent config not found: ${name} (looked for ${path})`);
-  }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(path, "utf-8"));
-  } catch (err) {
-    throw new Error(`agent config "${name}" is not valid JSON: ${(err as Error).message}`);
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    throw new Error(`agent config "${name}" is not valid JSON: ${(error as Error).message}`);
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(`agent config "${name}" must be a JSON object`);
+  const root = objectValue(parsed, `agent config "${name}"`);
+  assertKeys(root, ["roles"], `agent config "${name}"`);
+  const roles = objectValue(root.roles, `agent config "${name}".roles`);
+  if (Object.keys(roles).length === 0) throw new Error(`agent config "${name}".roles cannot be empty`);
+
+  const native = defaultConfig().profiles;
+  const profiles: Record<string, SubagentProfile> = {};
+  for (const [profileId, raw] of Object.entries(roles)) {
+    const label = `agent role "${profileId}"`;
+    const roleConfig = objectValue(raw, label);
+    assertKeys(roleConfig, [
+      "role", "worker", "workers", "prompt", "tools", "skills", "context",
+      "maxActive", "cooldownSteps", "retry",
+    ], label);
+    const patch = parseRoleConfig(roleConfig, label);
+    const role = resolveRole(profileId, patch.role);
+    const base = native[role];
+    if (!base) throw new Error(`native role config missing: ${role}`);
+    profiles[profileId] = mergeRole(base, role, patch, dirname(path));
   }
-  const unknown = Object.keys(parsed).find((key) => ![
-    "slot", "runtime", "prompt", "context", "permissions", "output",
-    "maxActive", "cooldownSteps", "triggers", "intervalSeconds",
-    "maxOutputTokens", "retry", "workers",
-  ].includes(key));
-  if (unknown) throw new Error(`agent config "${name}" contains unknown field "${unknown}"`);
-  const file = parsed as AgentFile;
-  if (file.prompt) file.prompt = resolvePromptPaths(file.prompt, dirname(path));
-  if (!file.slot || typeof file.slot !== "string") {
-    throw new Error(`agent config "${name}" must declare a string \`slot\``);
+  for (const role of ROLES) {
+    if (!Object.values(profiles).some((profile) => profile.role === role)) {
+      profiles[role] = native[role]!;
+    }
   }
-  if (!BUILTIN_SLOTS.includes(file.slot as BuiltinSlot)) {
-    throw new Error(
-      `agent config "${name}" has invalid slot "${file.slot}"; must be one of: ${BUILTIN_SLOTS.join(", ")}`,
-    );
-  }
-  return { name, slot: file.slot as BuiltinSlot, file };
+  validateInitialRoles(profiles);
+  return profiles;
 }
 
-/**
- * Deep-merge an agent patch onto a base profile. The agent overrides only the
- * fields it declares; omitted fields keep the base value. `permissions` and
- * `output.contract` are replaced wholesale when declared (not concatenated),
- * so an agent can narrow a builtin's capabilities.
- */
-export function applyAgentPatch(base: SubagentProfile, agent: AgentFile): SubagentProfile {
-  if (agent.permissions) {
-    const allowed = new Set(BUILTIN_PERMISSIONS[base.role]);
-    const forbidden = agent.permissions.filter((permission) => !allowed.has(permission));
-    if (forbidden.length > 0) {
-      throw new Error(
-        `agent slot "${base.role}" cannot declare permissions: ${forbidden.join(", ")}`,
-      );
-    }
-  }
-  if (agent.output?.contract) {
-    const allowedContracts: Record<SubagentProfile["role"], OutputContract[]> = {
-      planner: ["main_decision"],
-      explorer: ["candidate_fact"],
-      evaluator: ["verdict"],
-      metacog: ["hints", "stop"],
-    };
-    if (!allowedContracts[base.role].includes(agent.output.contract)) {
-      throw new Error(
-        `agent slot "${base.role}" cannot use output contract "${agent.output.contract}"`,
-      );
-    }
-  }
-  const merged: SubagentProfile = {
-    role: base.role,
-    runtime: mergeRuntime(base.runtime, agent.runtime),
-    prompt: mergePrompt(base.prompt, agent.prompt),
-    context: mergeContext(base.context, agent.context),
-    permissions: agent.permissions ?? base.permissions,
-    output: agent.output ? { contract: agent.output.contract ?? base.output.contract } : base.output,
+function mergeRole(
+  base: SubagentProfile,
+  role: SessionRole,
+  patch: AgentRoleConfig,
+  baseDir: string,
+): SubagentProfile {
+  const promptPatch = patch.prompt ? resolvePromptPaths(stripUndefined(patch.prompt), baseDir) : undefined;
+  const skills = patch.skills?.map((value) => {
+    assertSkillName(value);
+    return value;
+  });
+  const profile: SubagentProfile = {
+    role,
+    runtime: {
+      worker: patch.worker ?? base.runtime.worker,
+      ...(patch.workers ? { workers: uniqueStrings(patch.workers, "workers") } : {}),
+    },
+    prompt: {
+      ...base.prompt,
+      ...promptPatch,
+      ...(skills ? { skills } : promptPatch?.skills ? {} : base.prompt.skills ? { skills: base.prompt.skills } : {}),
+    },
+    ...(patch.tools ? { tools: uniqueStrings(patch.tools, "tools") } : {}),
+    context: { ...base.context, ...stripUndefined(patch.context ?? {}) },
+    permissions: [...BUILTIN_PERMISSIONS[role]],
+    output: { contract: CONTRACTS[role] },
   };
-  // Optional numeric fields: agent value wins when declared, else base.
-  for (const key of ["maxActive", "cooldownSteps", "intervalSeconds", "maxOutputTokens"] as const) {
-    const v = agent[key];
-    if (typeof v === "number") merged[key] = v;
-    else if (base[key] !== undefined) merged[key] = base[key];
+  for (const key of ["maxActive", "cooldownSteps"] as const) {
+    const value = patch[key] ?? base[key];
+    if (value !== undefined) profile[key] = value;
   }
-  if (agent.triggers) merged.triggers = agent.triggers;
-  else if (base.triggers) merged.triggers = base.triggers;
-  if (agent.retry) merged.retry = { ...base.retry, ...agent.retry };
-  else if (base.retry) merged.retry = base.retry;
-  return merged;
+  if (patch.retry ?? base.retry) profile.retry = { ...(base.retry ?? {}), ...stripUndefined(patch.retry ?? {}) };
+  return profile;
 }
 
-function mergeRuntime(base: RuntimeSpec, patch?: Partial<RuntimeSpec>): RuntimeSpec {
-  if (!patch) return base;
+function resolveRole(profileId: string, rawRole: unknown): SessionRole {
+  const role = typeof rawRole === "string"
+    ? rawRole
+    : ROLES.has(profileId as SessionRole)
+      ? profileId
+      : undefined;
+  if (!role || !ROLES.has(role as SessionRole)) {
+    throw new Error(`agent role "${profileId}" must declare role as planner|explorer|evaluator|metacog`);
+  }
+  return role as SessionRole;
+}
+
+function parseRoleConfig(value: Record<string, unknown>, label: string): AgentRoleConfig {
+  const prompt = value.prompt === undefined ? undefined : objectValue(value.prompt, `${label}.prompt`);
+  if (prompt) assertKeys(prompt, ["file", "instructions", "rules", "knowledge"], `${label}.prompt`);
+  const context = value.context === undefined ? undefined : objectValue(value.context, `${label}.context`);
+  if (context) assertKeys(context, [
+    "graphView", "maxFacts", "includeDeadEnds", "includeProgress", "relevanceScope",
+  ], `${label}.context`);
+  const retry = value.retry === undefined ? undefined : objectValue(value.retry, `${label}.retry`);
+  if (retry) assertKeys(retry, ["maxAttempts", "backoffMs"], `${label}.retry`);
   return {
-    worker: patch.worker ?? base.worker,
-    ...(patch.workers ? { workers: patch.workers } : base.workers ? { workers: base.workers } : {}),
-    ...(patch.model ? { model: patch.model } : base.model ? { model: base.model } : {}),
-    ...(patch.provider ? { provider: patch.provider } : base.provider ? { provider: base.provider } : {}),
+    role: optionalEnum(value.role, ["planner", "explorer", "evaluator", "metacog"], `${label}.role`),
+    worker: optionalString(value.worker, `${label}.worker`),
+    workers: optionalStringArray(value.workers, `${label}.workers`),
+    prompt: prompt ? {
+      file: optionalString(prompt.file, `${label}.prompt.file`),
+      instructions: optionalString(prompt.instructions, `${label}.prompt.instructions`),
+      rules: optionalStringArray(prompt.rules, `${label}.prompt.rules`),
+      knowledge: optionalStringArray(prompt.knowledge, `${label}.prompt.knowledge`),
+    } : undefined,
+    tools: optionalStringArray(value.tools, `${label}.tools`),
+    skills: optionalStringArray(value.skills, `${label}.skills`),
+    context: context ? {
+      graphView: optionalEnum(context.graphView, ["full", "focused", "evidence-only", "summary"], `${label}.context.graphView`),
+      maxFacts: optionalPositiveInt(context.maxFacts, `${label}.context.maxFacts`),
+      includeDeadEnds: optionalBoolean(context.includeDeadEnds, `${label}.context.includeDeadEnds`),
+      includeProgress: optionalBoolean(context.includeProgress, `${label}.context.includeProgress`),
+      relevanceScope: optionalEnum(context.relevanceScope, ["linked", "all"], `${label}.context.relevanceScope`),
+    } as Partial<ContextSpec> : undefined,
+    maxActive: optionalPositiveInt(value.maxActive, `${label}.maxActive`),
+    cooldownSteps: optionalNonNegativeInt(value.cooldownSteps, `${label}.cooldownSteps`),
+    retry: retry ? {
+      maxAttempts: optionalPositiveInt(retry.maxAttempts, `${label}.retry.maxAttempts`),
+      backoffMs: optionalNonNegativeInt(retry.backoffMs, `${label}.retry.backoffMs`),
+    } : undefined,
   };
 }
 
-function mergePrompt(base: PromptSpec, patch?: Partial<PromptSpec>): PromptSpec {
-  if (!patch) return base;
-  return {
-    file: patch.file ?? base.file,
-    ...(patch.rules ? { rules: patch.rules } : base.rules ? { rules: base.rules } : {}),
-    ...(patch.knowledge ? { knowledge: patch.knowledge } : base.knowledge ? { knowledge: base.knowledge } : {}),
-    ...(patch.skills ? { skills: patch.skills } : base.skills ? { skills: base.skills } : {}),
-    ...(patch.instructions ? { instructions: patch.instructions } : base.instructions ? { instructions: base.instructions } : {}),
-  };
-}
-
-function mergeContext(base: ContextSpec, patch?: Partial<ContextSpec>): ContextSpec {
-  if (!patch) return base;
-  const merged: ContextSpec = { graphView: patch.graphView ?? base.graphView };
-  const maxFacts = patch.maxFacts ?? base.maxFacts;
-  if (maxFacts !== undefined) merged.maxFacts = maxFacts;
-  if (patch.includeDeadEnds !== undefined) merged.includeDeadEnds = patch.includeDeadEnds;
-  else if (base.includeDeadEnds !== undefined) merged.includeDeadEnds = base.includeDeadEnds;
-  if (patch.includeProgress !== undefined) merged.includeProgress = patch.includeProgress;
-  else if (base.includeProgress !== undefined) merged.includeProgress = base.includeProgress;
-  if (patch.relevanceScope !== undefined) merged.relevanceScope = patch.relevanceScope;
-  else if (base.relevanceScope !== undefined) merged.relevanceScope = base.relevanceScope;
-  return merged;
-}
-
-/**
- * Inject a list of named agents into the builtin profiles. Each agent patches
- * its declared slot. Returns the patched profiles and the union of worker
- * definitions the agents bring (caller merges these under its own workers).
- */
-export function injectAgents(
-  baseProfiles: BuiltinProfiles & Record<string, SubagentProfile>,
-  agentNames: string[],
-  opts: InjectionOptions = {},
-): { profiles: BuiltinProfiles & Record<string, SubagentProfile>; workers: Record<WorkerName, WorkerConfig> } {
-  const profiles: BuiltinProfiles & Record<string, SubagentProfile> = { ...baseProfiles };
-  const workers: Record<WorkerName, WorkerConfig> = {};
-
-  for (const name of agentNames) {
-    const agent = loadAgent(name, opts);
-    const slotProfile = profiles[agent.slot];
-    if (!slotProfile) {
-      throw new Error(`agent "${name}" targets slot "${agent.slot}" but no such builtin profile exists`);
-    }
-    profiles[agent.slot] = applyAgentPatch(slotProfile, agent.file);
-    if (agent.file.workers) {
-      for (const [wn, wc] of Object.entries(agent.file.workers)) {
-        workers[wn] = wc;
-      }
+function validateInitialRoles(profiles: Record<string, SubagentProfile>): void {
+  for (const role of ROLES) {
+    if (!Object.values(profiles).some((profile) => profile.role === role)) {
+      throw new Error(`agent config must provide an initial ${role} role`);
     }
   }
+}
 
-  return { profiles, workers };
+function uniqueStrings(value: unknown, field: string): string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.trim() === "")) {
+    throw new Error(`${field} must be an array of non-empty strings`);
+  }
+  return [...new Set(value.map((item) => item.trim()))];
+}
+
+function assertAgentName(name: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name)) {
+    throw new Error("agent name must contain only letters, digits, underscore, or hyphen and must not contain a path");
+  }
+}
+
+function optionalString(value: unknown, label: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !value.trim()) throw new Error(`${label} must be a non-empty string`);
+  return value.trim();
+}
+
+function optionalStringArray(value: unknown, label: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  return uniqueStrings(value, label);
+}
+
+function optionalEnum<T extends string>(value: unknown, allowed: readonly T[], label: string): T | undefined {
+  const parsed = optionalString(value, label);
+  if (parsed === undefined) return undefined;
+  if (!allowed.includes(parsed as T)) throw new Error(`${label} must be one of: ${allowed.join(", ")}`);
+  return parsed as T;
+}
+
+function optionalBoolean(value: unknown, label: string): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") throw new Error(`${label} must be a boolean`);
+  return value;
+}
+
+function optionalPositiveInt(value: unknown, label: string): number | undefined {
+  const parsed = optionalNonNegativeInt(value, label);
+  if (parsed === 0) throw new Error(`${label} must be greater than zero`);
+  return parsed;
+}
+
+function optionalNonNegativeInt(value: unknown, label: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isInteger(value) || (value as number) < 0) throw new Error(`${label} must be a non-negative integer`);
+  return value as number;
+}
+
+function stripUndefined<T extends object>(value: T): T {
+  return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as T;
+}
+
+function objectValue(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be a JSON object`);
+  return value as Record<string, unknown>;
+}
+
+function assertKeys(value: Record<string, unknown>, allowed: string[], label: string): void {
+  const set = new Set(allowed);
+  const unknown = Object.keys(value).find((key) => !set.has(key));
+  if (unknown) throw new Error(`${label} contains unknown field "${unknown}"`);
 }

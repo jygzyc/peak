@@ -57,7 +57,7 @@ export class HttpServer {
       throw new Error(`HTTP session already registered: ${binding.sessionId}`);
     }
     const project = binding.graph.getProject(binding.projectId);
-    if (!project || project.session !== binding.sessionId) {
+    if (!project || project.sessionId !== binding.sessionId) {
       throw new Error(`HTTP session project not found: ${binding.sessionId}`);
     }
     this.sessions.set(binding.sessionId, binding);
@@ -290,7 +290,7 @@ export class HttpServer {
 
   private bindingProject(binding: HttpSessionBinding): Project | undefined {
     if (binding.projectId) return binding.graph.getProject(binding.projectId);
-    return binding.graph.listProjects().find((project) => project.session === binding.sessionId);
+    return binding.graph.listProjects().find((project) => project.sessionId === binding.sessionId);
   }
 
   private projectDetail(graph: Graph, project: Project) {
@@ -316,12 +316,9 @@ export class HttpServer {
       status: project?.status,
       taskGroup: group && member ? {
         scope: group.scope,
-        generation: group.generation,
         status: group.status,
-        headSeq: group.headSeq,
-        pendingDeliveries: group.pendingDeliveries,
+        pendingBroadcasts: group.pendingBroadcasts,
         memberStatus: member.status,
-        cursor: member.cursor,
       } : undefined,
     };
   }

@@ -21,7 +21,7 @@ async function startServer(graph: TestGraph): Promise<{ server: HttpServer; base
   const projects = graph.listProjects();
   assert.ok(projects.length <= 1, "one HTTP session binding requires one session-local graph");
   if (projects[0]) {
-    server.registerSession({ sessionId: projects[0].session, projectId: projects[0].id, graph });
+    server.registerSession({ sessionId: projects[0].sessionId, projectId: projects[0].id, graph });
   }
   await server.start({ port: 0 });
   return { server, base: `http://127.0.0.1:${server.port}` };
@@ -42,10 +42,10 @@ test("http-server: POST /api/sessions returns the registered session list", asyn
   const projectB = createProject(graphB, { session: "s2" });
   const server = new HttpServer();
   server.registerSession({
-    sessionId: "s1", projectId: projectA.id, graph: graphA,
+    sessionId: projectA.sessionId, projectId: projectA.id, graph: graphA,
   });
   server.registerSession({
-    sessionId: "s2", projectId: projectB.id, graph: graphB,
+    sessionId: projectB.sessionId, projectId: projectB.id, graph: graphB,
   });
   await server.start({ port: 0 });
   const base = `http://127.0.0.1:${server.port}`;
@@ -77,7 +77,7 @@ test("http-server: POST /api/sessions/:id/directives injects directive", async (
   const p = createProject(graph, { session: "s1" });
   const { server, base } = await startServer(graph);
   try {
-    const resp = await fetch(`${base}/api/sessions/s1/directives`, {
+    const resp = await fetch(`${base}/api/sessions/${p.sessionId}/directives`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ kind: "hint", payload: "check auth" }),
@@ -96,7 +96,7 @@ test("http-server: POST /api/sessions/:id returns full detail", async () => {
   graph.addIntent(p.id, { description: "do work", creator: "planner" });
   const { server, base } = await startServer(graph);
   try {
-    const resp = await post(`${base}/api/sessions/s1`);
+    const resp = await post(`${base}/api/sessions/${p.sessionId}`);
     const data = await resp.json();
     assert.equal(data.facts.length, 1);
     assert.equal(data.intents.length, 1);
@@ -116,29 +116,29 @@ test("http-server: one server isolates sessions and matches the local snapshot r
 
   const server = new HttpServer();
   server.registerSession({
-    sessionId: "unified-a", graph: graphA, projectId: projectA.id,
+    sessionId: projectA.sessionId, graph: graphA, projectId: projectA.id,
   });
   server.registerSession({
-    sessionId: "unified-b", graph: graphB, projectId: projectB.id,
+    sessionId: projectB.sessionId, graph: graphB, projectId: projectB.id,
   });
   await server.start({ port: 0 });
   const base = `http://127.0.0.1:${server.port}`;
   try {
     const sessions = await (await post(`${base}/api/sessions`)).json() as Array<{ sessionId: string }>;
-    assert.deepEqual(sessions.map((item) => item.sessionId), ["unified-a", "unified-b"]);
+    assert.deepEqual(new Set(sessions.map((item) => item.sessionId)), new Set([projectA.sessionId, projectB.sessionId]));
 
     const local = await new ServerSessionGraphReader(graphA).readSnapshot({
-      sessionId: "unified-a", profileId: "planner", projectId: projectA.id, spec: { graphView: "full" },
+      sessionId: projectA.sessionId, profileId: "planner", projectId: projectA.id, spec: { graphView: "full" },
     });
     const remote = await new HttpSessionGraphReader(base).readSnapshot({
-      sessionId: "unified-a", profileId: "planner", projectId: projectA.id, spec: { graphView: "full" },
+      sessionId: projectA.sessionId, profileId: "planner", projectId: projectA.id, spec: { graphView: "full" },
     });
     assert.equal(remote.contentHash, local.contentHash);
     assert.equal(remote.content, local.content);
     assert.match(remote.content, /only session A/);
     assert.doesNotMatch(remote.content, /only session B/);
 
-    const intents = await (await post(`${base}/api/sessions/unified-b/intents`)).json() as unknown[];
+    const intents = await (await post(`${base}/api/sessions/${projectB.sessionId}/intents`)).json() as unknown[];
     assert.deepEqual(intents, []);
   } finally {
     await server.stop();
@@ -152,12 +152,12 @@ test("http-server: graph snapshots are role-scoped JSON, not direct database acc
   const project = createProject(graph, { session: "permission-session", taskConfig: config });
   const server = new HttpServer();
   server.registerSession({
-    sessionId: project.session,
+    sessionId: project.sessionId,
     projectId: project.id,
     graph,
   });
   await server.start({ port: 0 });
-  const endpoint = `${server.baseUrl}/api/sessions/${project.session}/graph/snapshot`;
+  const endpoint = `${server.baseUrl}/api/sessions/${project.sessionId}/graph/snapshot`;
   try {
     const scoped = await post(endpoint, {
       projectId: project.id,
@@ -178,33 +178,31 @@ test("http-server: graph snapshots are role-scoped JSON, not direct database acc
   }
 });
 
-test("http-server: task-group read model exposes generation, membership, and broadcast watermarks", async () => {
+test("http-server: task-group read model exposes membership and pending broadcasts", async () => {
   const graphA = new TestGraph();
   const graphB = new TestGraph();
   const projectA = createProject(graphA, { session: "group-a" });
   const projectB = createProject(graphB, { session: "group-b" });
   graphA.createEndFact(projectA.id, "session A is ready", []);
   const bus = new TestFederationBus();
-  bus.registerExpectedSessions("analysis-group", ["group-a", "group-b"]);
-  bus.registerSession("group-a", "analysis-group", projectA.id);
-  bus.registerSession("group-b", "analysis-group", projectB.id);
+  bus.registerSession(projectA.sessionId, "analysis-group", projectA.id, graphA);
+  bus.registerSession(projectB.sessionId, "analysis-group", projectB.id, graphB);
   const server = new HttpServer(bus);
   server.registerSession({
-    sessionId: "group-a", graph: graphA, projectId: projectA.id, taskGroupScope: "analysis-group",
+    sessionId: projectA.sessionId, graph: graphA, projectId: projectA.id, taskGroupScope: "analysis-group",
   });
   server.registerSession({
-    sessionId: "group-b", graph: graphB, projectId: projectB.id, taskGroupScope: "analysis-group",
+    sessionId: projectB.sessionId, graph: graphB, projectId: projectB.id, taskGroupScope: "analysis-group",
   });
   await server.start({ port: 0 });
   const base = `http://127.0.0.1:${server.port}`;
   try {
     const groups = await (await post(`${base}/api/task-groups`)).json() as Array<{
-      scope: string; generation: number; headSeq: number; members: unknown[];
+      scope: string; pendingBroadcasts: number; members: unknown[];
     }>;
     assert.equal(groups.length, 1);
     assert.equal(groups[0]?.scope, "analysis-group");
-    assert.equal(groups[0]?.generation, 1);
-    assert.equal(groups[0]?.headSeq, 0);
+    assert.equal(groups[0]?.pendingBroadcasts, 0);
     assert.equal(groups[0]?.members.length, 2);
 
     const sessions = await (await post(`${base}/api/sessions`)).json() as Array<{
@@ -212,7 +210,7 @@ test("http-server: task-group read model exposes generation, membership, and bro
     }>;
     assert.ok(sessions.every((session) => session.taskGroup.scope === "analysis-group"));
     assert.ok(sessions.every((session) => session.taskGroup.memberStatus === "active"));
-    const endFacts = await (await post(`${base}/api/sessions/group-a/end-facts`)).json() as Array<{
+    const endFacts = await (await post(`${base}/api/sessions/${projectA.sessionId}/end-facts`)).json() as Array<{
       description: string;
     }>;
     assert.equal(endFacts[0]?.description, "session A is ready");
@@ -227,10 +225,10 @@ test("http-server: control endpoints require the configured bearer token", async
   const project = createProject(graph, { session: "secured" });
   const server = new HttpServer();
   server.registerSession({
-    sessionId: "secured", projectId: project.id, graph,
+    sessionId: project.sessionId, projectId: project.id, graph,
   });
   await server.start({ port: 0, token: "test-secret" });
-  const endpoint = `http://127.0.0.1:${server.port}/api/sessions/secured/directives`;
+  const endpoint = `http://127.0.0.1:${server.port}/api/sessions/${project.sessionId}/directives`;
   try {
     const denied = await fetch(endpoint, {
       method: "POST",
@@ -296,11 +294,11 @@ test("http-server: event API is POST-only", async () => {
   const project = createProject(graph, { session: "streamed" });
   const server = new HttpServer();
   server.registerSession({
-    sessionId: "streamed", projectId: project.id, graph,
+    sessionId: project.sessionId, projectId: project.id, graph,
   });
   await server.start({ port: 0 });
   try {
-    const endpoint = `http://127.0.0.1:${server.port}/api/sessions/streamed/events`;
+    const endpoint = `http://127.0.0.1:${server.port}/api/sessions/${project.sessionId}/events`;
     assert.equal((await fetch(endpoint)).status, 405);
     assert.equal((await post(endpoint)).status, 200);
   } finally {

@@ -8,9 +8,9 @@
 
 import { DatabaseSync } from "node:sqlite";
 import type {
-  BroadcastAssessment, Directive, DirectiveId, DirectiveInput,
+  Directive, DirectiveId, DirectiveInput,
   Fact, FactId, FactStatus, EndFact, GraphEvent, Hint, HintId,
-  Intent, IntentId, IntentStatus, ISOTime,
+  Intent, IntentId, IntentStatus,
   Progress, Project, ProjectId, ProjectStatus, TaskConfig, Verdict,
 } from "../agent/types.js";
 import {
@@ -22,15 +22,16 @@ import {
 const GRAPH_APPLICATION_ID = 1346715981;
 
 const SCHEMA = `
-PRAGMA journal_mode=WAL;
+PRAGMA journal_mode=DELETE;
 PRAGMA busy_timeout=5000;
 PRAGMA foreign_keys=ON;
 PRAGMA application_id=${GRAPH_APPLICATION_ID};
-PRAGMA user_version=2;
+PRAGMA user_version=4;
 
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
-  session TEXT UNIQUE NOT NULL,
+  session_id TEXT UNIQUE NOT NULL,
+  session TEXT NOT NULL,
   name TEXT NOT NULL,
   target TEXT NOT NULL,
   goal TEXT NOT NULL,
@@ -177,7 +178,7 @@ export class SqliteGraph implements Graph {
     const id = newProjectId();
     const ts = now();
     const project: Project = {
-      id, session: input.session, name: input.name,
+      id, sessionId: input.sessionId, session: input.session, name: input.name,
       target: input.target, goal: input.goal,
       status: "active", worker: input.worker,
       sessionDir: input.sessionDir, workspaceDir: input.workspaceDir ?? input.sessionDir,
@@ -186,9 +187,9 @@ export class SqliteGraph implements Graph {
     };
     this.transaction(() => {
       this.run(
-        `INSERT INTO projects (id, session, name, target, goal, status, worker, session_dir, workspace_dir, config_path, config_json, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)`,
-        id, input.session, input.name, input.target, input.goal,
+        `INSERT INTO projects (id, session_id, session, name, target, goal, status, worker, session_dir, workspace_dir, config_path, config_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)`,
+        id, input.sessionId, input.session, input.name, input.target, input.goal,
         input.worker, input.sessionDir, input.workspaceDir ?? input.sessionDir, input.configPath,
         JSON.stringify(input.taskConfig), ts, ts,
       );
@@ -224,7 +225,7 @@ export class SqliteGraph implements Graph {
   addFact(projectId: ProjectId, input: FactInput): Fact {
     return this.transaction(() => {
       this.reactivateIfFinishProposed(projectId, "fact.created");
-      const counter = this.nextId(projectId, "facts", "f");
+      const counter = this.nextId(projectId, "facts");
       const id = `f${String(counter).padStart(3, "0")}`;
       const ts = now();
       const stepRow = this.get("SELECT value FROM meta WHERE key = ?", `steps:${projectId}`);
@@ -339,7 +340,7 @@ export class SqliteGraph implements Graph {
           );
         }
       }
-      const counter = this.nextId(projectId, "intents", "i");
+      const counter = this.nextId(projectId, "intents");
       const id = `i${String(counter).padStart(3, "0")}`;
       const ts = now();
       const intent: Intent = {
@@ -526,7 +527,7 @@ export class SqliteGraph implements Graph {
         "UPDATE end_facts SET status = 'superseded', superseded_at = ?, superseded_reason = ? WHERE project_id = ? AND status = 'active'",
         now(), "replaced by a newer planner proposal", projectId,
       );
-      const id = `end_${String(this.nextId(projectId, "end_facts", "end_")).padStart(3, "0")}`;
+      const id = `end_${String(this.nextId(projectId, "end_facts")).padStart(3, "0")}`;
       const createdAt = now();
       this.run(
         "INSERT INTO end_facts (id, project_id, description, from_fact_ids_json, status, created_at) VALUES (?, ?, ?, ?, 'active', ?)",
@@ -583,38 +584,6 @@ export class SqliteGraph implements Graph {
     });
   }
 
-  commitBroadcastAssessment(
-    projectId: ProjectId,
-    broadcastId: string,
-    assessment: BroadcastAssessment,
-    broadcastKind?: string,
-  ): void {
-    this.transaction(() => {
-      const project = this.get("SELECT status FROM projects WHERE id = ?", projectId);
-      if (!project || (project.status !== "active" && project.status !== "finish_proposed")) {
-        throw new Error("broadcast result cannot commit after project stops");
-      }
-      if (assessment.decision === "condition_satisfied") {
-        const fact = assessment.targetFactId
-          ? this.get("SELECT status FROM facts WHERE project_id = ? AND id = ?", projectId, assessment.targetFactId)
-          : undefined;
-        if (!fact || fact.status !== "pending") {
-          throw new Error(`broadcast target is not a pending fact: ${assessment.targetFactId ?? "missing"}`);
-        }
-        this.clearFactConditions(projectId, assessment.targetFactId!);
-      } else if (assessment.decision === "relevant") {
-        this.reactivateIfFinishProposed(projectId, "relevant federation broadcast");
-      }
-      this.logEvent(projectId, "federation.broadcast_assessed", {
-        broadcastId,
-        broadcastKind,
-        decision: assessment.decision,
-        reason: assessment.reason,
-        targetFactId: assessment.targetFactId,
-      });
-    });
-  }
-
   commitMetacogResult(
     projectId: ProjectId,
     input: MetacogCommitInput,
@@ -625,14 +594,6 @@ export class SqliteGraph implements Graph {
         throw new Error("metacog result cannot commit after project stops");
       }
       for (const hint of input.hints) this.addHint(projectId, hint);
-      if (input.reviewedFactId) {
-        this.logEvent(projectId, "metacog.fact_reviewed", {
-          factId: input.reviewedFactId,
-        });
-      }
-      if (input.finalReviewCompleted && this.getProject(projectId)?.status === "finish_proposed") {
-        this.logEvent(projectId, "metacog.final_review_completed");
-      }
     });
   }
 
@@ -641,7 +602,7 @@ export class SqliteGraph implements Graph {
   addHint(projectId: ProjectId, input: HintInput): Hint {
     return this.transaction(() => {
       this.reactivateIfFinishProposed(projectId, "hint.created");
-      const counter = this.nextId(projectId, "hints", "h");
+      const counter = this.nextId(projectId, "hints");
       const id = `h${String(counter).padStart(3, "0")}`;
       const ts = now();
       const hint: Hint = {
@@ -677,7 +638,7 @@ export class SqliteGraph implements Graph {
 
   addDirective(projectId: ProjectId, input: DirectiveInput): Directive {
     return this.transaction(() => {
-      const counter = this.nextId(projectId, "directives", "d");
+      const counter = this.nextId(projectId, "directives");
       const id = `d${String(counter).padStart(3, "0")}`;
       const ts = now();
       const dir: Directive = { id, projectId, kind: input.kind, payload: input.payload, createdAt: ts };
@@ -782,7 +743,7 @@ export class SqliteGraph implements Graph {
     return this.db.prepare(sql).all(...params);
   }
 
-  private nextId(projectId: ProjectId, table: string, prefix: string): number {
+  private nextId(projectId: ProjectId, table: string): number {
     const row = this.get(`SELECT COUNT(*) AS count FROM ${table} WHERE project_id = ?`, projectId);
     return Number(row?.count ?? 0) + 1;
   }
@@ -812,7 +773,12 @@ export class SqliteGraph implements Graph {
   }
 
   private findProject(idOrSession: string): Project | undefined {
-    const row = this.get("SELECT * FROM projects WHERE id = ? OR session = ?", idOrSession, idOrSession);
+    const row = this.get(
+      "SELECT * FROM projects WHERE id = ? OR session_id = ? OR session = ?",
+      idOrSession,
+      idOrSession,
+      idOrSession,
+    );
     return row ? projectFromRow(row) : undefined;
   }
 }
@@ -827,8 +793,8 @@ function assertDatabaseIdentity(db: DatabaseSync, applicationId: number, label: 
     throw new Error(`${label} database does not use the first-version schema`);
   }
   const version = db.prepare("PRAGMA user_version").get() as { user_version: number };
-  if (Number(version.user_version) !== 2) {
-    throw new Error(`${label} database schema version must be 2`);
+  if (Number(version.user_version) !== 4) {
+    throw new Error(`${label} database schema version must be 4`);
   }
 }
 
@@ -836,7 +802,7 @@ function assertDatabaseIdentity(db: DatabaseSync, applicationId: number, label: 
 
 function projectFromRow(row: Record<string, unknown>): Project {
   return {
-    id: String(row.id), session: String(row.session), name: String(row.name),
+    id: String(row.id), sessionId: String(row.session_id), session: String(row.session), name: String(row.name),
     target: String(row.target), goal: String(row.goal),
     status: String(row.status) as Project["status"], worker: String(row.worker),
     sessionDir: String(row.session_dir),

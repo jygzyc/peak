@@ -45,3 +45,31 @@ test("parseEnvelope: handles JSON with newlines and whitespace", () => {
   const result = parseEnvelope(text, "test");
   assert.equal(result.kind, "hints");
 });
+
+test("parseEnvelope: handles unfenced pretty-printed JSON from Agent CLIs", () => {
+  const text = [
+    "{",
+    '  "kind": "fact",',
+    '  "data": {',
+    '    "description": "current finding",',
+    '    "evidence": ["https://example.com/{source}"],',
+    '    "confidence": 0.9',
+    "  }",
+    "}",
+  ].join("\n");
+  const result = parseEnvelope(text, "explorer");
+  assert.equal(result.kind, "fact");
+  assert.equal((result.data as { description: string }).description, "current finding");
+});
+
+test("parseEnvelope: finds an unfenced multiline envelope after unrelated braces", () => {
+  const text = [
+    "Checked code shaped like { not valid JSON }.",
+    "{",
+    '  "kind": "verdict",',
+    '  "data": { "decision": "pass", "reason": "verified" }',
+    "}",
+  ].join("\n");
+  const result = parseEnvelope(text, "evaluator");
+  assert.equal(result.kind, "verdict");
+});

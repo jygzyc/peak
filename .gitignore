@@ -19,6 +19,7 @@ examples/**/artifacts/
 examples/**/*.db
 examples/**/*.db-shm
 examples/**/*.db-wal
+.test/
 
 # Binary test samples (large; fetch separately)
 examples/*.apk

@@ -1,12 +1,12 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
-import { TestGraph } from "./test-graph.ts";
+import { TestFederationBus, TestGraph } from "./test-graph.ts";
 import { MockWorker } from "../dist/worker/mock-worker.js";
 import { MetacogSupervisor } from "../dist/session/metacog-supervisor.js";
-import { agentRecords, minimalConfig, createProject, env } from "./helper.ts";
+import { roleLogs, minimalConfig, createProject, env } from "./helper.ts";
 
-function makeSupervisor(graph: TestGraph, worker: MockWorker, intervalMs = 50) {
-  return new MetacogSupervisor(graph, worker, minimalConfig(), intervalMs);
+function makeSupervisor(graph: TestGraph, worker: MockWorker) {
+  return new MetacogSupervisor(graph, worker, minimalConfig());
 }
 
 function primeForMetacog(graph: TestGraph, p: ReturnType<typeof createProject>) {
@@ -14,34 +14,6 @@ function primeForMetacog(graph: TestGraph, p: ReturnType<typeof createProject>) 
   graph.resolveFact(p.id, f.id, { decision: "pass", reason: "ok" });
   return f;
 }
-
-test("metacog-supervisor: start sets running=true, stop sets running=false", () => {
-  const graph = new TestGraph();
-  const worker = new MockWorker();
-  const sup = makeSupervisor(graph, worker);
-  assert.equal(sup.isRunning, false);
-  sup.start();
-  assert.equal(sup.isRunning, true);
-  sup.stop();
-  assert.equal(sup.isRunning, false);
-});
-
-test("metacog-supervisor: double start is idempotent", () => {
-  const graph = new TestGraph();
-  const worker = new MockWorker();
-  const sup = makeSupervisor(graph, worker);
-  sup.start();
-  sup.start();
-  assert.equal(sup.isRunning, true);
-  sup.stop();
-});
-
-test("metacog-supervisor: stop without start is safe", () => {
-  const graph = new TestGraph();
-  const worker = new MockWorker();
-  const sup = makeSupervisor(graph, worker);
-  assert.doesNotThrow(() => sup.stop());
-});
 
 test("metacog-supervisor: runOnce produces hints and writes them to graph", async () => {
   const graph = new TestGraph();
@@ -74,7 +46,7 @@ test("metacog-supervisor: stop recommendation becomes a planner hint", async () 
   assert.ok(graph.unconsumedHints(p.id).some((hint) => /recommends ending/i.test(hint.content)));
 });
 
-test("metacog-supervisor: runOnce writes an applied agent JSON record", async () => {
+test("metacog-supervisor: runOnce writes metacog context and output logs", async () => {
   const graph = new TestGraph();
   const worker = new MockWorker();
   const p = createProject(graph);
@@ -85,12 +57,14 @@ test("metacog-supervisor: runOnce writes an applied agent JSON record", async ()
   const sup = makeSupervisor(graph, worker);
   await sup.runOnce();
 
-  const records = await agentRecords(p);
-  assert.equal(records.length, 1);
-  assert.equal(records[0]!.status, "applied");
+  const records = await roleLogs(p);
+  assert.deepEqual(records.map((entry) => [entry.role, entry.kind]), [
+    ["metacog", "context"],
+    ["metacog", "output"],
+  ]);
 });
 
-test("metacog-supervisor: runOnce worker error marks the JSON record failed", async () => {
+test("metacog-supervisor: invalid output records context and failure output", async () => {
   const graph = new TestGraph();
   const worker = new MockWorker();
   const p = createProject(graph);
@@ -101,9 +75,9 @@ test("metacog-supervisor: runOnce worker error marks the JSON record failed", as
   const sup = makeSupervisor(graph, worker);
   await sup.runOnce();
 
-  const failed = (await agentRecords(p)).filter((record) => record.status === "failed");
-  assert.equal(failed.length, 1);
-  assert.ok(failed[0]!.errorMessage);
+  const logs = await roleLogs(p);
+  assert.deepEqual(logs.map((entry) => entry.kind), ["context", "output"]);
+  assert.match((logs[1]!.data as { error: string }).error, /no JSON object/);
 });
 
 test("metacog-supervisor: runOnce does NOT run for inactive projects", async () => {
@@ -120,30 +94,54 @@ test("metacog-supervisor: runOnce does NOT run for inactive projects", async () 
   await sup.runOnce();
 
   assert.equal(metacogCalled, false);
-  assert.equal((await agentRecords(p)).length, 0);
+  assert.equal((await roleLogs(p)).length, 0);
 });
 
-test("metacog-supervisor: unchanged trigger state is coalesced", async () => {
+test("metacog-supervisor: one pass Fact triggers one review", async () => {
   const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
-  config.profiles.metacog.triggers = { everySteps: 1, stagnationLevel: 99 };
   const p = createProject(graph);
   primeForMetacog(graph, p);
   worker.register(/Metacog Role/i, env("hints", { hints: [] }));
 
-  const sup = new MetacogSupervisor(graph, worker, config, 1);
+  const sup = new MetacogSupervisor(graph, worker, config);
   await sup.runOnce();
   await sup.runOnce();
 
-  assert.equal((await agentRecords(p)).filter((record) => record.profileId === "metacog").length, 1);
+  assert.equal((await roleLogs(p)).filter((entry) => entry.role === "metacog" && entry.kind === "output").length, 1);
 });
 
-test("metacog-supervisor: concurrent triggers share one lock-free in-flight execution", async () => {
+test("metacog-supervisor: every pass Fact produces one unified broadcast", async () => {
   const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
-  config.profiles.metacog.triggers = { everySteps: 1, stagnationLevel: 99 };
+  const p = createProject(graph);
+  const first = primeForMetacog(graph, p);
+  const second = graph.addFact(p.id, { description: "another accepted fact", source: "explorer" });
+  graph.resolveFact(p.id, second.id, { decision: "pass", reason: "second verified" });
+  worker.register(/Metacog Role/i, env("hints", { hints: [] }));
+  const bus = new TestFederationBus();
+  bus.registerSession(p.sessionId, "scope", p.id, graph);
+
+  const sup = new MetacogSupervisor(graph, worker, config, {
+    bus,
+    sessionId: p.sessionId,
+    scope: "scope",
+  });
+  await sup.runOnce();
+
+  assert.deepEqual(
+    bus.recentBroadcasts(10, "scope").map((broadcast) => broadcast.factId).sort(),
+    [first.id, second.id].sort(),
+  );
+  assert.equal((await roleLogs(p)).filter((entry) => entry.role === "metacog" && entry.kind === "output").length, 2);
+});
+
+test("metacog-supervisor: concurrent calls share one lock-free execution", async () => {
+  const graph = new TestGraph();
+  const worker = new MockWorker();
+  const config = minimalConfig();
   const p = createProject(graph);
   primeForMetacog(graph, p);
   let calls = 0;
@@ -154,18 +152,14 @@ test("metacog-supervisor: concurrent triggers share one lock-free in-flight exec
     await held;
     return env("hints", { hints: [] });
   });
-  const sup = new MetacogSupervisor(graph, worker, config, 1);
+  const sup = new MetacogSupervisor(graph, worker, config);
 
   const first = sup.runOnce();
   const second = sup.runOnce();
   for (let attempt = 0; attempt < 100 && calls === 0; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 1));
   }
-  assert.equal(
-    (await agentRecords(p)).filter((record) => record.profileId === "metacog" && record.status === "running").length,
-    1,
-    "both triggers must share one in-flight execution",
-  );
+  assert.equal((await roleLogs(p)).filter((entry) => entry.role === "metacog" && entry.kind === "context").length, 1);
   assert.equal(calls, 1);
   release();
   await Promise.all([first, second]);

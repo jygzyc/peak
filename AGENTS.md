@@ -10,20 +10,20 @@ Coding guidance for the optional TypeScript `peak` package.
 
 ## Architecture
 
-`peak` implements a profile-driven subagent control plane:
+`peak` implements a configured multi-Agent control plane:
 
 ```text
 GlobalSupervisor / AgentRuntime
   -> manages multiple SessionLoops
   -> global resource scheduling, worker quota, HTTP/API
-  -> owns the cross-session FederationBus
+  -> coordinates cross-session broadcasts without a separate database
 
 SessionLoop(session)
   -> owns the session-local Graph
   -> owns the session-local MainAgent / Planner
   -> owns the session-local MetacogSupervisor
   -> controls active role executions in memory
-  -> writes role audit JSON under sessions/<session>/agents
+  -> writes context/output JSON and main.log under sessions/<uuid>/logs
   -> writes back to the session Graph via permission-checked DecisionApplier
 
 SubagentProfile
@@ -36,12 +36,12 @@ Graph
 Core principles:
 
 1. Source implements mechanism only — no hardcoded role semantics.
-2. Roles, prompts, models, workers, permissions, and context policies come from configuration.
+2. Roles, prompts, tools, skills, workers, permissions, and context policies come from configuration. A Worker's optional model is passed to its Agent CLI.
 3. The Graph is the single session-local source of truth.
 4. Main loop is easy to find: `session/session-loop.ts` (per-session) and `session/supervisor.ts` (global).
-5. Explorer / Evaluator / Metacog extend BaseAgent; live cancellation and concurrency are runtime state, while completed invocation audits are JSON files outside Graph.
+5. All four roles extend BaseAgent; live cancellation and concurrency are runtime state, while each execution writes only context/output JSON outside Graph.
 6. Each active session has its own MainAgent/Planner and Metacog; the global layer only supervises.
-7. Session-internal sync goes through Graph/events; cross-session insight goes through FederationBus (read-only summary + refs, never cross-session graph writes).
+7. Session-internal task state goes through Graph/events. Every pass Fact triggers metacog and one `{sessionId, factId, reason}` broadcast; FederationBus resolves the source Fact by reference and never writes either Session Graph.
 
 Architecture and runtime data flow are documented in `docs/README.md` and `docs/data-flow.md`.
 
@@ -50,12 +50,12 @@ Architecture and runtime data flow are documented in `docs/README.md` and `docs/
 ```text
 src/
 ├── app/       # runtime composition root (AgentRuntime)
-├── config/    # task/default/provider config, profile-loader, prompt-loader
+├── config/    # task/Agent/default config and prompt-loader
 ├── session/   # SessionLoop, GlobalSupervisor, MetacogSupervisor, SessionCoordinator, SessionManager
 ├── agent/     # MainAgent, DecisionApplier, contracts, permissions, context-builder, graph-view,
 │              # parse-envelope, prompts/builtins, and role implementations
 ├── graph/     # Graph interface, persistent SQLite store, FederatedGraph, FederationBus
-├── worker/    # worker runtime, drivers, backends, providers, mock worker
+├── worker/    # BaseWorker, four Agent CLI workers, runtime pool, mock worker
 ├── server/    # HTTP API and embedded dashboard
 ├── cli.ts     # CLI entrypoint
 └── index.ts   # public exports
@@ -63,43 +63,52 @@ src/
 
 ## Config model
 
-A `TaskConfig` is profiles-first:
+A Task file has one narrow top-level schema:
 
 ```text
 task
-profiles
+agent       (optional task-local <name>.json bundle)
 workers
 scheduler   (optional — scheduler resource knobs only; NOT a "workflow")
-control
+federation  (optional scope)
 ```
 
 Important points:
 
 - `task.target` and `task.goal` are required.
-- `profiles` declares SubagentProfiles. The built-in slots are `planner`, `explorer`, `evaluator`, and optional `metacog`; custom profiles (e.g. `source-finder`, `strict-reviewer`) live under arbitrary keys.
-- A SubagentProfile binds together: `runtime` (worker + optional model), `prompt` (file/text/rules/knowledge), `context` (graphView + maxFacts), `permissions` (capability tokens), `output` (contract name), plus per-agent tuning knobs: `maxActive`, `cooldownSteps` (planner), `triggers` (metacog), `intervalSeconds`.
-- `workers` defines low-level worker configs (`kind: "agent" | "api" | "mock"`).
+- `agent` selects exactly one role bundle beside `task.json`. Omit it to use the native four roles.
+- Agent files contain `roles`; custom ids may provide multiple roles of one protocol type, such as `explorer_gather` and `explorer_analysis`.
+- A role config may set Worker refs, prompt, tools, skills, context and execution knobs. Permissions and output contracts are fixed by the four protocol roles and cannot be overridden.
+- `workers` defines named CLI workers: `type` is `opencode | codex | pi | claude-code`; optional fields are `model`, `args`, and `timeoutMs`.
 - **There is no `workflow` concept.** Termination is natural (planner produces no new intent). `scheduler` (`maxConcurrent`/`refillPerTick`) is the only top-level execution knob and is optional. A `workflow` field is rejected as outside the first-version config schema.
-- `control.mainProfile` and `control.metacogProfile` select which profiles drive planning and metacognition. Metacog cadence belongs to `profiles.<id>.triggers.everySeconds`.
+- Old `profiles`, `agents` arrays, `control`, `task.session`, and `workflow` fields are rejected.
 
-## Peak home layout (`~/.peak/`)
+## Task workspace and Peak home
 
-All persistent state lives under one root (`PEAK_HOME` env overrides; default `~/.peak`):
+Task configuration is self-contained:
+
+```text
+workspace/
+├── task.json
+├── <task-agent>.json
+└── skills/<skill>/SKILL.md
+```
+
+Persistent Session state lives under `PEAK_HOME` (default `~/.peak`):
 
 ```text
 ~/.peak/
-├── config.json          global baseline (default workers/control) — optional
-├── agents/<name>.json   reusable role configs injected into builtin slots
-├── tasks/<name>.json    task configs (target/goal/session + agent refs + workers)
-├── sessions/<session>/  analysis.db plus agents/<agentId> JSON audit records
-└── providers.json       model provider configs
+└── sessions/
+    ├── .session.yaml
+    └── <uuid>/
+        ├── analysis.db
+        └── logs/<timestamp>-<role>-context|output.json + main.log
 ```
 
-- **Agent files are patches, not standalone profiles.** An agent file declares a builtin `slot` (planner/explorer/evaluator/metacog) and is deep-merged over that builtin profile — declared fields override, omitted fields keep the builtin default. Task `profiles` may additionally use arbitrary profile ids; `control.{mainProfile,explorerProfile,evaluatorProfile,metacogProfile}` binds one of them to each fixed protocol role, and SessionLoop validates that the profile's `role` matches. See `src/config/agent-loader.ts` and `src/session/session-loop.ts`.
-- A task's `agents: ["name", ...]` array references `~/.peak/agents/<name>.json`; each agent may also bring its own `workers` (merged under the task's workers).
-- Session name: `--session` > `task.session` > derived from `task.target` > derived from task filename.
-- `~/.peak/config.json` baseline is merged between `defaultConfig()` and the task file.
-- `ensurePeakLayout()` (called by `peak run`) idempotently creates `agents/`, `tasks/`, `sessions/`.
+- A Task's singular `agent` references `<task-dir>/<name>.json`; role Worker refs must resolve in the Task's `workers`.
+- Role Skill entries are names, never paths. Task initialization validates `<task-dir>/skills/<name>/SKILL.md` and links it to `~/.agents/skills` for OpenCode/Pi or `~/.claude/skills` for Claude Code. Existing real directories are never overwritten.
+- Session display name: `--session` > `task.name` > derived from `task.target` > derived from the task directory. The state directory always uses a random UUID.
+- `ensurePeakLayout()` creates only `sessions/`.
 
 ## Graph model
 
@@ -114,9 +123,9 @@ Graph state is session-local and is the source of truth:
 - Events
 - Dead-end route hashes
 
-Role invocation state is intentionally not part of Graph. Active controllers, cancellation, and concurrency live in the runtime; `agents/<agentId>/record.json` records the invocation after the fact.
+Role execution state is intentionally not part of Graph. Active controllers, cancellation, and concurrency live in memory; only timestamped context/output files and Graph operation `main.log` remain as history.
 
-Intent stores only task state (`open/claimed/pass/deny`). Worker ownership, lease epochs, heartbeats, retry counters, planner cooldowns, and federation delivery state are not Graph data. A new SessionLoop reopens orphaned `claimed` Intents; the FederationBus persists its own insights, deliveries, and cursors.
+Intent stores only task state (`open/claimed/pass/deny`). Worker ownership, lease epochs, heartbeats, retry counters, and planner cooldowns are not Graph data. A new SessionLoop reopens orphaned `claimed` Intents. Broadcast send/receive history is JSONL in each Session's `logs/main.log`; FederationBus rebuilds its in-memory queue from those logs and owns no database.
 
 Do not introduce domain-specific fact enums. Keep domain meaning in descriptions, evidence, prompts, and references.
 
@@ -132,19 +141,17 @@ Do not introduce domain-specific fact enums. Keep domain meaning in descriptions
 
 ## Workers
 
-Worker adapters are bottom-layer execution only. They must not own graph state or scheduling policy.
+Worker adapters are bottom-layer execution only. They must not own graph state, Agent prompt policy, or scheduling policy.
 
-- `src/worker/agent-driver.ts` handles agent CLI/HTTP backends.
-- `src/worker/api-driver.ts` handles direct model API providers.
-- `src/worker/backends/` contains OpenCode, Codex, Claude Code, HTTP, and custom process adapters.
-- `src/worker/providers/` contains direct model provider wiring.
-
-Backends should stay thin: prompt in, text/process result out.
+- `BaseWorker` owns subprocess execution, stdin, timeout, cancellation, output limits, and result shaping.
+- `OpenCodeWorker`, `CodexWorker`, `PiWorker`, and `ClaudeCodeWorker` inherit `BaseWorker` and implement only CLI arguments plus JSON result parsing.
+- `BaseAgent` supplies the complete role input assembled from prompt, tools, skills, context, assignment, and output contract.
+- Worker `model` is passed to the selected CLI's `--model`; authentication and provider configuration stay in that CLI.
+- Peak has no direct model API/SDK path, no HTTP Worker, and no `providers.json`.
 
 ## Editing gotchas
 
-- **Two different `WorkerRequest`/`WorkerResult` types exist.** `worker/worker-runtime.ts` (the agent-facing `WorkerPool` abstraction: `prompt`/`config`/`workerName`/`role`/`projectId`) vs `worker/base.ts` (the driver-internal contract: `worker`/`role`/`sessionDir`/`stdout`). They share names but not shape — `AgentDriverPool` hand-maps fields between them. Check which one a symbol refers to by import path.
-- **`kind` taxonomy is inconsistent across layers.** `WorkerKind = "agent" | "api" | "mock"` in `agent/types.ts`; AGENTS.md prose and `workerCapabilities()` use `command`/`model`/`agent`/`api`. Don't assume one vocabulary.
+- Worker configuration has one taxonomy only: `WorkerConfig.type`. Do not reintroduce `kind`, `backend`, `transport`, Provider, or API Worker layers.
 - **Windows path handling in scripts:** use `fileURLToPath(new URL("..", import.meta.url))` for the repo root, never `new URL("..", import.meta.url).pathname` (yields a malformed `\\E:\\` drive path on Windows). When deleting SQLite-backed session dirs in tests, `close()` the graph handle before `rmSync` (open files fail with EPERM on Windows).
 - **Session ids are filesystem-derived.** `SessionManager` sanitizes them via `safeSessionName` and rejects paths that escape `baseDir` — never bypass `sessionDir()` by joining `baseDir` with a raw id.
 

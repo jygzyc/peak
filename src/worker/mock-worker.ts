@@ -12,7 +12,7 @@
  * domain policy — it carries no business semantics.
  */
 
-import type { ProjectId, TaskConfig, WorkerName } from "../agent/types.js";
+import type { TaskConfig, WorkerName } from "../agent/types.js";
 import type { WorkerPool, WorkerRequest, WorkerResult } from "./worker-runtime.js";
 
 type ResponseSpec = string | ((request: WorkerRequest) => string | Promise<string>);
@@ -86,6 +86,7 @@ export class MockWorker implements WorkerPool {
       /Evaluator Role/i,
       envelope("verdict", { decision: "pass", reason: "mock acceptance" }),
     );
+    this.register(/Metacog Role/i, envelope("hints", { hints: [] }));
     return this;
   }
 
@@ -101,7 +102,7 @@ export class MockWorker implements WorkerPool {
 
   async execute(request: WorkerRequest): Promise<WorkerResult> {
     if (request.signal?.aborted) {
-      return { workerId: "mock", text: "", returncode: 1, stderr: "mock worker cancelled", aborted: true };
+      return { text: "", returncode: 1, stderr: "mock worker cancelled" };
     }
     for (const entry of this.entries) {
       if (entry.pattern.test(request.prompt)) {
@@ -110,21 +111,19 @@ export class MockWorker implements WorkerPool {
           : entry.response;
         const text = await abortable(raw, request.signal);
         this.callLog.push({ prompt: request.prompt, text, workerName: request.workerName, cwd: request.cwd });
-        return { workerId: "mock", text, returncode: entry.returncode };
+        return { text, returncode: entry.returncode };
       }
     }
     const stderr = `no mock match for prompt: ${request.prompt.slice(0, 100)}`;
     this.callLog.push({ prompt: request.prompt, text: "", workerName: request.workerName, cwd: request.cwd });
-    return { workerId: "mock", text: "", returncode: 1, stderr };
+    return { text: "", returncode: 1, stderr };
   }
 
-  pickWorker(projectId: ProjectId, config: TaskConfig, allowed?: WorkerName[]): WorkerName {
+  pickWorker(config: TaskConfig, allowed?: WorkerName[]): WorkerName {
     const candidates = (allowed?.length ? allowed : Object.keys(config.workers))
       .filter((name) => config.workers[name]);
     return candidates[0] ?? "mock";
   }
-
-  runningCount(_projectId: ProjectId): number { return 0; }
 }
 
 async function abortable(value: string | Promise<string>, signal?: AbortSignal): Promise<string> {

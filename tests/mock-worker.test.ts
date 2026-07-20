@@ -7,7 +7,7 @@ test("registerDefaults: planner prompt yields a decisions envelope with one inte
   const worker = new MockWorker().registerDefaults();
   const result = await worker.execute({
     prompt: "You are an automated planning module. ... context ...",
-    config: { kind: "mock" },
+    config: { type: "opencode" },
   });
   assert.equal(result.returncode, 0);
   const env = parseEnvelope(result.text, "test");
@@ -21,7 +21,7 @@ test("registerDefaults: explorer prompt yields a candidate fact envelope", async
   const worker = new MockWorker().registerDefaults();
   const result = await worker.execute({
     prompt: "# Explorer Role (Subagent)\n\ninvestigate the intent below",
-    config: { kind: "mock" },
+    config: { type: "opencode" },
   });
   assert.equal(result.returncode, 0);
   const env = parseEnvelope(result.text, "test");
@@ -34,7 +34,7 @@ test("registerDefaults: evaluator prompt yields an accept verdict", async () => 
   const worker = new MockWorker().registerDefaults();
   const result = await worker.execute({
     prompt: "# Evaluator Role\n\nassess the candidate fact",
-    config: { kind: "mock" },
+    config: { type: "opencode" },
   });
   assert.equal(result.returncode, 0);
   const env = parseEnvelope(result.text, "test");
@@ -44,10 +44,10 @@ test("registerDefaults: evaluator prompt yields an accept verdict", async () => 
 
 test("registerDefaults: second planner call concludes the run (natural termination)", async () => {
   const worker = new MockWorker().registerDefaults();
-  await worker.execute({ prompt: "automated planning module", config: { kind: "mock" } });
+  await worker.execute({ prompt: "automated planning module", config: { type: "opencode" } });
   const second = await worker.execute({
     prompt: "You are an automated planning module. (re-invoked)",
-    config: { kind: "mock" },
+    config: { type: "opencode" },
   });
   const env = parseEnvelope(second.text, "test");
   assert.equal(env.kind, "decisions");
@@ -57,7 +57,7 @@ test("registerDefaults: second planner call concludes the run (natural terminati
 
 test("registerDefaults: unmatched prompt still falls through to failure", async () => {
   const worker = new MockWorker().registerDefaults();
-  const result = await worker.execute({ prompt: "completely unrelated prompt", config: { kind: "mock" } });
+  const result = await worker.execute({ prompt: "completely unrelated prompt", config: { type: "opencode" } });
   assert.equal(result.returncode, 1);
   assert.match(result.stderr ?? "", /no mock match/);
 });

@@ -3,6 +3,7 @@ import { strict as assert } from "node:assert";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { AgentRuntime } from "../dist/app/agent-runtime.js";
 import { MockWorker } from "../dist/worker/mock-worker.js";
 import { SqliteGraph } from "../dist/graph/sqlite-graph.js";
@@ -17,15 +18,16 @@ function decisions(createIntents: unknown[] = [], concludeRun: unknown = null) {
 
 function makeRuntime(opts: { workerPool?: MockWorker } = {}) {
   const worker = opts.workerPool ?? new MockWorker();
+  worker.register(/Metacog Role/i, env("hints", { hints: [] }));
   const config = minimalConfig();
-  config.task.session = "test-session";
+  const sessionId = randomUUID();
   const runtime = new AgentRuntime(config, {
     baseDir: mkdtempSync(join(tmpdir(), "peak-agent-runtime-")),
     workerPool: worker,
     useHttp: false,
-    useMetacogSupervisor: false,
+    sessionId,
   });
-  return { runtime, worker, config };
+  return { runtime, worker, config, sessionId };
 }
 
 test("agent-runtime: createProject returns a project id", () => {
@@ -35,21 +37,19 @@ test("agent-runtime: createProject returns a project id", () => {
   assert.equal(typeof id, "string");
 });
 
-test("agent-runtime: persistent graph identity requires one session before construction", () => {
+test("agent-runtime: persistent graph identity requires a UUID before construction", () => {
   const config = minimalConfig();
   assert.throws(
     () => new AgentRuntime(config, { baseDir: "unused", useHttp: false }),
-    /requires task\.session or options\.sessionId/,
+    /requires a UUID sessionId/,
   );
-
-  config.task.session = "configured";
   assert.throws(
     () => new AgentRuntime(config, {
       baseDir: "unused",
       sessionId: "different",
       useHttp: false,
     }),
-    /session mismatch/,
+    /session id must be a UUID/,
   );
 });
 
@@ -83,13 +83,25 @@ test("agent-runtime: run drives to completion", async () => {
   assert.equal(result.type, "completed");
 });
 
+test("agent-runtime: run returns when the project reaches failed status", async () => {
+  const worker = new MockWorker();
+  const { runtime, config } = makeRuntime({ workerPool: worker });
+  config.profiles.planner!.retry = { maxAttempts: 1, backoffMs: 0 };
+  worker.register(/automated planning module/i, "not json");
+
+  const projectId = runtime.createProject({ session: "failed-session" });
+  const result = await runtime.run(projectId, { idlePollMs: 1 });
+
+  assert.deepEqual(result, { type: "failed", reason: "project failed" });
+  await runtime.close();
+});
+
 test("agent-runtime: federated single-session run completes through supervisor barrier", async () => {
   const worker = new MockWorker();
   const config = minimalConfig();
-  config.task.session = "fed-one";
+  const sessionId = randomUUID();
   config.federation = {
     scope: "fed-one-group",
-    members: ["fed-one"],
   };
   const bus = new TestFederationBus();
   const runtime = new AgentRuntime(config, {
@@ -97,7 +109,7 @@ test("agent-runtime: federated single-session run completes through supervisor b
     workerPool: worker,
     useHttp: false,
     federationBus: bus,
-    sessionId: "fed-one",
+    sessionId,
     federationScope: "fed-one-group",
   });
   let round = 0;
@@ -115,8 +127,7 @@ test("agent-runtime: federated single-session run completes through supervisor b
   const result = await runtime.run(projectId, { idlePollMs: 1 });
   assert.equal(result.type, "completed");
   assert.equal(runtime.graph.getProject(projectId)?.status, "completed");
-  assert.ok(bus.recentInsights(10, "fed-one-group").some((item) => item.kind === "fact"));
-  assert.ok(bus.recentInsights(10, "fed-one-group").some((item) => item.kind === "session_summary"));
+  assert.ok(bus.recentBroadcasts(10, "fed-one-group").some((item) => item.factId === "f001"));
   await runtime.close();
   bus.close();
 });
@@ -149,13 +160,6 @@ test("agent-runtime: addDirective injects directive into graph", () => {
   assert.equal(runtime.graph.unconsumedDirectives(pid).length, 1);
 });
 
-test("agent-runtime: startMetacog/stopMetacog are safe when supervisor disabled", () => {
-  const { runtime } = makeRuntime();
-  assert.equal(runtime.metacogSupervisor, undefined);
-  assert.doesNotThrow(() => runtime.startMetacog());
-  assert.doesNotThrow(() => runtime.stopMetacog());
-});
-
 test("agent-runtime: close does not throw", async () => {
   const { runtime } = makeRuntime();
   await assert.doesNotReject(runtime.close());
@@ -164,12 +168,11 @@ test("agent-runtime: close does not throw", async () => {
 test("agent-runtime: close aborts in-flight work before releasing the session", async () => {
   const worker = new MockWorker();
   const config = minimalConfig();
-  config.task.session = "closing";
   const runtime = new AgentRuntime(config, {
     baseDir: mkdtempSync(join(tmpdir(), "peak-agent-runtime-")),
     workerPool: worker,
     useHttp: false,
-    useMetacogSupervisor: false,
+    sessionId: randomUUID(),
   });
   worker.register(/automated planning module/i, () => new Promise<string>(() => {}));
   const projectId = runtime.createProject({ session: "closing" });
@@ -187,14 +190,13 @@ test("agent-runtime: close interrupts a supervisor run waiting in idle polling",
   const worker = new MockWorker();
   const supervisor = new GlobalSupervisor({ federationBus: new TestFederationBus() });
   const config = minimalConfig();
-  config.task.session = "closing-idle-run";
+  const sessionId = randomUUID();
   const runtime = new AgentRuntime(config, {
     baseDir: mkdtempSync(join(tmpdir(), "peak-agent-runtime-")),
     workerPool: worker,
     useHttp: false,
-    useMetacogSupervisor: false,
     globalSupervisor: supervisor,
-    sessionId: "closing-idle-run",
+    sessionId,
   });
   const projectId = runtime.createProject({ session: "closing-idle-run" });
   supervisor.tick = async () => [];
@@ -211,45 +213,27 @@ test("agent-runtime: close interrupts a supervisor run waiting in idle polling",
 test("agent-runtime: close removes its standalone federation registration", async () => {
   const bus = new TestFederationBus();
   const config = minimalConfig();
-  config.task.session = "closing-federation";
+  const sessionId = randomUUID();
   const runtime = new AgentRuntime(config, {
     baseDir: mkdtempSync(join(tmpdir(), "peak-agent-runtime-")),
     workerPool: new MockWorker(),
     useHttp: false,
-    useMetacogSupervisor: false,
     federationBus: bus,
     federationScope: "closing-scope",
+    sessionId,
   });
   runtime.createProject({ session: "closing-federation" });
   assert.equal(
-    bus.registeredSessions("closing-scope").find((member) => member.sessionId === "closing-federation")?.memberStatus,
-    "active",
+    bus.registeredSessions("closing-scope").some((member) => member.sessionId === sessionId),
+    true,
   );
 
   await runtime.close();
   assert.equal(
-    bus.registeredSessions("closing-scope").find((member) => member.sessionId === "closing-federation")?.memberStatus,
-    "left",
+    bus.registeredSessions("closing-scope").some((member) => member.sessionId === sessionId),
+    false,
   );
   bus.close();
-});
-
-test("agent-runtime: with metacog supervisor enabled, start/stop works", async () => {
-  const worker = new MockWorker();
-  const config = minimalConfig();
-  config.task.session = "metacog-runtime";
-  const runtime = new AgentRuntime(config, {
-    baseDir: mkdtempSync(join(tmpdir(), "peak-agent-runtime-")),
-    workerPool: worker,
-    useHttp: false,
-    useMetacogSupervisor: true,
-  });
-  assert.ok(runtime.metacogSupervisor);
-  runtime.startMetacog();
-  assert.equal(runtime.metacogSupervisor!.isRunning, true);
-  runtime.stopMetacog();
-  assert.equal(runtime.metacogSupervisor!.isRunning, false);
-  await runtime.close();
 });
 
 test("agent-runtime: always uses persistent SQLite", () => {

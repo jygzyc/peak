@@ -2,12 +2,12 @@
  * Core data model for peak.
  *
  * The model is intentionally graph-first and domain-neutral: facts, intents,
- * hints, directives, links, events, subagent runs, workers, and scheduling
+ * hints, directives, links, events, workers, and scheduling
  * limits describe analysis structure while domain meaning stays in
  * descriptions, evidence, and prompts.
  *
  * The protocol has four fixed session roles. Domain specialization belongs in
- * arbitrary profile ids, prompts, knowledge, skills, models, and workers; a
+ * arbitrary profile ids, prompts, knowledge, skills, and workers; a
  * profile binds to one of the four roles and cannot invent new capabilities.
  */
 
@@ -16,7 +16,6 @@ export type FactId = string;
 export type IntentId = string;
 export type HintId = string;
 export type DirectiveId = string;
-export type AgentId = string;
 export type EndFactId = string;
 
 export type SessionRole = "planner" | "explorer" | "evaluator" | "metacog";
@@ -30,7 +29,6 @@ export const BUILTIN_ROLES = {
   system: "system",
 } as const;
 
-export type AgentBackendId = "opencode" | "codex" | "claude-code" | string;
 export type ToolKind = "tool" | "skill";
 
 export type ISOTime = string;
@@ -46,6 +44,9 @@ export type ProjectStatus =
 
 export interface Project {
   id: ProjectId;
+  /** Stable UUID used for the persistent Session directory and Server route. */
+  sessionId: string;
+  /** Human-readable Session name. */
   session: string;
   name: string;
   target: string;
@@ -182,89 +183,42 @@ export interface DirectiveInput {
   payload: string;
 }
 
-// ─── Agent execution records (JSON artifacts, never Graph data) ───
-
-export type AgentRecordStatus =
-  | "running"
-  | "validated"
-  | "applied"
-  | "failed"
-  | "cancelled"
-  | "discarded";
-
-/** Audit record written under sessions/<session>/agents. Runtime scheduling
- * remains in SessionLoop; this record never participates in Graph state. */
-export interface AgentRecord {
-  version: 1;
-  id: AgentId;
-  projectId: ProjectId;
-  sessionId: string;
-  profileId: string;
-  role: RoleId;
-  workerName: WorkerName;
-  status: AgentRecordStatus;
-  intentId?: IntentId;
-  factId?: FactId;
-  inputSummary?: string;
-  outputSummary?: string;
-  errorMessage?: string;
-  inputTokens?: number;
-  outputTokens?: number;
-  promptHash?: string;
-  promptManifest?: PromptManifest;
-  contextArtifact?: ContextArtifact;
-  outputArtifact?: RoleOutputArtifact;
-  workerSessionId?: string;
-  createdAt: ISOTime;
-  startedAt: ISOTime;
-  finishedAt?: ISOTime;
-}
-
 // ─── Workers ───
 
 export type WorkerName = string;
-export type WorkerKind = "agent" | "api" | "mock";
+export type WorkerType = "opencode" | "codex" | "pi" | "claude-code";
 
 export interface WorkerConfig {
-  kind: WorkerKind;
-  backend?: string;
-  transport?: "subprocess" | "http";
-  command?: string;
-  args?: string[];
+  type: WorkerType;
+  /** Optional model understood by the selected Agent CLI. */
   model?: string;
-  baseUrl?: string;
-  apiKeyEnv?: string;
-  apiKey?: string;
-  password?: string;
-  provider?: string;
-  maxTokens?: number;
-  temperature?: number;
+  /** Extra arguments passed to the selected CLI before Peak's prompt input. */
+  args?: string[];
   timeoutMs?: number;
 }
 
 // ─── Subagent profiles (configuration-driven role binding) ───
 
 /**
- * Runtime selection for a subagent: which worker, optional model override,
- * and optional direct provider (for `api` workers).
+ * Runtime selection for a subagent. Model selection and authentication belong
+ * to the selected Agent CLI's own configuration.
  */
 export interface RuntimeSpec {
   worker: WorkerName;
   workers?: WorkerName[];
-  model?: string;
-  provider?: string;
 }
 
 /**
  * Prompt assembly specification. `file` accepts a `builtin:<id>` source or an
- * external file path. Rules, knowledge, skills, and instructions are appended
- * to that system prompt. ContextBuilder supplies runtime graph context.
+ * external file path. Rules, knowledge, configured Skill names, and
+ * instructions are appended to that system prompt. ContextBuilder supplies
+ * runtime graph context.
  */
 export interface PromptSpec {
   file: string;
   rules?: string[];
   knowledge?: string[];
-  /** Versioned task skill instructions. Paths and inline text are both allowed. */
+  /** Names of task-local Skills preinstalled for the selected Agent CLI. */
   skills?: string[];
   instructions?: string;
 }
@@ -316,8 +270,8 @@ export interface RoleOutputArtifact {
   version: 1;
   sessionId: string;
   projectId: ProjectId;
-  agentId: AgentId;
-  role: RoleId;
+  /** Configured role id, e.g. explorer_gather. */
+  role: string;
   relativePath: string;
   resolvedPath: string;
   sha256: string;
@@ -386,77 +340,49 @@ export interface RetryPolicy {
  * context policy, permissions, output contract, and concurrency bounds.
  *
  * Per-agent tuning knobs (no global "workflow" concept):
- *   - maxActive: concurrent invocation cap for this profile.
- *   - cooldownSteps: (planner) min steps between planner invocations.
- *   - triggers: (metacog) when the wall-clock metacog loop fires.
+ *   - maxActive: concurrent execution cap for this profile.
+ *   - cooldownSteps: (planner) min steps between planner executions.
  */
 export interface SubagentProfile {
   role: SessionRole;
   runtime: RuntimeSpec;
   prompt: PromptSpec;
+  /** Worker tool names made available to this configured role. */
+  tools?: string[];
   context: ContextSpec;
   permissions: Permission[];
   output: OutputSpec;
   maxActive?: number;
-  intervalSeconds?: number;
   /** Planner-only: min steps between planner runs (default 3). */
   cooldownSteps?: number;
-  /** Metacog-only: when the metacog wall-clock loop fires. */
-  triggers?: MetacogTriggers;
-  maxOutputTokens?: number;
   retry?: RetryPolicy;
 }
 
-/** Metacog firing triggers (per-metacog-profile, not global). */
-export interface MetacogTriggers {
-  everySteps?: number;
-  everySeconds?: number;
-  stagnationLevel?: number;
-}
-
 /**
- * Built-in profile slots used by SessionLoop and MetacogSupervisor wiring.
- * Custom profiles live in `profiles` under arbitrary keys and are dispatched
- * explicitly via SubagentManager.
+ * Effective role configuration assembled from the selected Agent bundle.
+ * It is internal runtime state; Task JSON does not declare profiles directly.
  */
-export interface BuiltinProfiles {
-  planner: SubagentProfile;
-  explorer: SubagentProfile;
-  evaluator: SubagentProfile;
-  metacog?: SubagentProfile;
-}
-
 export interface TaskConfig {
   task: {
     target: string;
     goal: string;
-    session?: string;
     name?: string;
     /** Worker cwd, resolved relative to the task config file. */
     workspace?: string;
   };
-  profiles: BuiltinProfiles & Record<string, SubagentProfile>;
+  /** Task-local role bundle loaded from <task-dir>/<name>.json. */
+  agent?: string;
+  /** Effective role profiles loaded from the selected reusable Agent bundle. */
+  profiles: Record<string, SubagentProfile>;
   workers: Record<WorkerName, WorkerConfig>;
   /** Scheduler resource knobs (optional; defaults suffice). Not a "workflow". */
   scheduler?: SchedulerConfig;
-  control?: ControlConfig;
   federation?: FederationConfig;
 }
 
 export interface FederationConfig {
   /** Related-session completion and broadcast visibility boundary. */
   scope?: string;
-  /** Expected related session ids. Required for safe cross-process grouping;
-   * omitted means membership is the sessions registered before execution. */
-  members?: string[];
-}
-
-export interface ControlConfig {
-  mainProfile?: string;
-  explorerProfile?: string;
-  evaluatorProfile?: string;
-  metacogProfile?: string;
-  globalMaxConcurrent?: number;
 }
 
 /**
@@ -484,13 +410,6 @@ export const DEFAULT_SCHEDULER = {
   maxConcurrent: 10,
   refillPerTick: 10,
 } as const;
-
-/** Default metacog triggers (used when the metacog profile omits `triggers`). */
-export const DEFAULT_METACOG_TRIGGERS: MetacogTriggers = {
-  everySteps: 5,
-  everySeconds: 30,
-  stagnationLevel: 3,
-};
 
 /**
  * Permission sets for the built-in roles. Custom profiles declare their own.

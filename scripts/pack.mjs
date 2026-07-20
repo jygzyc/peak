@@ -3,19 +3,21 @@
  *
  * Pipeline:
  *   1. `tsc --noEmit` for type checking (fail fast on type errors).
- *   2. Clean dist/ and bundle src/index.ts with esbuild into a single
+ *   2. Clean dist/ and bundle src/cli.ts with esbuild into a single
  *      minified, mangled ESM file. The four npm dependencies
- *      (commander, ai, @ai-sdk/openai, @ai-sdk/anthropic) and node:* builtins
+ *      (commander) and node:* builtins
  *      stay external so consumers' node_modules satisfy them.
- *   3. Verify the bundle boots: `node dist/index.js workers` must
- *      print valid JSON.
+ *   3. Verify the declared npm binary boots: `node dist/cli.js workers`
+ *      must print valid JSON.
  *   4. `npm pack` the bundled dist into dist-packages/.
  *   5. Emit dist-packages/manifest.json with name, version, fileName,
  *      compressed size, unpacked size, sha256, and bundle metadata.
  *
  * No sourcemap is emitted — performance over debuggability.
  *
- * Idempotent. Runnable via `npm run pack`.
+ * `prepare` builds and verifies dist/ for the npm prepack lifecycle.
+ * `archive` packs that prepared output into dist-packages/.
+ * With no mode, both phases run. Idempotent. Runnable via `npm run pack`.
  */
 import { build } from "esbuild";
 import { createHash } from "node:crypto";
@@ -40,19 +42,23 @@ import { spawnSync } from "node:child_process";
 const root = fileURLToPath(new URL("..", import.meta.url));
 const srcEntry = join(root, "src", "cli.ts");
 const distDir = join(root, "dist");
-const distEntry = join(distDir, "index.js");
+const distEntryRelative = "dist/cli.js";
+const distEntry = join(root, ...distEntryRelative.split("/"));
 const outDir = join(root, "dist-packages");
 const npmCache = mkdtempSync(join(tmpdir(), "peak-npm-cache-"));
+const mode = process.argv[2] ?? "all";
+
+if (!new Set(["all", "prepare", "archive"]).has(mode)) {
+  process.stderr.write(`unknown pack mode: ${mode}\n`);
+  process.exit(2);
+}
 
 const EXTERNAL = [
   "commander",
-  "ai",
-  "@ai-sdk/openai",
-  "@ai-sdk/anthropic",
 ];
 
 try {
-  await step("typecheck", () => {
+  if (mode !== "archive") await step("typecheck", () => {
     const npm = npmInvocation(["run", "typecheck"]);
     const result = spawnSync(npm.command, npm.args, {
       cwd: root,
@@ -65,16 +71,16 @@ try {
     }
   });
 
-  await step("clean dist", () => {
+  if (mode !== "archive") await step("clean dist", () => {
     rmSync(distDir, { recursive: true, force: true });
     mkdirSync(distDir, { recursive: true });
   });
 
-  await step("copy dashboard.html", () => {
+  if (mode !== "archive") await step("copy dashboard.html", () => {
     copyFileSync(join(root, "src", "server", "dashboard.html"), join(distDir, "dashboard.html"));
   });
 
-  await step("esbuild bundle", async () => {
+  if (mode !== "archive") await step("esbuild bundle", async () => {
     await build({
       entryPoints: [srcEntry],
       outfile: distEntry,
@@ -98,9 +104,16 @@ try {
     }
   });
 
-  await step("verify bundle", () => {
+  if (mode !== "archive") await step("verify bundle", () => {
     if (!existsSync(distEntry)) {
       process.stderr.write(`bundle did not produce ${distEntry}\n`);
+      process.exit(1);
+    }
+    const packageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf-8"));
+    if (packageJson.bin?.peak !== distEntryRelative) {
+      process.stderr.write(
+        `package bin.peak must reference the bundle: expected ${distEntryRelative}, got ${packageJson.bin?.peak}\n`,
+      );
       process.exit(1);
     }
     const verify = spawnSync(process.execPath, [distEntry, "workers"], {
@@ -110,7 +123,7 @@ try {
       env: npmEnv(),
     });
     if (verify.status !== 0) {
-      process.stderr.write("bundle verification failed: `node dist/index.js workers` exited non-zero\n");
+      process.stderr.write(`bundle verification failed: \`node ${distEntryRelative} workers\` exited non-zero\n`);
       process.stderr.write(verify.stderr || verify.stdout);
       process.exit(verify.status ?? 1);
     }
@@ -125,7 +138,7 @@ try {
     }
   });
 
-  await step("npm pack", () => {
+  if (mode !== "prepare") await step("npm pack", () => {
     rmSync(outDir, { recursive: true, force: true });
     mkdirSync(outDir, { recursive: true });
 
@@ -154,6 +167,13 @@ try {
 
     const [entry] = JSON.parse(packed.stdout);
     const fileName = entry.filename;
+    const packedFiles = new Set(
+      (entry.files ?? []).map((file) => String(file.path).replaceAll("\\", "/")),
+    );
+    if (!packedFiles.has(distEntryRelative)) {
+      process.stderr.write(`npm package does not contain declared binary ${distEntryRelative}\n`);
+      process.exit(1);
+    }
     // npm usually honors --pack-destination, but in some lifecycle wrappers
     // (e.g. publish --dry-run) it may write to cwd instead. Check both.
     const tarball = [join(outDir, fileName), join(root, fileName)].find(existsSync);
@@ -173,8 +193,8 @@ try {
       unpackedSize: entry.unpackedSize,
       sha256: createHash("sha256").update(bytes).digest("hex"),
       bundle: {
-        entry: "src/index.ts",
-        output: "dist/index.js",
+        entry: "src/cli.ts",
+        output: distEntryRelative,
         bundleBytes,
         external: EXTERNAL,
         format: "esm",

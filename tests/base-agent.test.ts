@@ -1,15 +1,16 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { MainAgent } from "../dist/agent/main-agent.js";
 import { EvaluatorAgent, ExplorerAgent, MetacogAgent } from "../dist/agent/role-agents.js";
 import { explorerExtra, evaluatorExtra, metacogExtra } from "../dist/agent/prompt-builder.js";
 import { ServerSessionGraphReader } from "../dist/server/session-graph-reader.js";
-import { agentRecords, createProject, env, freshSetup } from "./helper.ts";
+import { roleLogs, createProject, env, freshSetup } from "./helper.ts";
 
-test("BaseAgent: planner writes role-safe JSON records outside Graph", async () => {
+test("BaseAgent: planner writes timestamped context and output JSON under logs", async () => {
   const { graph, worker, config } = freshSetup();
   const project = createProject(graph);
+  config.profiles.planner!.tools = ["read", "grep"];
   worker.register(/automated planning module/i, env("decisions", {
     createIntents: [{ description: "scan", from: [], priority: 2, dispatchExplorer: true }],
     failIntents: [], consumeHints: [], concludeRun: null,
@@ -19,20 +20,23 @@ test("BaseAgent: planner writes role-safe JSON records outside Graph", async () 
   });
 
   const result = await agent.run({});
-  const records = await agentRecords(project);
+  const records = await roleLogs(project);
 
   assert.equal(result.decision.createIntents[0]?.description, "scan");
   assert.match(
     worker.calls()[0]!.prompt,
     /# Planner Role[\s\S]*Contract: main_decision[\s\S]*"kind": "decisions"/,
   );
-  assert.equal(records.length, 1);
-  assert.equal(records[0]!.status, "validated");
-  assert.match(records[0]!.promptHash!, /^[a-f0-9]{64}$/);
-  assert.equal(records[0]!.contextArtifact?.relativePath, `agents/${result.agentId}/context.json`);
-  assert.equal(records[0]!.outputArtifact?.relativePath, `agents/${result.agentId}/output.json`);
-  assert.ok(existsSync(records[0]!.contextArtifact!.resolvedPath));
-  assert.match(JSON.parse(readFileSync(records[0]!.contextArtifact!.resolvedPath, "utf8")).content, /## Objective/);
+  assert.match(worker.calls()[0]!.prompt, /Configured tools for this role: read, grep/);
+  assert.equal(records.length, 2);
+  const context = records.find((entry) => entry.kind === "context")!;
+  const output = records.find((entry) => entry.kind === "output")!;
+  assert.ok(existsSync(context.path));
+  assert.match((context.data as { content: string }).content, /## Objective/);
+  assert.equal((output.data as { kind: string }).kind, "decisions");
+  assert.match(context.path, /\d{8}T\d{9}Z-planner-context\.json$/);
+  assert.match(output.path, /\d{8}T\d{9}Z-planner-output\.json$/);
+  assert.equal(context.path.replace("-context.json", ""), output.path.replace("-output.json", ""));
   assert.equal("subagentRuns" in graph, false);
 });
 
@@ -70,7 +74,10 @@ test("ExplorerAgent: rejects output outside the candidate_fact contract", async 
     /no JSON object/,
   );
   assert.equal(worker.calls().length, 1);
-  assert.equal((await agentRecords(project))[0]!.status, "failed");
+  const logs = await roleLogs(project);
+  assert.deepEqual(logs.map((entry) => entry.kind), ["context", "output"]);
+  assert.match((logs[1]!.data as { error: string }).error, /no JSON object/);
+  assert.equal((logs[1]!.data as { rawText: string }).rawText, "unstructured result");
 });
 
 test("EvaluatorAgent: enforces the verdict contract", async () => {
@@ -92,7 +99,30 @@ test("EvaluatorAgent: enforces the verdict contract", async () => {
     agent.run({ candidate, promptExtra: evaluatorExtra(candidate) }),
     /contract="verdict".*kind="decisions"/,
   );
-  assert.equal((await agentRecords(project))[0]!.status, "failed");
+  const logs = await roleLogs(project);
+  assert.deepEqual(logs.map((entry) => entry.kind), ["context", "output"]);
+  assert.match((logs[1]!.data as { error: string }).error, /contract="verdict"/);
+});
+
+test("BaseAgent: records a failed Worker result under logs", async () => {
+  const { graph, worker, config } = freshSetup();
+  const project = createProject(graph);
+  worker.register(/# Explorer Role/i, "partial output", 7);
+  const agent = new ExplorerAgent({
+    profile: config.profiles.explorer,
+    profileId: "explorer",
+    project,
+    workerPool: worker,
+    config,
+    graphReader: new ServerSessionGraphReader(graph),
+  });
+
+  await assert.rejects(agent.run({ promptExtra: "assignment" }), /explorer worker failed/);
+  const logs = await roleLogs(project);
+  assert.deepEqual(logs.map((entry) => entry.kind), ["context", "output"]);
+  assert.equal((logs[1]!.data as { status: string }).status, "failed");
+  assert.equal((logs[1]!.data as { returncode: number }).returncode, 7);
+  assert.equal((logs[1]!.data as { rawText: string }).rawText, "partial output");
 });
 
 test("MetacogAgent: accepts hints and stop only", async () => {
@@ -111,11 +141,19 @@ test("MetacogAgent: accepts hints and stop only", async () => {
   assert.equal(result.output.kind, "hints");
 });
 
-test("BaseAgent: rejects API workers that cannot read local JSON", async () => {
+test("BaseAgent: sends the configured Agent input to its selected Worker", async () => {
   const { graph, worker, config } = freshSetup();
   const project = createProject(graph);
-  config.workers.direct = { kind: "api" };
+  config.workers.direct = { type: "pi", model: "anthropic/sonnet" };
   config.profiles.explorer.runtime.worker = "direct";
+  config.profiles.explorer.tools = ["read", "grep"];
+  let receivedType: string | undefined;
+  let receivedModel: string | undefined;
+  worker.register(/# Explorer Role/i, (request) => {
+    receivedType = request.config.type;
+    receivedModel = request.config.model;
+    return env("fact", { description: "worker result", confidence: 0.9 });
+  });
   const agent = new ExplorerAgent({
     profile: config.profiles.explorer,
     profileId: "explorer",
@@ -124,6 +162,10 @@ test("BaseAgent: rejects API workers that cannot read local JSON", async () => {
     config,
     graphReader: new ServerSessionGraphReader(graph),
   });
-  await assert.rejects(agent.run({ promptExtra: "test" }), /cannot read session JSON artifacts/);
-  assert.equal((await agentRecords(project)).length, 0);
+  const result = await agent.run({ promptExtra: "assignment" });
+  assert.equal(result.output.kind, "fact");
+  assert.equal(receivedType, "pi");
+  assert.equal(receivedModel, "anthropic/sonnet");
+  assert.match(worker.calls().at(-1)?.prompt ?? "", /Configured tools for this role: read, grep/);
+  assert.equal((await roleLogs(project)).length, 2);
 });

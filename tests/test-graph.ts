@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,7 @@ const openBuses = new Set<TestFederationBus>();
 export class TestGraph extends SqliteGraph {
   private readonly directory: string;
   readonly sessionDir: string;
+  readonly sessionId = randomUUID();
   private closed = false;
 
   constructor() {
@@ -31,15 +33,12 @@ export class TestGraph extends SqliteGraph {
   }
 }
 
-/** On-disk federation fixture; there is no in-memory database mode. */
+/** Process-local Fact broadcast fixture. */
 export class TestFederationBus extends FederationBus {
-  private readonly directory: string;
   private closed = false;
 
   constructor() {
-    const directory = mkdtempSync(join(tmpdir(), "peak-test-federation-"));
-    super({ dbPath: join(directory, "federation.db") });
-    this.directory = directory;
+    super();
     openBuses.add(this);
   }
 
@@ -48,7 +47,6 @@ export class TestFederationBus extends FederationBus {
     this.closed = true;
     super.close();
     openBuses.delete(this);
-    rmSync(this.directory, { recursive: true, force: true });
   }
 }
 

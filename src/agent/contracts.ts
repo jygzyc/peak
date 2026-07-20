@@ -33,7 +33,10 @@ const OUTPUT_CONTRACT_SHAPES: Record<OutputContract, string> = {
     "consumeHints": [],
     "concludeRun": null
   }
-}`,
+}
+
+When pass Facts already support the Goal and no work remains, replace concludeRun: null with:
+{ "description": "concise supported conclusion", "from": ["f001"] }`,
   candidate_fact: `{
   "kind": "fact",
   "data": { "description": "one objective finding", "evidence": ["how it was verified"], "confidence": 0.8 }
@@ -160,9 +163,13 @@ export interface CandidateFact {
 
 export function validateCandidateFact(envelope: WorkerEnvelope, stage: string): CandidateFact {
   const data = expectKind(envelope, "fact", stage);
+  const evidence = Array.isArray(data.evidence) ? data.evidence : [];
+  if (evidence.some((item) => typeof item !== "string" || item.length === 0)) {
+    throw new StageError('candidate fact "evidence" must contain only non-empty strings', stage);
+  }
   return {
     description: asString(data, "description", stage),
-    evidence: Array.isArray(data.evidence) ? (data.evidence as string[]) : [],
+    evidence: evidence as string[],
     confidence: asNumber(data, "confidence", stage, 0.7),
   };
 }

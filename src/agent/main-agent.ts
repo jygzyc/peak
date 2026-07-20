@@ -26,19 +26,16 @@ export interface MainAgentContext {
 export interface MainAgentResult {
   decision: MainDecision;
   permissions: PermissionChecker;
-  agentId: string;
 }
 
 export class MainAgent extends BaseAgent {
   private readonly profileId: string;
 
   constructor(private readonly mainContext: MainAgentContext) {
-    const profileId = mainContext.config.control?.mainProfile ?? "planner";
-    const profile = mainContext.config.profiles[profileId];
-    if (!profile) throw new StageError(`main profile not found: ${profileId}`, "planner");
-    if (profile.role !== "planner") {
-      throw new StageError(`main profile "${profileId}" must bind role planner`, "planner");
-    }
+    const selected = Object.entries(mainContext.config.profiles)
+      .find(([, candidate]) => candidate.role === "planner");
+    if (!selected) throw new StageError("planner role is not configured", "planner");
+    const [profileId, profile] = selected;
     super({ ...mainContext, profile, profileId });
     this.profileId = profileId;
   }
@@ -58,7 +55,6 @@ export class MainAgent extends BaseAgent {
     return {
       decision: result.output.decision,
       permissions: new PermissionChecker(this.mainContext.config.profiles[this.profileId]!),
-      agentId: result.agentId,
     };
   }
 }

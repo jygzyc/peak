@@ -7,10 +7,9 @@ import { MetacogSupervisor } from "../dist/session/metacog-supervisor.js";
 import { FederationBus } from "../dist/graph/federation-bus.js";
 import { GlobalSupervisor } from "../dist/session/supervisor.js";
 import { env } from "./helper.ts";
-
 export function loadMockScenario(path: string): ReturnType<typeof loadConfig> {
-  const loaded = loadConfig(path, undefined, { skipBaseline: true });
-  loaded.config.workers = { mock: { kind: "mock" } };
+  const loaded = loadConfig(path);
+  loaded.config.workers = { mock: { type: "opencode" } };
   for (const profile of Object.values(loaded.config.profiles)) {
     if (profile) profile.runtime = { worker: "mock" };
   }
@@ -18,11 +17,12 @@ export function loadMockScenario(path: string): ReturnType<typeof loadConfig> {
 }
 
 export function createScenarioProject(
-  graph: Graph & { sessionDir: string },
+  graph: Graph & { sessionDir: string; sessionId: string },
   loaded: ReturnType<typeof loadConfig>,
   workspaceDir = loaded.workspaceDir,
 ): ReturnType<Graph["createProject"]> {
   const input: ProjectInput = {
+    sessionId: graph.sessionId,
     session: loaded.session,
     name: loaded.config.task.name ?? loaded.session,
     target: loaded.config.task.target,
@@ -64,7 +64,6 @@ export function attachScenario(
     graph,
     worker,
     config,
-    undefined,
     { bus, sessionId, scope },
   );
   loop.setMetacog(metacog);
@@ -81,4 +80,17 @@ export async function tickUntilCompleted(
     if (projects.every(({ graph, projectId }) =>
       graph.getProject(projectId)?.status === "completed")) return;
   }
+  throw new Error(JSON.stringify({
+    projects: projects.map(({ graph, projectId }) => ({
+      projectId,
+      status: graph.getProject(projectId)?.status,
+      facts: graph.facts(projectId).map((fact) => ({
+        id: fact.id,
+        status: fact.status,
+        requiredConditions: fact.requiredConditions,
+      })),
+    })),
+    taskGroups: supervisor.federationBus.taskGroups(),
+    broadcasts: supervisor.federationBus.recentBroadcasts(),
+  }));
 }

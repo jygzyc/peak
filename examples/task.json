@@ -1,0 +1,15 @@
+{
+  "task": {
+    "name": "app-vulnerability-analysis",
+    "target": "./app",
+    "goal": "Find and verify security vulnerabilities in the authorized application",
+    "workspace": "."
+  },
+  "agent": "app_vulnhunt",
+  "workers": {
+    "opencode": {
+      "type": "opencode",
+      "timeoutMs": 300000
+    }
+  }
+}

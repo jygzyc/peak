@@ -1,6 +1,6 @@
 /** Process-local coordination state for one SessionLoop.
  *
- * Retry counters, planner cooldowns and delivery notifications control live
+ * Retry counters, planner cooldowns and broadcast notifications control live
  * execution. They are deliberately not part of the persistent task Graph.
  */
 import type { ProjectId, Verdict } from "../agent/types.js";

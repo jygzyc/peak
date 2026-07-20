@@ -3,47 +3,58 @@ import { strict as assert } from "node:assert";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SubprocessBackend } from "../dist/worker/backends/subprocess.js";
-import { ClaudeBackend } from "../dist/worker/backends/claude.js";
+import { BaseWorker } from "../dist/worker/backends/subprocess.js";
+import { ClaudeCodeWorker } from "../dist/worker/backends/claude.js";
 import type { WorkerConfig } from "../dist/agent/types.js";
 
-class StdinBatchBackend extends SubprocessBackend {
-  readonly id = "stdin-batch-test";
+class StdinBatchWorker extends BaseWorker {
+  readonly type = "stdin-batch-test";
+  private readonly command: string;
+
+  constructor(command: string) {
+    super();
+    this.command = command;
+  }
 
   buildArgv(config: WorkerConfig, prompt: string) {
     return {
-      argv: [config.command!, "a&b"],
+      argv: [this.command, "a&b"],
       input: prompt,
     };
   }
 }
 
-class TreeBatchBackend extends SubprocessBackend {
-  readonly id = "tree-batch-test";
+class TreeBatchWorker extends BaseWorker {
+  readonly type = "tree-batch-test";
+  private readonly command: string;
+
+  constructor(command: string) {
+    super();
+    this.command = command;
+  }
 
   buildArgv(config: WorkerConfig, prompt: string) {
-    return { argv: [config.command!], input: prompt };
+    return { argv: [this.command], input: prompt };
   }
 }
 
-test("ClaudeBackend: uses the first-version JSON result contract", () => {
-  const backend = new ClaudeBackend();
-  const built = backend.buildArgv({ kind: "agent", backend: "claude-code" }, "prompt");
-  assert.deepEqual(built.argv.slice(0, 6), [
+test("ClaudeCodeWorker: uses the first-version JSON result contract", () => {
+  const worker = new ClaudeCodeWorker();
+  const built = worker.buildArgv({ type: "claude-code", model: "sonnet" }, "prompt");
+  assert.deepEqual(built.argv.slice(0, 5), [
     "claude", "--dangerously-skip-permissions", "-p", "--output-format", "json",
   ]);
+  assert.deepEqual(built.argv.slice(5, 7), ["--model", "sonnet"]);
   const output = JSON.stringify({ type: "result", session_id: "session-1", result: "answer" });
-  assert.equal(backend.extractSession(output, ""), "session-1");
-  assert.equal(backend.extractResponseText(output, ""), "answer");
+  assert.equal(worker.extractResponseText(output), "answer");
 });
 
-test("ClaudeBackend: rejects non-JSON output", () => {
-  const backend = new ClaudeBackend();
-  assert.equal(backend.extractSession("session: session-1", ""), undefined);
-  assert.equal(backend.extractResponseText("plain answer", ""), "");
+test("ClaudeCodeWorker: rejects non-JSON output", () => {
+  const worker = new ClaudeCodeWorker();
+  assert.equal(worker.extractResponseText("plain answer"), "");
 });
 
-test("SubprocessBackend: Windows .cmd shim is isolated and prompt stays on stdin", {
+test("BaseWorker: Windows .cmd shim is isolated and prompt stays on stdin", {
   skip: process.platform !== "win32",
 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "peak shim "));
@@ -55,9 +66,10 @@ test("SubprocessBackend: Windows .cmd shim is isolated and prompt stays on stdin
     "echo input=%PEAK_INPUT%",
   ].join("\r\n"));
 
-  const result = await new StdinBatchBackend().invoke({
+  const result = await new StdinBatchWorker(shim).execute({
     prompt: "prompt-value",
-    config: { kind: "agent", command: shim, timeoutMs: 5_000 },
+    config: { type: "opencode", timeoutMs: 5_000 },
+    workerName: "test",
     cwd: dir,
   });
 
@@ -66,7 +78,7 @@ test("SubprocessBackend: Windows .cmd shim is isolated and prompt stays on stdin
   assert.match(result.text, /input=prompt-value/);
 });
 
-test("SubprocessBackend: AbortSignal terminates a Windows shim process tree", {
+test("BaseWorker: AbortSignal terminates a Windows shim process tree", {
   skip: process.platform !== "win32",
 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "peak tree "));
@@ -83,9 +95,10 @@ test("SubprocessBackend: AbortSignal terminates a Windows shim process tree", {
   ].join("\r\n"));
 
   const controller = new AbortController();
-  const pending = new TreeBatchBackend().invoke({
+  const pending = new TreeBatchWorker(shim).execute({
     prompt: "stdin-only-prompt",
-    config: { kind: "agent", command: shim, timeoutMs: 10_000 },
+    config: { type: "opencode", timeoutMs: 10_000 },
+    workerName: "test",
     cwd: dir,
     signal: controller.signal,
   });
@@ -97,7 +110,7 @@ test("SubprocessBackend: AbortSignal terminates a Windows shim process tree", {
   const result = await pending;
   await waitUntil(() => !isAlive(childPid), 2_000);
 
-  assert.equal(result.aborted, true);
+  assert.equal(result.stderr, "worker cancelled");
   assert.equal(isAlive(childPid), false, "descendant must not survive the cancelled shim");
 });
 

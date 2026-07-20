@@ -25,13 +25,9 @@ export interface AgentRuntimeOptions {
   baseDir?: string;
   workerPool?: WorkerPool;
   useHttp?: boolean;
-  useMetacogSupervisor?: boolean;
-  /** Shared cross-session insight bus. When set (with sessionId), this runtime's
-   *  evaluator publishes local verdicts and cross-validates candidates against
-   *  facts siblings have already verified. */
+  /** Optional shared coordinator. A standalone runtime creates its own bus. */
   federationBus?: FederationBus;
-  /** This session's id, used as source attribution on published insights and to
-   *  skip own insights when pulling sibling corroboration. */
+  /** UUID used in every Fact broadcast emitted by this Session's metacog. */
   sessionId?: string;
   federationScope?: string;
   /** Existing global control plane. When provided, createProject registers this
@@ -48,10 +44,11 @@ export class AgentRuntime {
   readonly sessionLoop: SessionLoop;
   readonly metacogSupervisor?: MetacogSupervisor;
   readonly httpServer?: HttpServer;
-  private readonly supervisor?: GlobalSupervisor;
+  private readonly supervisor: GlobalSupervisor;
+  private readonly ownsFederationBus: boolean;
   private federationScope?: string;
   private supervisorRegistration?: string;
-  private boundSession?: string;
+  private readonly sessionId: string;
   private readonly closeController = new AbortController();
   private closed = false;
   private closePromise?: Promise<void>;
@@ -60,34 +57,28 @@ export class AgentRuntime {
     private readonly config: TaskConfig,
     options: AgentRuntimeOptions = {},
   ) {
-    if (config.task.session && options.sessionId && config.task.session !== options.sessionId) {
-      throw new Error(
-        `AgentRuntime session mismatch: task.session is "${config.task.session}" but options.sessionId is "${options.sessionId}"`,
-      );
-    }
-    this.boundSession = options.sessionId ?? config.task.session;
-    if (!this.boundSession) {
-      throw new Error("AgentRuntime requires task.session or options.sessionId before construction");
-    }
+    if (!options.sessionId) throw new Error("AgentRuntime requires a UUID sessionId");
+    this.sessionId = options.sessionId;
     const baseDir = options.baseDir ?? sessionsDir();
     this.sessionManager = new SessionManager(baseDir);
-    this.graph = this.sessionManager.open(this.boundSession);
+    this.graph = this.sessionManager.open(this.sessionId);
 
     this.workerPool = options.workerPool ?? new AgentDriverPool();
-    const federationBus = options.federationBus ?? options.globalSupervisor?.federationBus;
+    const federationBus = options.federationBus
+      ?? options.globalSupervisor?.federationBus
+      ?? new FederationBus();
+    this.ownsFederationBus = !options.federationBus && !options.globalSupervisor;
     if (options.useHttp) this.httpServer = new HttpServer(federationBus);
     const graphReader = options.graphReader ?? (this.httpServer
       ? new HttpSessionGraphReader(() => this.httpServer!.baseUrl)
       : undefined);
-    const federationSessionId = this.boundSession;
+    const federationSessionId = this.sessionId;
     this.federationScope = options.federationScope
       ?? config.federation?.scope;
-    this.supervisor = options.globalSupervisor ?? (federationBus
-      ? new GlobalSupervisor({
-        federationBus,
-        globalMaxConcurrent: config.control?.globalMaxConcurrent,
-      })
-      : undefined);
+    this.supervisor = options.globalSupervisor ?? new GlobalSupervisor({
+      federationBus,
+      globalMaxConcurrent: config.scheduler?.maxConcurrent,
+    });
     this.sessionLoop = new SessionLoop(this.graph, this.workerPool, config, {
       federationBus,
       sessionId: federationSessionId,
@@ -95,19 +86,14 @@ export class AgentRuntime {
       graphReader,
     });
 
-    if (options.useMetacogSupervisor !== false) {
-      this.metacogSupervisor = new MetacogSupervisor(
-        this.graph,
-        this.workerPool,
-        config,
-        undefined,
-        federationSessionId && federationBus
-          ? { bus: federationBus, sessionId: federationSessionId, scope: this.federationScope ?? federationSessionId }
-          : undefined,
-        graphReader,
-      );
-      this.sessionLoop.setMetacog(this.metacogSupervisor);
-    }
+    this.metacogSupervisor = new MetacogSupervisor(
+      this.graph,
+      this.workerPool,
+      config,
+      { bus: federationBus, sessionId: federationSessionId, scope: this.federationScope ?? federationSessionId },
+      graphReader,
+    );
+    this.sessionLoop.setMetacog(this.metacogSupervisor);
 
   }
 
@@ -120,28 +106,21 @@ export class AgentRuntime {
   }): ProjectId {
     this.assertOpen();
     const session = input.session;
-    if (this.boundSession && this.boundSession !== session) {
-      throw new Error(
-        `AgentRuntime is bound to session "${this.boundSession}"; create a separate runtime and register it with GlobalSupervisor for session "${session}"`,
-      );
-    }
     const existingProjects = this.graph.listProjects();
     if (existingProjects.length > 0 && !existingProjects.some((project) => project.session === session)) {
       throw new Error("one session runtime may contain only one task/Project");
     }
-    this.boundSession = session;
-    this.federationScope ??= session;
-    const sessionDir = this.sessionManager.sessionDir(session);
+    this.federationScope ??= this.sessionId;
+    const sessionDir = this.sessionManager.sessionDir(this.sessionId);
     const configPath = input.configPath ?? join(sessionDir, "task.json");
     const workspaceDir = this.config.task.workspace
       ? resolve(dirname(configPath), this.config.task.workspace)
       : dirname(configPath);
-    const explorerProfileId = this.config.control?.explorerProfile ?? "explorer";
-    const explorerProfile = this.config.profiles[explorerProfileId];
-    if (!explorerProfile || explorerProfile.role !== "explorer") {
-      throw new Error(`explorer profile "${explorerProfileId}" is missing or has the wrong role`);
-    }
+    const explorerProfile = Object.values(this.config.profiles)
+      .find((profile) => profile.role === "explorer");
+    if (!explorerProfile) throw new Error("explorer role is not configured");
     const projectInput: ProjectInput = {
+      sessionId: this.sessionId,
       session,
       name: input.name ?? session,
       target: input.target ?? this.config.task.target,
@@ -154,20 +133,20 @@ export class AgentRuntime {
     };
 
     const project = this.graph.createProject(projectInput);
-    if (this.httpServer && !this.httpServer.listSessions().some((binding) => binding.sessionId === session)) {
+    if (this.httpServer && !this.httpServer.listSessions().some((binding) => binding.sessionId === this.sessionId)) {
       this.httpServer.registerSession({
-        sessionId: session,
+        sessionId: this.sessionId,
         projectId: project.id,
         graph: this.graph,
         taskGroupScope: this.federationScope,
       });
     }
     if (this.supervisor && !this.supervisorRegistration) {
-      this.supervisor.register(session, this.sessionLoop, {
+      this.supervisor.register(this.sessionId, this.sessionLoop, {
         projectId: project.id,
         scope: this.federationScope,
       });
-      this.supervisorRegistration = session;
+      this.supervisorRegistration = this.sessionId;
     }
     return project.id;
   }
@@ -179,7 +158,6 @@ export class AgentRuntime {
 
   async run(projectId: ProjectId, options?: RunOptions): Promise<StepResult> {
     this.assertOpen();
-    if (!this.supervisor) return this.sessionLoop.run(projectId, options);
     const sessionId = this.supervisorRegistration;
     if (!sessionId) throw new Error("AgentRuntime must create its session project before run()");
     const idlePollMs = options?.idlePollMs ?? 50;
@@ -208,15 +186,6 @@ export class AgentRuntime {
     return this.sessionLoop.tick();
   }
 
-  startMetacog(): void {
-    this.assertOpen();
-    this.metacogSupervisor?.start();
-  }
-
-  stopMetacog(): void {
-    this.metacogSupervisor?.stop();
-  }
-
   async startHttp(options?: HttpServerOptions): Promise<void> {
     this.assertOpen();
     await this.httpServer?.start(options);
@@ -236,17 +205,17 @@ export class AgentRuntime {
     this.closed = true;
     this.closeController.abort();
     this.closePromise = (async () => {
-      this.stopMetacog();
       if (this.supervisorRegistration) {
         this.supervisor?.unregister(this.supervisorRegistration);
         this.supervisorRegistration = undefined;
       }
-      if (this.boundSession) this.httpServer?.unregisterSession(this.boundSession);
+      this.httpServer?.unregisterSession(this.sessionId);
       const results = await Promise.allSettled([
         this.sessionLoop.close(),
         this.stopHttp(),
       ]);
       this.graph.close?.();
+      if (this.ownsFederationBus) this.supervisor.federationBus.close();
       const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
       if (failure) throw failure.reason;
     })();

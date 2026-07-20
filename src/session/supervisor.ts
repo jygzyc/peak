@@ -20,7 +20,6 @@ import type { ProjectId } from "../agent/types.js";
 import type { SessionLoop, StepResult } from "./session-loop.js";
 import { FederationBus } from "../graph/federation-bus.js";
 import { GlobalResourceGovernor } from "../worker/resource-governor.js";
-import { federationFile } from "../config/peak-home.js";
 
 export interface RegisteredSession {
   id: string;
@@ -51,7 +50,7 @@ export class GlobalSupervisor {
   readonly resourceGovernor: GlobalResourceGovernor;
 
   constructor(options: GlobalSupervisorOptions = {}) {
-    this.federationBus = options.federationBus ?? new FederationBus({ dbPath: federationFile() });
+    this.federationBus = options.federationBus ?? new FederationBus();
     this.globalMaxConcurrent = options.globalMaxConcurrent ?? Infinity;
     this.resourceGovernor = new GlobalResourceGovernor(this.globalMaxConcurrent);
   }
@@ -124,10 +123,11 @@ export class GlobalSupervisor {
     this.completeQuiescentGroups();
     for (const item of output) {
       const registered = this.sessions.get(item.sessionId);
-      if (registered?.projectId && item.result.type === "idle"
-        && registered.loop.projectStatus(registered.projectId) === "completed") {
-        item.result = { type: "completed" };
-      }
+      if (!registered?.projectId || item.result.type !== "idle") continue;
+      const status = registered.loop.projectStatus(registered.projectId);
+      if (status === "completed") item.result = { type: "completed" };
+      else if (status === "failed") item.result = { type: "failed", reason: "project failed" };
+      else if (status === "stopped") item.result = { type: "stopped", reason: "stopped by directive" };
     }
     return output;
   }
@@ -149,15 +149,11 @@ export class GlobalSupervisor {
     for (const [scope, members] of groups) {
       if (members.length === 0 || members.some((member) => !member.projectId)) continue;
       if (members.some((member) => !this.memberFinishReady(member))) continue;
-      const generation = this.federationBus.groupGeneration(scope);
-      if (generation === undefined) continue;
-      // The persistent bus serializes this decision with publishInsight(), so a
-      // broadcast cannot slip between a queue/head check and group completion.
-      if (!this.federationBus.tryCompleteScope(scope, generation)) continue;
+      if (!this.federationBus.tryCompleteScope(scope)) continue;
 
       // Session DBs remain intentionally isolated. Each member has already
-      // persisted its EndFact and final review; the durable scope decision above
-      // is the monotonic commit point and these local transitions materialize it.
+      // persisted its EndFact and final review; these local transitions
+      // materialize the group decision.
       for (const member of members) {
         if (member.loop.projectStatus(member.projectId!) !== "completed") {
           member.loop.completeFromSupervisor(member.projectId!);

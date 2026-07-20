@@ -9,26 +9,22 @@
  */
 
 import { Command } from "commander";
-import { writeFileSync, existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { AgentRuntime } from "./app/agent-runtime.js";
 import { loadConfig } from "./config/task-config.js";
-import { SqliteGraph } from "./graph/sqlite-graph.js";
 import { SessionManager } from "./session/session-manager.js";
 import { FederatedGraph } from "./graph/federated-graph.js";
 import { FederationBus } from "./graph/federation-bus.js";
 import { AgentDriverPool } from "./worker/agent-driver-pool.js";
 import { MockWorker } from "./worker/mock-worker.js";
 import { workerCapabilities } from "./worker/registry.js";
-import { defaultConfig } from "./config/default-config.js";
-import { ensurePeakLayout, sessionsDir, agentsDir, tasksDir, federationFile } from "./config/peak-home.js";
+import { ensurePeakLayout, sessionsDir } from "./config/peak-home.js";
+import { installTaskSkills } from "./config/task-skill-installer.js";
 
 /**
- * Process-level singleton for cross-session federation. When `--federation` is
- * passed, every AgentRuntime constructed in this process shares this bus so
- * siblings can cross-validate candidates. A single `peak run` only creates one
- * runtime, so the flag is inert without multiple sessions; it exists for the
- * multi-session mode and for SDK callers wiring several runtimes together.
+ * Process-level coordinator shared by Session runtimes created in this process.
+ * Broadcast history remains in each Session's logs/main.log.
  */
 let sharedFederationBus: FederationBus | undefined;
 
@@ -47,20 +43,15 @@ program
   .option("--host <host>", "HTTP server host", "127.0.0.1")
   .option("--http-token <token>", "protect HTTP control endpoints (or set PEAK_HTTP_TOKEN)", process.env.PEAK_HTTP_TOKEN)
   .option("--no-http", "disable HTTP server")
-  .option("--no-metacog", "disable metacog loop")
   .option("--mock", "use MockWorker instead of real backends")
-  .option("--federation", "share verified facts across sessions (cross-session corroboration)")
   .action(async (configPath: string, opts: {
     session?: string; port: string; host: string; httpToken?: string;
-    http: boolean; metacog: boolean; mock: boolean; federation: boolean;
+    http: boolean; mock: boolean;
   }) => {
-    // Ensure the ~/.peak/{agents,tasks,sessions} layout exists before running,
-    // so the session DB has a home and agents/tasks commands work afterward.
+    // Ensure the persistent Session layout exists before running.
     ensurePeakLayout();
     const { config, session, configPath: absPath } = loadConfig(configPath, opts.session);
-    // Write the resolved session name back so AgentRuntime opens the right DB.
-    config.task.session = session;
-
+    installTaskSkills(config, dirname(absPath));
     // Persist the session DB under ~/.peak/sessions/ so resume/status/sessions
     // (which default to the same location) can find it. The task file's own
     // directory is recorded on the project, not used as the store root.
@@ -69,21 +60,16 @@ program
     // (planner → explorer → evaluator → verified fact) without a real backend.
     const workerPool = opts.mock ? new MockWorker().registerDefaults() : new AgentDriverPool();
 
-    // Cross-session federation: share verified facts and dead-ends with sibling
-    // sessions. The bus is a process-level singleton so multiple runtimes in one
-    // process cross-validate; a single-session run gains nothing but the flag is
-    // harmless and ready for the multi-session mode.
-    const federationBus = opts.federation
-      ? (sharedFederationBus ??= new FederationBus({ dbPath: federationFile() }))
-      : undefined;
+    const sessionManager = new SessionManager(baseDir);
+    const active = sessionManager.create(session);
+    const federationBus = sharedFederationBus ??= new FederationBus();
 
     const runtime = new AgentRuntime(config, {
       baseDir,
       workerPool,
       useHttp: opts.http,
-      useMetacogSupervisor: opts.metacog,
       federationBus,
-      sessionId: federationBus ? session : undefined,
+      sessionId: active.id,
     });
 
     const projectId = runtime.createProject({
@@ -91,7 +77,7 @@ program
       configPath: absPath,
     });
 
-    console.log(`[peak] session: ${session}`);
+    console.log(`[peak] session: ${session} (${active.id})`);
     console.log(`[peak] project: ${projectId}`);
     console.log(`[peak] target: ${config.task.target}`);
     console.log(`[peak] goal: ${config.task.goal}`);
@@ -100,16 +86,14 @@ program
       await runtime.startHttp({ host: opts.host, port: parseInt(opts.port), token: opts.httpToken });
       console.log(`[peak] dashboard: http://${opts.host}:${opts.port}`);
     }
-    if (opts.metacog) {
-      console.log("[peak] metacog: synchronous (reviews graph each step)");
-    }
-    if (opts.federation) {
-      console.log(`[peak] federation: sharing verified facts as session "${session}"`);
-    }
-
+    console.log("[peak] metacog: synchronous (reviews every pass Fact and final proposal)");
     console.log("[peak] running...");
     const result = await runtime.run(projectId);
     console.log(`[peak] finished: ${result.type}`);
+    if (result.type === "failed") {
+      console.error(`[peak] failure: ${result.reason}`);
+      process.exitCode = 1;
+    }
 
     if (result.type === "completed") {
       const graph = runtime.graph;
@@ -124,45 +108,42 @@ program
   });
 
 program
-  .command("resume <session>")
+  .command("resume [session]")
   .description("Resume a stopped/paused session")
   .option("-P, --port <port>", "HTTP server port", "25429")
   .option("--http-token <token>", "protect HTTP control endpoints (or set PEAK_HTTP_TOKEN)", process.env.PEAK_HTTP_TOKEN)
   .option("--no-http", "disable HTTP server")
-  .option("--federation", "share verified facts across sessions (cross-session corroboration)")
-  .action(async (session: string, opts: { port: string; httpToken?: string; http: boolean; federation: boolean }) => {
+  .action(async (session: string | undefined, opts: { port: string; httpToken?: string; http: boolean }) => {
     const sm = new SessionManager(sessionsDir());
-    const info = sm.info(session);
-    if (!info.exists) {
-      console.error(`session not found: ${session}`);
+    const selected = sm.resolve(session);
+    if (!selected) {
+      console.error(`session not found: ${session ?? "active"}`);
       process.exit(1);
     }
-    const graph = sm.open(session);
+    sm.activate(selected);
+    const graph = sm.open(selected.id);
     const projects = graph.listProjects();
     if (projects.length === 0) {
-      console.error(`no projects in session: ${session}`);
+      console.error(`no projects in session: ${selected.name}`);
       process.exit(1);
     }
     const project = projects[0];
     graph.updateProjectStatus(project.id, "active");
 
     const config = project.taskConfig;
-    config.task.session = session;
+    installTaskSkills(config, dirname(project.configPath));
     (graph as { close?: () => void }).close?.();
     const pool = new AgentDriverPool();
-    const federationBus = opts.federation
-      ? (sharedFederationBus ??= new FederationBus({ dbPath: federationFile() }))
-      : undefined;
+    const federationBus = sharedFederationBus ??= new FederationBus();
     const runtime = new AgentRuntime(config, {
       baseDir: sessionsDir(),
       workerPool: pool,
       useHttp: opts.http,
-      useMetacogSupervisor: true,
       federationBus,
-      sessionId: federationBus ? session : undefined,
+      sessionId: selected.id,
     });
     const projectId = runtime.createProject({
-      session,
+      session: selected.name,
       configPath: project.configPath,
     });
     if (opts.http) {
@@ -171,25 +152,26 @@ program
     }
 
     console.log(`[peak] resuming project: ${projectId}`);
-    if (opts.federation) {
-      console.log(`[peak] federation: sharing verified facts as session "${session}"`);
-    }
     const result = await runtime.run(projectId);
     console.log(`[peak] finished: ${result.type}`);
+    if (result.type === "failed") {
+      console.error(`[peak] failure: ${result.reason}`);
+      process.exitCode = 1;
+    }
     await runtime.close();
   });
 
 program
-  .command("status <session>")
+  .command("status [session]")
   .description("Show project status for a session")
-  .action((session: string) => {
+  .action((session: string | undefined) => {
     const sm = new SessionManager(sessionsDir());
-    const info = sm.info(session);
-    if (!info.exists) {
-      console.log(`session not found: ${session}`);
+    const selected = sm.resolve(session);
+    if (!selected) {
+      console.log(`session not found: ${session ?? "active"}`);
       return;
     }
-    const graph = sm.open(session);
+    const graph = sm.open(selected.id);
     const projects = graph.listProjects();
     for (const p of projects) {
       const progress = graph.progress(p.id);
@@ -208,7 +190,7 @@ program
 
 program
   .command("workers")
-  .description("List available worker backends and providers")
+  .description("List available Agent CLI worker types")
   .action(() => {
     const caps = workerCapabilities();
     console.log(JSON.stringify(caps, null, 2));
@@ -227,7 +209,7 @@ program
     }
     for (const s of sessions) {
       const info = sm.info(s);
-      console.log(`  ${s} (${info.dir})`);
+      console.log(`  ${info.name ?? "unnamed"} ${s} (${info.dir})`);
     }
   });
 
@@ -264,54 +246,33 @@ program
   .command("init [dir]")
   .description("Create a minimal task.json in the specified directory")
   .action((dir: string = ".") => {
-    const config = defaultConfig();
-    config.task.target = "example-target";
-    config.task.goal = "Describe what you want to analyze";
+    mkdirSync(join(dir, "skills"), { recursive: true });
+    const config = {
+      task: {
+        target: "example-target",
+        goal: "Describe what you want to analyze",
+      },
+      agent: "task-agent",
+      workers: {
+        opencode: { type: "opencode" },
+      },
+    };
+    const agent = {
+      roles: {
+        planner: { worker: "opencode", tools: [], skills: [] },
+        explorer: { worker: "opencode", tools: [], skills: [] },
+        evaluator: { worker: "opencode", tools: [], skills: [] },
+        metacog: { worker: "opencode", tools: [], skills: [] },
+      },
+    };
     const configPath = join(dir, "task.json");
+    const agentPath = join(dir, "task-agent.json");
     writeFileSync(configPath, JSON.stringify(config, null, 2));
+    writeFileSync(agentPath, JSON.stringify(agent, null, 2));
     console.log(`created: ${configPath}`);
-    console.log("edit target/goal/workers, then run: peak run task.json");
-  });
-
-program
-  .command("agents")
-  .description("List reusable agent configs in ~/.peak/agents/")
-  .action(() => {
-    const dir = agentsDir();
-    if (!existsSync(dir)) {
-      console.log("no agents directory; run a task first to initialize ~/.peak/");
-      return;
-    }
-    const names = readdirSync(dir, { withFileTypes: true })
-      .filter((d) => d.isFile() && d.name.endsWith(".json"))
-      .map((d) => d.name.replace(/\.json$/, ""))
-      .sort();
-    if (names.length === 0) {
-      console.log("no agent configs found");
-      return;
-    }
-    for (const n of names) console.log(`  ${n}`);
-    console.log(`\nreference these by name in a task's \`agents\` array`);
-  });
-
-program
-  .command("tasks")
-  .description("List task configs in ~/.peak/tasks/")
-  .action(() => {
-    const dir = tasksDir();
-    if (!existsSync(dir)) {
-      console.log("no tasks directory; run a task first to initialize ~/.peak/");
-      return;
-    }
-    const names = readdirSync(dir, { withFileTypes: true })
-      .filter((d) => d.isFile() && d.name.endsWith(".json"))
-      .map((d) => d.name.replace(/\.json$/, ""))
-      .sort();
-    if (names.length === 0) {
-      console.log("no task configs found");
-      return;
-    }
-    for (const n of names) console.log(`  ${n}`);
+    console.log(`created: ${agentPath}`);
+    console.log(`created: ${join(dir, "skills")}`);
+    console.log("edit task/agent/workers/skills, then run: peak run task.json");
   });
 
 program.parse();

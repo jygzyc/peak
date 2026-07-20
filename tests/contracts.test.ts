@@ -84,6 +84,13 @@ test("contracts: validateCandidateFact parses evidence array", () => {
   assert.equal(c.confidence, 0.9);
 });
 
+test("contracts: validateCandidateFact rejects structured evidence outside the string contract", () => {
+  assert.throws(() => validateCandidateFact(env("fact", {
+    description: "x",
+    evidence: [{ source: "https://example.com" }],
+  }), "explorer"), /evidence.*non-empty strings/);
+});
+
 test("contracts: validateVerdict accepts accept/reject/defer", () => {
   for (const decision of ["pass", "deny", "pending"] as const) {
     const v = validateVerdict(env("verdict", { decision, reason: "r" }), "evaluator");

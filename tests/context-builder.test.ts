@@ -114,7 +114,7 @@ test("context-builder: relevanceScope=linked filters to linked facts only", () =
 
   // Link f1 → f2 via a concluded intent (an Intent IS the graph edge).
   const linkIntent = graph.addIntent(p.id, { description: "derive f2 from f1", creator: "planner", parentFactIds: [f1.id] });
-  graph.claimIntent(p.id, linkIntent.id, "w1", 30000);
+  graph.claimIntent(p.id, linkIntent.id);
   graph.concludeIntent(p.id, linkIntent.id, f2.id);
 
   // A separate intent the explorer is working on, rooted at f1.
@@ -157,13 +157,13 @@ test("context-builder: snapshot and artifact are deterministic and auditable", a
   const reader = new ServerSessionGraphReader(graph);
 
   const first = await reader.readSnapshot({
-    sessionId: p.session,
+    sessionId: p.sessionId,
     profileId: "planner",
     projectId: p.id,
     spec: { graphView: "full" },
   });
   const second = await reader.readSnapshot({
-    sessionId: p.session,
+    sessionId: p.sessionId,
     profileId: "planner",
     projectId: p.id,
     spec: { graphView: "full" },
@@ -171,18 +171,19 @@ test("context-builder: snapshot and artifact are deterministic and auditable", a
   assert.equal(first.contentHash, second.contentHash);
   assert.equal(first.graphSeq, second.graphSeq);
 
-  const artifact = await materializeGraphContext(p.sessionDir, "agent_context_1", first);
+  const timestamp = "20260719T120000000Z";
+  const artifact = await materializeGraphContext(p.sessionDir, timestamp, "planner", first);
   const stored = JSON.parse(readFileSync(artifact.resolvedPath, "utf8"));
   assert.deepEqual(stored, first);
   assert.notEqual(artifact.sha256, first.contentHash);
-  assert.equal(artifact.relativePath, "agents/agent_context_1/context.json");
+  assert.equal(artifact.relativePath, `logs/${timestamp}-planner-context.json`);
 
   const injected = renderGraphContextArtifact(first, artifact);
   assert.match(injected, /Read the referenced JSON file/);
   assert.match(injected, /Never open analysis\.db/);
   assert.doesNotMatch(injected, /artifact fact/);
   await assert.rejects(
-    materializeGraphContext(p.sessionDir, "../escape", first),
-    /invalid agent id/,
+    materializeGraphContext(p.sessionDir, "../escape", "planner", first),
+    /invalid role log timestamp/,
   );
 });

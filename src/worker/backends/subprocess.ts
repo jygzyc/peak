@@ -1,5 +1,5 @@
 /**
- * Shared subprocess execution helper for command-style agent backends.
+ * BaseWorker shared by all supported Agent CLI workers.
  *
  * Handles process spawning, stdin/prompt delivery, timeout handling, stdout and
  * stderr capture, and common result shaping so individual backend adapters stay
@@ -10,40 +10,29 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { delimiter, extname, isAbsolute, resolve } from "node:path";
 import type { WorkerConfig } from "../../agent/types.js";
-import type { AgentBackend, BackendInvokeInput, BackendInvokeResult } from "./types.js";
+import type { WorkerRequest, WorkerResult } from "../worker-runtime.js";
 
 const SPAWN_ERROR_RETURNCODE = 127;
 const DEFAULT_TIMEOUT_MS = 300_000;
 const MAX_STDOUT_BYTES = 10 * 1024 * 1024;
 const TERMINATION_GRACE_MS = 1_500;
 
-/** Options passed to buildArgv for session resume and conclude-phase calls. */
-export interface BuildArgvOptions {
-  sessionId?: string;
-  conclude?: boolean;
-}
+export abstract class BaseWorker {
+  abstract readonly type: string;
 
-export abstract class SubprocessBackend implements AgentBackend {
-  abstract readonly id: string;
-
-  abstract buildArgv(config: WorkerConfig, prompt: string, opts?: BuildArgvOptions): { argv: string[]; env?: Record<string, string>; input?: string };
-
-  /** Subclasses override to extract a reusable session id from worker output. */
-  extractSession(_stdout: string, _stderr: string): string | undefined {
-    return undefined;
-  }
+  abstract buildArgv(config: WorkerConfig, prompt: string): { argv: string[]; env?: Record<string, string>; input?: string };
 
   /**
    * Default: the response text IS stdout. CLI backends that emit the assistant
-   * response directly (codex, claude) use this. Backends with structured output
+   * response directly use this. Workers with structured output
    * (opencode --format json) override to parse NDJSON events.
    */
-  extractResponseText(stdout: string, _stderr: string): string {
+  extractResponseText(stdout: string): string {
     return stdout;
   }
 
-  invoke(input: BackendInvokeInput): Promise<BackendInvokeResult> {
-    const built = this.buildArgv(input.config, input.prompt, { sessionId: input.sessionId, conclude: input.conclude });
+  execute(input: WorkerRequest): Promise<WorkerResult> {
+    const built = this.buildArgv(input.config, input.prompt);
     const timeoutMs = input.config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
     if (input.signal?.aborted) {
@@ -51,20 +40,19 @@ export abstract class SubprocessBackend implements AgentBackend {
         text: "",
         returncode: SPAWN_ERROR_RETURNCODE,
         stderr: "worker cancelled before start",
-        aborted: true,
       });
     }
 
     return new Promise((resolve) => {
-      const cwd = input.cwd ?? process.cwd();
-      const invocation = resolveSpawnInvocation(built.argv[0], built.argv.slice(1), cwd);
-      const child = spawn(invocation.command, invocation.args, {
+      const cwd = input.cwd;
+      const resolved = resolveSpawnCommand(built.argv[0], built.argv.slice(1), cwd);
+      const child = spawn(resolved.command, resolved.args, {
         cwd,
         stdio: built.input !== undefined ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
         env: { ...process.env, ...(built.env ?? {}), PEAK_AGENT_ACTIVE: "1" },
         shell: false,
         windowsHide: true,
-        windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+        windowsVerbatimArguments: resolved.windowsVerbatimArguments,
       });
 
       let stdoutLen = 0;
@@ -124,7 +112,7 @@ export abstract class SubprocessBackend implements AgentBackend {
         terminate();
       };
 
-      const finish = (result: BackendInvokeResult) => {
+      const finish = (result: WorkerResult) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
@@ -170,15 +158,13 @@ export abstract class SubprocessBackend implements AgentBackend {
           text: "",
           returncode: SPAWN_ERROR_RETURNCODE,
           stderr: aborted ? "worker cancelled" : err.message,
-          aborted: aborted || undefined,
         });
       });
 
       child.on("close", (code, signal) => {
         const rawStdout = Buffer.concat(stdoutChunks).toString("utf-8");
         const stderr = Buffer.concat(stderrChunks).toString("utf-8");
-        const sessionId = this.extractSession?.(rawStdout, stderr) ?? input.sessionId;
-        const text = this.extractResponseText(rawStdout, stderr);
+        const text = this.extractResponseText(rawStdout);
         if (aborted || timedOut || outputLimitExceeded || (signal && code === null)) {
           finish({
             text,
@@ -190,9 +176,6 @@ export abstract class SubprocessBackend implements AgentBackend {
                 : outputLimitExceeded
                   ? `worker output exceeded ${MAX_STDOUT_BYTES} bytes`
                   : `worker terminated by signal ${signal}`,
-            sessionId,
-            timedOut: timedOut || undefined,
-            aborted: aborted || undefined,
           });
           return;
         }
@@ -200,14 +183,13 @@ export abstract class SubprocessBackend implements AgentBackend {
           text,
           returncode: code ?? SPAWN_ERROR_RETURNCODE,
           stderr,
-          sessionId,
         });
       });
     });
   }
 }
 
-export interface SpawnInvocation {
+export interface SpawnCommand {
   command: string;
   args: string[];
   windowsVerbatimArguments?: boolean;
@@ -217,13 +199,13 @@ export interface SpawnInvocation {
  * Native executables remain direct child processes. Only a command that
  * resolves to a trusted local `.cmd`/`.bat` file is wrapped by `cmd.exe`; all
  * dynamic prompt content remains on stdin and never enters this command line. */
-export function resolveSpawnInvocation(
+export function resolveSpawnCommand(
   command: string,
   args: string[],
   cwd: string,
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
-): SpawnInvocation {
+): SpawnCommand {
   if (platform !== "win32") return { command, args };
   const resolved = resolveWindowsExecutable(command, cwd, env);
   if (!resolved || !/\.(?:cmd|bat)$/i.test(resolved)) {

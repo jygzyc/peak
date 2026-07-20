@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
-import { OpencodeCliBackend } from "../dist/worker/backends/opencode-cli.js";
+import { OpenCodeWorker } from "../dist/worker/backends/opencode-cli.js";
 
-const backend = new OpencodeCliBackend();
+const worker = new OpenCodeWorker();
 
 test("opencode-cli: extractResponseText parses NDJSON part.text format (opencode 1.17+)", () => {
   // Real opencode --format json output: text events with nested part.text
@@ -12,7 +12,7 @@ test("opencode-cli: extractResponseText parses NDJSON part.text format (opencode
     JSON.stringify({ type: "step_finish", part: { type: "step-finish", reason: "stop" } }),
   ].join("\n");
 
-  const text = backend.extractResponseText(ndjson, "");
+  const text = worker.extractResponseText(ndjson);
   assert.equal(text, '{"kind":"fact","data":{"description":"found X"}}');
 });
 
@@ -22,13 +22,13 @@ test("opencode-cli: extractResponseText rejects non-schema flat text events", ()
     JSON.stringify({ type: "text", text: "world" }),
   ].join("\n");
 
-  const text = backend.extractResponseText(ndjson, "");
+  const text = worker.extractResponseText(ndjson);
   assert.equal(text, "");
 });
 
 test("opencode-cli: extractResponseText rejects plain text output", () => {
   const raw = "just plain text output, no JSON";
-  const text = backend.extractResponseText(raw, "");
+  const text = worker.extractResponseText(raw);
   assert.equal(text, "");
 });
 
@@ -41,21 +41,19 @@ test("opencode-cli: extractResponseText returns empty for step-only NDJSON (no t
     JSON.stringify({ type: "step_finish", part: { type: "step-finish", reason: "stop", tokens: { output: 1 } } }),
   ].join("\n");
 
-  const text = backend.extractResponseText(ndjson, "");
+  const text = worker.extractResponseText(ndjson);
   assert.equal(text, "");
 });
 
-test("opencode-cli: extractResponseText falls back to tool_use output when no text event", () => {
-  // Model emitted its JSON answer via a bash tool call (echo) instead of a
-  // final text event. The answer lives in tool_use.part.state.output.
+test("opencode-cli: does not treat tool output as the Agent result", () => {
   const ndjson = [
     JSON.stringify({ type: "step_start", part: { type: "step-start" } }),
     JSON.stringify({ type: "tool_use", part: { type: "tool", tool: "bash", state: { status: "completed", output: '{"kind":"fact","data":{"description":"x"}}\n' } } }),
     JSON.stringify({ type: "step_finish", part: { type: "step-finish", reason: "stop" } }),
   ].join("\n");
 
-  const text = backend.extractResponseText(ndjson, "");
-  assert.equal(text, '{"kind":"fact","data":{"description":"x"}}');
+  const text = worker.extractResponseText(ndjson);
+  assert.equal(text, "");
 });
 
 test("opencode-cli: extractResponseText prefers text events over tool_use output", () => {
@@ -65,7 +63,7 @@ test("opencode-cli: extractResponseText prefers text events over tool_use output
     JSON.stringify({ type: "text", part: { type: "text", text: "final answer" } }),
   ].join("\n");
 
-  const text = backend.extractResponseText(ndjson, "");
+  const text = worker.extractResponseText(ndjson);
   assert.equal(text, "final answer");
 });
 
@@ -76,29 +74,16 @@ test("opencode-cli: extractResponseText skips non-JSON lines", () => {
     "another non-json line",
   ].join("\n");
 
-  const text = backend.extractResponseText(mixed, "");
+  const text = worker.extractResponseText(mixed);
   assert.equal(text, "real answer");
 });
 
-test("opencode-cli: extractSession finds ses_ id in output", () => {
-  const output = JSON.stringify({ type: "step_start", sessionID: "ses_abc123def456" });
-  const sid = backend.extractSession(output, "");
-  assert.equal(sid, "ses_abc123def456");
-});
-
 test("opencode-cli: buildArgv uses --format json and stdin for prompt", () => {
-  const config = { kind: "agent" as const, backend: "opencode", model: "anthropic/claude-sonnet-4-5" };
-  const built = backend.buildArgv(config, "test prompt");
+  const config = { type: "opencode" as const, model: "anthropic/claude-sonnet-4-5" };
+  const built = worker.buildArgv(config, "test prompt");
   const argvStr = built.argv.join(" ");
   assert.ok(argvStr.includes("--format json"), "should use --format json");
   assert.ok(!argvStr.includes("--print"), "should NOT use --print");
   assert.ok(argvStr.includes("opencode run"), "should start with opencode run");
   assert.ok(built.input === "test prompt", "should pass prompt via stdin (input)");
-});
-
-test("opencode-cli: buildArgv adds --session for resume", () => {
-  const config = { kind: "agent" as const, backend: "opencode" };
-  const built = backend.buildArgv(config, "test prompt", { sessionId: "ses_resume123" });
-  const argvStr = built.argv.join(" ");
-  assert.ok(argvStr.includes("--session ses_resume123"), "should add --session for resume");
 });

@@ -64,29 +64,32 @@ function extractBestJson(text: string): string | undefined {
     if (validateJsonEnvelope(candidate)) return candidate;
   }
 
-  const lines = text.split("\n");
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i];
-    if (!line.includes("{")) continue;
-    const candidate = findJsonFromLine(lines, i);
-    if (candidate && validateJsonEnvelope(candidate)) return candidate;
-  }
+  if (validateJsonEnvelope(text)) return text;
 
-  return undefined;
+  let best: string | undefined;
+  for (let start = 0; start < text.length; start += 1) {
+    if (text[start] !== "{") continue;
+    const candidate = findJsonObject(text, start);
+    if (candidate && validateJsonEnvelope(candidate)) best = candidate;
+  }
+  return best;
 }
 
-function findJsonFromLine(lines: string[], startIdx: number): string | undefined {
-  for (let i = startIdx; i >= 0; i--) {
-    const slice = lines.slice(i, startIdx + 1).join("\n");
-    const fb = slice.indexOf("{");
-    const lb = slice.lastIndexOf("}");
-    if (fb !== -1 && lb > fb) {
-      const candidate = slice.slice(fb, lb + 1);
-      try {
-        JSON.parse(candidate);
-        return candidate;
-      } catch { /* keep searching */ }
+function findJsonObject(text: string, start: number): string | undefined {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
     }
+    if (char === '"') inString = true;
+    else if (char === "{") depth += 1;
+    else if (char === "}" && --depth === 0) return text.slice(start, index + 1);
   }
   return undefined;
 }

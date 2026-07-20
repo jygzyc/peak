@@ -1,5 +1,4 @@
 import type {
-  AgentId,
   Fact,
   Hint,
   Intent,
@@ -24,15 +23,14 @@ import {
   type MainDecision,
 } from "./contracts.js";
 import {
-  estimateContextTokens,
   materializeGraphContext,
   materializeRoleOutput,
   renderGraphContextArtifact,
+  roleLogTimestamp,
   type SessionGraphReader,
 } from "./context-builder.js";
 import { PromptLoader } from "../config/prompt-loader.js";
 import { PromptBuilder } from "./prompt-builder.js";
-import { AgentRecordStore, type AgentRecordPatch } from "./agent-record-store.js";
 
 export interface BaseAgentContext {
   profile: SubagentProfile;
@@ -65,7 +63,6 @@ export type AgentOutput =
   | { kind: "stop"; stop: ReturnType<typeof validateStop> };
 
 export interface BaseAgentResult {
-  agentId: AgentId;
   output: AgentOutput;
   rawText: string;
   prompt: string;
@@ -75,49 +72,19 @@ export interface BaseAgentResult {
 
 /** Shared execution boundary for planner, explorer, evaluator and metacog. */
 export class BaseAgent {
-  protected readonly records: AgentRecordStore;
-
-  constructor(protected readonly context: BaseAgentContext) {
-    this.records = new AgentRecordStore(context.project.sessionDir);
-  }
+  constructor(protected readonly context: BaseAgentContext) {}
 
   protected async executeAgent(input: BaseAgentRunInput): Promise<BaseAgentResult> {
-    const { profile, profileId, project, workerPool, config } = this.context;
-    const workerName = input.workerName ?? selectProfileWorker(profile, project.id, workerPool, config);
+    const { profile, workerPool, config } = this.context;
+    const workerName = input.workerName ?? selectProfileWorker(profile, workerPool, config);
     const workerConfig = config.workers[workerName];
     if (!workerConfig) throw new StageError(`worker config missing for ${profile.role}: ${workerName}`, profile.role);
-    if (workerConfig.kind === "api") {
-      throw new StageError(`role worker "${workerName}" cannot read session JSON artifacts; use an agent worker`, profile.role);
-    }
 
-    const record = await this.records.create({
-      sessionId: project.session,
-      projectId: project.id,
-      profileId,
-      role: profile.role,
-      workerName,
-      intentId: input.intent?.id,
-      factId: input.candidate?.id,
-      inputSummary: input.inputSummary,
-    });
-
-    try {
-      return await this.execute(record.id, workerName, input);
-    } catch (error) {
-      await this.records.update(record.id, {
-        status: input.signal?.aborted ? "cancelled" : "failed",
-        errorMessage: error instanceof Error ? error.message : String(error),
-      });
-      throw error;
-    }
-  }
-
-  updateRecord(agentId: AgentId, patch: AgentRecordPatch): Promise<import("./types.js").AgentRecord> {
-    return this.records.update(agentId, patch);
+    return this.execute(roleLogTimestamp(), workerName, input);
   }
 
   private async execute(
-    agentId: AgentId,
+    logTimestamp: string,
     workerName: WorkerName,
     input: BaseAgentRunInput,
   ): Promise<BaseAgentResult> {
@@ -137,7 +104,7 @@ export class BaseAgent {
     }
 
     const snapshot = await graphReader.readSnapshot({
-      sessionId: project.session,
+      sessionId: project.sessionId,
       projectId: project.id,
       profileId,
       spec: profile.context,
@@ -147,7 +114,12 @@ export class BaseAgent {
       candidate: input.candidate,
       signal: input.signal,
     });
-    const contextArtifact = await materializeGraphContext(project.sessionDir, agentId, snapshot);
+    const contextArtifact = await materializeGraphContext(
+      project.sessionDir,
+      logTimestamp,
+      profileId,
+      snapshot,
+    );
     const contextBlock = renderGraphContextArtifact(snapshot, contextArtifact);
     const contextComponent = {
       source: `artifact:${contextArtifact.relativePath}`,
@@ -156,36 +128,42 @@ export class BaseAgent {
       artifactSha256: contextArtifact.sha256,
       delivery: contextArtifact.delivery,
     };
-    const assignment = input.promptExtra || [
+    const assignmentBody = input.promptExtra || [
       "## Assignment",
       `Execute the current ${profile.role} responsibility for project ${project.id}.`,
     ].join("\n");
+    const assignment = profile.tools?.length
+      ? `${assignmentBody}\n\nConfigured tools for this role: ${profile.tools.join(", ")}.`
+      : assignmentBody;
     const outputContract = outputContractInstructions(effectiveProfile.output.contract);
     const built = promptBuilder.compose(resolved, contextBlock, assignment, contextComponent, outputContract);
-    await this.records.update(agentId, {
-      promptHash: built.promptHash,
-      promptManifest: built.manifest,
-      contextArtifact,
-      inputTokens: estimateContextTokens(built.prompt),
-    });
-
     const result = await workerPool.execute({
       prompt: built.prompt,
       config: workerConfig,
       workerName,
-      role: profile.role,
-      projectId: project.id,
       cwd: project.workspaceDir,
-      maxOutputTokens: profile.maxOutputTokens,
       signal: input.signal,
     });
     if (result.returncode !== 0) {
-      throw new StageError(`${profile.role} worker failed: ${result.stderr ?? "no stderr"}`, profile.role);
+      const message = `${profile.role} worker failed: ${result.stderr ?? "no stderr"}`;
+      await materializeRoleOutput(
+        project.sessionDir,
+        project.sessionId,
+        project.id,
+        logTimestamp,
+        profileId,
+        {
+          status: "failed",
+          error: message,
+          returncode: result.returncode,
+          stderr: result.stderr ?? "",
+          rawText: result.text,
+        },
+      );
+      throw new StageError(message, profile.role);
     }
-    if (result.sessionId) await this.records.update(agentId, { workerSessionId: result.sessionId });
-
     return this.validateAndPersist(
-      agentId,
+      logTimestamp,
       result.text,
       built.prompt,
       built.promptHash,
@@ -195,37 +173,45 @@ export class BaseAgent {
   }
 
   private async validateAndPersist(
-    agentId: AgentId,
+    logTimestamp: string,
     rawText: string,
     prompt: string,
     promptHash: string,
     promptManifest: PromptManifest,
     profile: SubagentProfile,
   ): Promise<BaseAgentResult> {
-    const envelope = parseEnvelope(rawText, profile.role);
-    const output = validateOutput(envelope, profile, this.context.profileId);
-    const outputArtifact = await materializeRoleOutput(
-      this.context.project.sessionDir,
-      this.context.project.session,
-      this.context.project.id,
-      agentId,
-      profile.role,
-      output,
-    );
-    await this.records.update(agentId, {
-      status: "validated",
-      promptHash,
-      promptManifest,
-      outputArtifact,
-      outputTokens: estimateContextTokens(rawText),
-    });
-    return { agentId, output, rawText, prompt, promptHash, promptManifest };
+    try {
+      const envelope = parseEnvelope(rawText, profile.role);
+      const output = validateOutput(envelope, profile, this.context.profileId);
+      await materializeRoleOutput(
+        this.context.project.sessionDir,
+        this.context.project.sessionId,
+        this.context.project.id,
+        logTimestamp,
+        this.context.profileId,
+        output,
+      );
+      return { output, rawText, prompt, promptHash, promptManifest };
+    } catch (error) {
+      await materializeRoleOutput(
+        this.context.project.sessionDir,
+        this.context.project.sessionId,
+        this.context.project.id,
+        logTimestamp,
+        this.context.profileId,
+        {
+          status: "failed",
+          error: error instanceof Error ? error.message : String(error),
+          rawText,
+        },
+      );
+      throw error;
+    }
   }
 }
 
 export function selectProfileWorker(
   profile: SubagentProfile,
-  projectId: string,
   workerPool: WorkerPool,
   config: TaskConfig,
 ): WorkerName {
@@ -233,7 +219,7 @@ export function selectProfileWorker(
     ? profile.runtime.workers
     : [profile.runtime.worker])].filter((name) => config.workers[name]);
   if (candidates.length === 0) throw new StageError(`no configured worker is available for ${profile.role}`, profile.role);
-  const selected = workerPool.pickWorker(projectId, config, candidates);
+  const selected = workerPool.pickWorker(config, candidates);
   return candidates.includes(selected) ? selected : candidates[0]!;
 }
 

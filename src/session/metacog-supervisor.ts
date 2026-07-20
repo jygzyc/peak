@@ -1,12 +1,10 @@
 /**
- * Wall-clock metacognition loop.
+ * Session-local metacognition trigger.
  *
- * Runs the metacog BaseAgent independently of the main SessionLoop cadence.
- * Live control is in memory; execution audit is written as session JSON.
+ * Runs once for every pass Fact and once for the final completion proposal.
  */
 
 import type { Fact, ProjectId, TaskConfig } from "../agent/types.js";
-import { DEFAULT_METACOG_TRIGGERS } from "../agent/types.js";
 import type { Graph } from "../graph/graph.js";
 import type { WorkerPool } from "../worker/worker-runtime.js";
 import { selectProfileWorker } from "../agent/base-agent.js";
@@ -14,21 +12,14 @@ import { MetacogAgent } from "../agent/role-agents.js";
 import { metacogExtra } from "../agent/prompt-builder.js";
 import { PromptLoader } from "../config/prompt-loader.js";
 import { PermissionChecker } from "../agent/permissions.js";
-import type { FederationBus, InsightKind } from "../graph/federation-bus.js";
+import type { FactBroadcast, FederationBus } from "../graph/federation-bus.js";
+import { appendGraphOperation, graphOperations } from "../server/graph-operation-log.js";
 import type { GlobalResourceGovernor } from "../worker/resource-governor.js";
 import type { SessionGraphReader } from "../agent/context-builder.js";
 import { ServerSessionGraphReader } from "../server/session-graph-reader.js";
 
-const DEFAULT_METACOG_INTERVAL_MS = DEFAULT_METACOG_TRIGGERS.everySeconds
-  ? DEFAULT_METACOG_TRIGGERS.everySeconds * 1000
-  : 30_000;
-
 export class MetacogSupervisor {
-  private timer: ReturnType<typeof setInterval> | undefined;
-  private running = false;
   private closed = false;
-  private tickInFlight = false;
-  private readonly intervalMs: number;
   private readonly promptLoader: PromptLoader;
   private readonly activeControllers = new Map<ProjectId, {
     controller: AbortController;
@@ -41,7 +32,6 @@ export class MetacogSupervisor {
     private readonly graph: Graph,
     private workerPool: WorkerPool,
     private readonly config: TaskConfig,
-    intervalMs?: number,
     federation?: { bus: FederationBus; sessionId: string; scope?: string },
     graphReader?: SessionGraphReader,
   ) {
@@ -53,13 +43,6 @@ export class MetacogSupervisor {
         federation.scope ?? config.federation?.scope ?? federation.sessionId,
       );
     }
-    // Read the wall-clock interval from the metacog profile's triggers (per-
-    // agent), not a global workflow block. Fall back to the constructor arg,
-    // then the module default.
-    const metacogProfileId = config.control?.metacogProfile ?? "metacog";
-    const metacogProfile = config.profiles[metacogProfileId] ?? config.profiles.metacog;
-    const everySeconds = metacogProfile?.triggers?.everySeconds;
-    this.intervalMs = intervalMs ?? (everySeconds ? everySeconds * 1000 : DEFAULT_METACOG_INTERVAL_MS);
     this.promptLoader = new PromptLoader();
   }
 
@@ -80,33 +63,12 @@ export class MetacogSupervisor {
     this.workerPool = governor.wrap(this.workerPool);
   }
 
-  start(): void {
-    if (this.closed) throw new Error("MetacogSupervisor is closed");
-    if (this.running) return;
-    this.running = true;
-    this.tick();
-    this.timer = setInterval(() => { void this.tick(); }, this.intervalMs);
-  }
-
-  stop(): void {
-    this.running = false;
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = undefined;
-    }
-    for (const active of this.activeControllers.values()) {
-      active.controller.abort(new Error("metacog supervisor stopped"));
-    }
-  }
-
   async close(): Promise<void> {
     this.closed = true;
-    this.stop();
+    for (const active of this.activeControllers.values()) {
+      active.controller.abort(new Error("metacog supervisor closed"));
+    }
     await Promise.allSettled([...this.inFlightProjects.values()]);
-  }
-
-  get isRunning(): boolean {
-    return this.running;
   }
 
   interrupt(projectId: ProjectId): void {
@@ -114,29 +76,32 @@ export class MetacogSupervisor {
   }
 
   async runOnce(): Promise<void> {
-    const active = this.graph.listProjects("active");
+    const active = this.graph.listProjects()
+      .filter((project) => project.status === "active" || project.status === "finish_proposed");
     await Promise.allSettled(active.map((p) => this.runForProject(p.id)));
   }
 
-  private async tick(): Promise<void> {
-    if (!this.running || this.tickInFlight) return;
-    this.tickInFlight = true;
-    try {
-      const active = this.graph.listProjects("active");
-      await Promise.allSettled(active.map((p) => this.runForProject(p.id, true)));
-    } finally {
-      this.tickInFlight = false;
-    }
+  hasCompletedFinalReview(projectId: ProjectId): boolean {
+    const project = this.graph.getProject(projectId);
+    const endFact = this.graph.activeEndFact(projectId);
+    if (!project || !endFact) return false;
+    return graphOperations(project, "final_review")
+      .some((entry) => entry.changes.endFactId === endFact.id);
   }
 
-  /** Concurrent timer/SessionLoop calls for one project share the same promise. */
-  async runForProject(projectId: ProjectId, scheduled = false): Promise<boolean> {
-    if (this.closed) throw new Error("MetacogSupervisor is closed");
+  /** Concurrent SessionLoop calls for one project share the same promise. */
+  async runForProject(projectId: ProjectId): Promise<boolean> {
+    if (this.closed) return false;
     const existing = this.inFlightProjects.get(projectId);
     if (existing) return existing;
-    const current = Promise.resolve().then(() => {
-      if (scheduled && !this.running) return Promise.resolve(false);
-      return this.executeForProject(projectId);
+    const current = Promise.resolve().then(async () => {
+      let ran = false;
+      do {
+        const executed = await this.executeForProject(projectId);
+        ran ||= executed;
+        if (!executed) break;
+      } while (this.hasPendingFactReview(projectId));
+      return ran;
     }).finally(() => {
       if (this.inFlightProjects.get(projectId) === current) {
         this.inFlightProjects.delete(projectId);
@@ -149,45 +114,27 @@ export class MetacogSupervisor {
   private async executeForProject(projectId: ProjectId): Promise<boolean> {
     const project = this.graph.getProject(projectId);
     if (!project || (project.status !== "active" && project.status !== "finish_proposed")) return false;
-    const progress = this.graph.progress(projectId);
-    const metacogProfileId = this.config.control?.metacogProfile ?? "metacog";
-    const profile = this.config.profiles[metacogProfileId] ?? this.config.profiles.metacog;
-    if (!profile) return false;
-    if (profile.role !== "metacog") {
-      throw new Error(`metacog profile "${metacogProfileId}" must bind role metacog`);
-    }
+    const selected = Object.entries(this.config.profiles)
+      .find(([, candidate]) => candidate.role === "metacog");
+    if (!selected) return false;
+    const [metacogProfileId, profile] = selected;
 
-    const metacogEvents = this.graph.events(projectId)
-      .filter((event) => event.type === "metacog.completed" || event.type === "metacog.fact_reviewed");
-    const reviewedFactIds = new Set(metacogEvents
-      .map((event) => typeof event.payload.factId === "string" ? event.payload.factId : undefined)
+    const reviewedFactIds = new Set(graphOperations(project, "review_fact")
+      .map((entry) => typeof entry.changes.factId === "string" ? entry.changes.factId : undefined)
       .filter((factId): factId is string => Boolean(factId)));
     const factToReview = this.graph.facts(projectId, "pass")
       .find((fact) => !reviewedFactIds.has(fact.id));
-    const finalReview = project.status === "finish_proposed";
+    const finalReview = project.status === "finish_proposed"
+      && !this.hasCompletedFinalReview(projectId);
 
-    // Per-profile periodic triggers remain useful for course correction, but
-    // accepted facts and final review are protocol triggers and cannot be
-    // coalesced away by a timer or an in-memory checkpoint.
-    const triggers = profile.triggers ?? DEFAULT_METACOG_TRIGGERS;
-    const stagnationTrigger = triggers.stagnationLevel ?? DEFAULT_METACOG_TRIGGERS.stagnationLevel ?? 3;
-    const everySteps = triggers.everySteps ?? DEFAULT_METACOG_TRIGGERS.everySteps ?? 5;
+    if (!factToReview && !finalReview) return false;
 
-    const shouldRun = Boolean(factToReview) || finalReview
-      || progress.stagnationLevel >= stagnationTrigger
-      || progress.stepsExecuted > 0 && progress.stepsExecuted % everySteps === 0;
-
-    if (!shouldRun) return false;
-
-    const trigger = factToReview ? `fact.accepted:${factToReview.id}`
-      : finalReview ? "final-review"
-        : `scheduled:${progress.stepsExecuted}:${progress.stagnationLevel}`;
-    if (!factToReview && !finalReview && metacogEvents.some((event) => event.payload.trigger === trigger)) return false;
+    const trigger = factToReview ? `fact.accepted:${factToReview.id}` : "final-review";
 
     const maxActive = profile.maxActive ?? 1;
     if (this.activeControllers.size >= maxActive) return false;
 
-    const workerName = selectProfileWorker(profile, projectId, this.workerPool, this.config);
+    const workerName = selectProfileWorker(profile, this.workerPool, this.config);
     const agent = new MetacogAgent({
       profileId: metacogProfileId,
       profile,
@@ -215,23 +162,32 @@ export class MetacogSupervisor {
         const finalReviewCompleted = finalReview && !factToReview
           && result.output.hints.hints.length === 0
           && this.graph.getProject(projectId)?.status === "finish_proposed";
-        const broadcast = this.buildBroadcast(
-          projectId,
-          factToReview,
-          finalReviewCompleted,
-        );
+        const broadcast = this.buildBroadcast(factToReview);
         if (broadcast) permissions.require("send_fact_broadcast");
-        if (broadcast) this.publishBroadcast(projectId, broadcast);
+        if (broadcast) this.federation!.bus.publish(broadcast);
         this.graph.commitMetacogResult(projectId, {
           hints: result.output.hints.hints,
-          reviewedFactId: factToReview?.id,
-          finalReviewCompleted,
         });
-        await agent.updateRecord(result.agentId, {
-          status: "applied",
-          outputSummary: `${result.output.hints.hints.length} hints`,
-        });
-        return result.output.hints.hints.length > 0;
+        if (result.output.hints.hints.length > 0) {
+          appendGraphOperation(project, metacogProfileId, "create_hint", {
+            count: result.output.hints.hints.length,
+          });
+        }
+        if (factToReview) {
+          appendGraphOperation(project, metacogProfileId, "review_fact", { factId: factToReview.id });
+        }
+        if (finalReviewCompleted) {
+          appendGraphOperation(project, metacogProfileId, "final_review", {
+            endFactId: this.graph.activeEndFact(projectId)?.id,
+          });
+        }
+        if (broadcast) {
+          appendGraphOperation(project, metacogProfileId, "send_fact_broadcast", {
+            factId: broadcast.factId,
+            reason: broadcast.reason,
+          });
+        }
+        return true;
       } else {
         permissions.require("create_hint");
         const hint = {
@@ -239,17 +195,22 @@ export class MetacogSupervisor {
           kind: "warning" as const,
           content: `Metacog recommends ending or redirecting the task: ${result.output.stop.reason}`,
         };
-        const broadcast = this.buildBroadcast(projectId, factToReview, false);
+        const broadcast = this.buildBroadcast(factToReview);
         if (broadcast) permissions.require("send_fact_broadcast");
-        if (broadcast) this.publishBroadcast(projectId, broadcast);
+        if (broadcast) this.federation!.bus.publish(broadcast);
         this.graph.commitMetacogResult(projectId, {
           hints: [hint],
-          reviewedFactId: factToReview?.id,
         });
-        await agent.updateRecord(result.agentId, {
-          status: "applied",
-          outputSummary: `end recommendation: ${result.output.stop.reason}`,
-        });
+        appendGraphOperation(project, metacogProfileId, "create_hint", { count: 1 });
+        if (factToReview) {
+          appendGraphOperation(project, metacogProfileId, "review_fact", { factId: factToReview.id });
+        }
+        if (broadcast) {
+          appendGraphOperation(project, metacogProfileId, "send_fact_broadcast", {
+            factId: broadcast.factId,
+            reason: broadcast.reason,
+          });
+        }
         return true;
       }
     } catch (err) {
@@ -262,56 +223,23 @@ export class MetacogSupervisor {
     }
   }
 
-  private buildBroadcast(
-    projectId: ProjectId,
-    fact: Fact | undefined,
-    finalReviewCompleted: boolean,
-  ): BroadcastInput | undefined {
-    if (!this.federation) return undefined;
-    if (fact) {
-      return {
-        eventId: `fact:${this.federation.sessionId}:${projectId}:${fact.id}`,
-        kind: "fact",
-        sourceFactId: fact.id,
-        summary: fact.description,
-        confidence: fact.confidence,
-      };
-    }
-    if (!finalReviewCompleted) return undefined;
-    const endFact = this.graph.activeEndFact(projectId);
-    if (!endFact) return undefined;
+  private buildBroadcast(fact: Fact | undefined): FactBroadcast | undefined {
+    if (!this.federation || !fact) return undefined;
     return {
-      eventId: `summary:${this.federation.sessionId}:${projectId}:${endFact.id}`,
-      kind: "session_summary",
-      summary: endFact.description,
-      confidence: 1,
+      sessionId: this.federation.sessionId,
+      factId: fact.id,
+      reason: fact.reviewerReason ?? "Fact passed evaluator review",
     };
   }
 
-  private publishBroadcast(projectId: ProjectId, broadcast: BroadcastInput): void {
-    const federation = this.federation;
-    if (!federation) return;
-    federation.bus.publishInsight(
-      broadcast.kind,
-      {
-        sessionId: federation.sessionId,
-        projectId,
-        factId: broadcast.sourceFactId,
-      },
-      broadcast.summary,
-      broadcast.confidence,
-      undefined,
-      { id: broadcast.eventId, scope: federation.scope },
-    );
+  private hasPendingFactReview(projectId: ProjectId): boolean {
+    const project = this.graph.getProject(projectId);
+    if (!project) return false;
+    const reviewed = new Set(graphOperations(project, "review_fact")
+      .map((entry) => entry.changes.factId)
+      .filter((factId): factId is string => typeof factId === "string"));
+    return this.graph.facts(projectId, "pass").some((fact) => !reviewed.has(fact.id));
   }
 
   private readonly graphReader: SessionGraphReader;
-}
-
-interface BroadcastInput {
-  eventId: string;
-  kind: Extract<InsightKind, "fact" | "session_summary">;
-  sourceFactId?: string;
-  summary: string;
-  confidence: number;
 }

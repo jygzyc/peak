@@ -3,9 +3,9 @@
  *
  * This intentionally stays shallow: unit tests cover graph/stage behavior; smoke
  * verifies that the built CLI can load config, run a task with MockWorker, list
- * worker capabilities, and initialize a minimal task file under ESM.
+ * worker capabilities, and initialize a complete task workspace under ESM.
  */
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,10 +37,10 @@ function run(args, options = {}) {
 try {
   const taskPath = join(workspace, "task.json");
   writeFileSync(taskPath, JSON.stringify({
-    task: { target: "input.apk", goal: "smoke test current runtime wiring", session: "smoke-session" },
+    task: { name: "smoke-session", target: "input.apk", goal: "smoke test current runtime wiring" },
   }, null, 2));
 
-  const runOut = run(["run", taskPath, "--mock", "--no-http", "--no-metacog"]);
+  const runOut = run(["run", taskPath, "--mock", "--no-http"]);
   for (const expected of [
     "[peak] session: smoke-session",
     "[peak] target: input.apk",
@@ -57,8 +57,32 @@ try {
     }
   }
 
+  const activeText = readFileSync(join(peakHome, "sessions", ".session.yaml"), "utf8");
+  const sessionId = /^\s*id:\s*([0-9a-f-]+)\s*$/mi.exec(activeText)?.[1];
+  if (!sessionId) {
+    process.stderr.write(`active Session UUID missing\n${activeText}`);
+    process.exit(1);
+  }
+  const sessionDir = join(peakHome, "sessions", sessionId);
+  const logs = readdirSync(join(sessionDir, "logs"));
+  for (const expected of ["analysis.db", "logs/main.log"]) {
+    if (!existsSync(join(sessionDir, ...expected.split("/")))) {
+      process.stderr.write(`Session state missing: ${expected}`);
+      process.exit(1);
+    }
+  }
+  if (!logs.some((name) => /-planner-context\.json$/.test(name))
+    || !logs.some((name) => /-planner-output\.json$/.test(name))) {
+    process.stderr.write(`timestamped role logs missing: ${logs.join(", ")}`);
+    process.exit(1);
+  }
+  if (existsSync(join(peakHome, "federation.db")) || existsSync(join(sessionDir, "agents"))) {
+    process.stderr.write("obsolete federation.db or runtime agents directory was created");
+    process.exit(1);
+  }
+
   const workersOut = run(["workers"]);
-  for (const expected of ["workers", "driverKinds", "agentBackends", "modelProviders", "api", "agent"]) {
+  for (const expected of ["workerTypes", "opencode", "codex", "pi", "claude-code"]) {
     if (!workersOut.includes(expected)) {
       process.stderr.write(`workers output missing: ${expected}\n${workersOut}`);
       process.exit(1);
@@ -69,10 +93,14 @@ try {
   mkdirSync(initDir, { recursive: true });
   const initOut = run(["init", initDir]);
   const initTask = join(initDir, "task.json");
-  if (!existsSync(initTask) || !initOut.includes("created:")) {
-    process.stderr.write(`init did not create task.json\n${initOut}`);
+  const initAgent = join(initDir, "task-agent.json");
+  const initSkills = join(initDir, "skills");
+  if (!existsSync(initTask) || !existsSync(initAgent) || !existsSync(initSkills)
+    || !initOut.includes("created:")) {
+    process.stderr.write(`init did not create task.json, task-agent.json, and skills/\n${initOut}`);
     process.exit(1);
   }
+  run(["run", initTask, "--mock", "--no-http", "--session", "initialized-task"]);
 
   console.log("smoke ok");
 } finally {

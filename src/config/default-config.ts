@@ -1,14 +1,12 @@
 /**
  * Default task configuration for peak.
  *
- * Provides a minimal runnable setup when task.json omits profile or worker
- * fields. Defaults avoid encoding domain-specific vulnerability-
- * hunting policy; role prompts are kept minimal so that task.json can override
- * them via `profiles.<id>.prompt.file`.
+ * Provides the native four roles and the OpenCode worker used when a task does
+ * not select a reusable Agent bundle. Domain behavior belongs in Agent files.
  */
 
-import type { TaskConfig, SubagentProfile, GraphView, OutputContract, MetacogTriggers, SessionRole } from "../agent/types.js";
-import { BUILTIN_ROLES, BUILTIN_PERMISSIONS, DEFAULT_METACOG_TRIGGERS } from "../agent/types.js";
+import type { TaskConfig, SubagentProfile, GraphView, OutputContract, SessionRole } from "../agent/types.js";
+import { BUILTIN_ROLES, BUILTIN_PERMISSIONS } from "../agent/types.js";
 import { builtinPromptSource, type BuiltinPromptId } from "../agent/prompts/index.js";
 
 function builtinProfile(
@@ -16,7 +14,7 @@ function builtinProfile(
   promptId: BuiltinPromptId,
   graphView: GraphView,
   contract: OutputContract,
-  extra?: { cooldownSteps?: number; triggers?: MetacogTriggers },
+  extra?: { cooldownSteps?: number },
 ): SubagentProfile {
   const profile: SubagentProfile = {
     role,
@@ -27,7 +25,6 @@ function builtinProfile(
     output: { contract },
   };
   if (extra?.cooldownSteps !== undefined) profile.cooldownSteps = extra.cooldownSteps;
-  if (extra?.triggers) profile.triggers = extra.triggers;
   return profile;
 }
 
@@ -38,10 +35,10 @@ export function defaultConfig(): TaskConfig {
       planner: builtinProfile(BUILTIN_ROLES.planner, "planner", "full", "main_decision", { cooldownSteps: 3 }),
       explorer: builtinProfile(BUILTIN_ROLES.explorer, "explorer", "focused", "candidate_fact"),
       evaluator: builtinProfile(BUILTIN_ROLES.evaluator, "evaluator", "evidence-only", "verdict"),
-      metacog: builtinProfile(BUILTIN_ROLES.metacog, "metacog", "summary", "hints", { triggers: { ...DEFAULT_METACOG_TRIGGERS } }),
+      metacog: builtinProfile(BUILTIN_ROLES.metacog, "metacog", "summary", "hints"),
     },
     workers: {
-      opencode: { kind: "agent", backend: "opencode" },
+      opencode: { type: "opencode" },
     },
     // High concurrency by default: many small parallel intents (see planner
     // fan-out guidance) only parallelize when the scheduler does not throttle
@@ -49,11 +46,5 @@ export function defaultConfig(): TaskConfig {
     // refillPerTick == maxConcurrent so a single step can fan out to the full
     // pool instead of adding one explorer at a time.
     scheduler: { maxConcurrent: 10, refillPerTick: 10 },
-    control: {
-      mainProfile: "planner",
-      explorerProfile: "explorer",
-      evaluatorProfile: "evaluator",
-      metacogProfile: "metacog",
-    },
   };
 }

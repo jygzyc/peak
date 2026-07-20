@@ -48,10 +48,7 @@ test("GlobalSupervisor: failed governor binding rolls back federation membership
     /resource governor is already bound/,
   );
   assert.equal(second.listSessions().length, 0);
-  assert.equal(
-    second.federationBus.registeredSessions("second").find((member) => member.sessionId === "owned")?.memberStatus,
-    "left",
-  );
+  assert.equal(second.federationBus.registeredSessions("second").length, 0);
 });
 
 test("GlobalSupervisor: tick steps all registered sessions", async () => {
@@ -69,8 +66,8 @@ test("GlobalSupervisor: tick steps all registered sessions", async () => {
 
   const loop1 = new SessionLoop(graph1, worker1, config1);
   const loop2 = new SessionLoop(graph2, worker2, config2);
-  sup.register("sess1", loop1, { projectId: p1.id, scope: "group-a" });
-  sup.register("sess2", loop2, { projectId: p2.id, scope: "group-a" });
+  sup.register(p1.sessionId, loop1, { projectId: p1.id, scope: "group-a" });
+  sup.register(p2.sessionId, loop2, { projectId: p2.id, scope: "group-a" });
 
   const results = await sup.tick();
   assert.ok(results.every((result) => result.result.type === "completed"));
@@ -78,7 +75,20 @@ test("GlobalSupervisor: tick steps all registered sessions", async () => {
   assert.equal(graph2.getProject(p2.id)!.status, "completed");
 });
 
-test("GlobalSupervisor: pending broadcast blocks completion until target evaluator advances cursor", async () => {
+test("GlobalSupervisor: tick reports terminal projects that no longer enter SessionLoop.tick", async () => {
+  const sup = new GlobalSupervisor({ federationBus: new TestFederationBus() });
+  const graph = new TestGraph();
+  const project = createProject(graph, { session: "failed-session" });
+  graph.updateProjectStatus(project.id, "failed");
+  const loop = new SessionLoop(graph, new MockWorker(), minimalConfig());
+  sup.register(project.sessionId, loop, { projectId: project.id });
+
+  const [result] = await sup.tick();
+
+  assert.deepEqual(result?.result, { type: "failed", reason: "project failed" });
+});
+
+test("GlobalSupervisor: pending broadcast blocks completion until target evaluator records an assessment", async () => {
   const sup = new GlobalSupervisor({ federationBus: new TestFederationBus() });
   const graph1 = new TestGraph();
   const graph2 = new TestGraph();
@@ -88,6 +98,8 @@ test("GlobalSupervisor: pending broadcast blocks completion until target evaluat
   const config2 = minimalConfig();
   const p1 = createProject(graph1, { session: "sess1" });
   const p2 = createProject(graph2, { session: "sess2" });
+  const shared = graph1.addFact(p1.id, { description: "shared finding", source: "explorer" });
+  graph1.resolveFact(p1.id, shared.id, { decision: "pass", reason: "verified" });
   worker1.register(/automated planning module/i, decisions([], { description: "session 1 done" }));
   worker2.register(/automated planning module/i, decisions([], { description: "session 2 done" }));
   let attempts = 0;
@@ -100,65 +112,55 @@ test("GlobalSupervisor: pending broadcast blocks completion until target evaluat
 
   const loop1 = new SessionLoop(graph1, worker1, config1);
   const loop2 = new SessionLoop(graph2, worker2, config2);
-  sup.register("sess1", loop1, { projectId: p1.id, scope: "group-a" });
-  sup.register("sess2", loop2, { projectId: p2.id, scope: "group-a" });
-  sup.federationBus.publishInsight(
-    "fact",
-    { sessionId: "sess1", projectId: p1.id, factId: "f1" },
-    "shared finding",
-    0.9,
-    undefined,
-    { id: "fact:sess1:p1:f1", scope: "group-a" },
-  );
+  sup.register(p1.sessionId, loop1, { projectId: p1.id, scope: "group-a" });
+  sup.register(p2.sessionId, loop2, { projectId: p2.id, scope: "group-a" });
+  sup.federationBus.publish({ sessionId: p1.sessionId, factId: shared.id, reason: "verified" });
 
   await sup.tick();
   assert.equal(graph1.getProject(p1.id)!.status, "finish_proposed");
   assert.equal(graph2.getProject(p2.id)!.status, "finish_proposed");
-  assert.equal(sup.federationBus.hasPendingDeliveries("group-a"), true);
+  assert.equal(sup.federationBus.hasPendingBroadcasts("group-a"), true);
 
   await sup.tick();
-  assert.equal(sup.federationBus.hasPendingDeliveries("group-a"), false);
+  assert.equal(sup.federationBus.hasPendingBroadcasts("group-a"), false);
   assert.equal(graph1.getProject(p1.id)!.status, "completed");
   assert.equal(graph2.getProject(p2.id)!.status, "completed");
 });
 
-test("GlobalSupervisor: a declared but unregistered session blocks task-group completion", async () => {
+test("GlobalSupervisor: task-group membership contains only active Sessions", async () => {
   const sup = new GlobalSupervisor({ federationBus: new TestFederationBus() });
   const graph = new TestGraph();
   const worker = new MockWorker();
   const config = minimalConfig();
-  config.federation = {
-    scope: "declared-group",
-    members: ["sess1", "sess2"],
-  };
+  config.federation = { scope: "declared-group" };
   const project = createProject(graph, { session: "sess1" });
   worker.register(/automated planning module/i, decisions([], { description: "session 1 done" }));
   const loop = new SessionLoop(graph, worker, config, {
     federationBus: sup.federationBus,
-    sessionId: "sess1",
+    sessionId: project.sessionId,
     federationScope: "declared-group",
   });
-  sup.register("sess1", loop, { projectId: project.id, scope: "declared-group" });
+  sup.register(project.sessionId, loop, { projectId: project.id, scope: "declared-group" });
 
   await sup.tick();
 
-  assert.equal(graph.getProject(project.id)?.status, "finish_proposed");
-  assert.equal(sup.federationBus.taskGroup("declared-group")?.status, "running");
-  assert.equal(
-    sup.federationBus.registeredSessions("declared-group").find((member) => member.sessionId === "sess2")?.memberStatus,
-    "expected",
+  assert.equal(graph.getProject(project.id)?.status, "completed");
+  assert.deepEqual(
+    sup.federationBus.registeredSessions("declared-group").map((member) => member.sessionId),
+    [project.sessionId],
   );
 });
 
 test("GlobalSupervisor: owns a FederationBus", () => {
   const sup = new GlobalSupervisor({ federationBus: new TestFederationBus() });
+  const graph = new TestGraph();
+  const project = createProject(graph);
+  sup.federationBus.registerSession(project.sessionId, "default", project.id, graph);
   assert.ok(sup.federationBus);
-  sup.federationBus.publishInsight(
-    "fact",
-    { sessionId: "s1", projectId: "p1", factId: "f1" },
-    "test", 0.5,
-  );
-  assert.equal(sup.federationBus.recentInsights().length, 1);
+  const fact = graph.addFact(project.id, { description: "test", source: "explorer" });
+  graph.resolveFact(project.id, fact.id, { decision: "pass", reason: "verified" });
+  sup.federationBus.publish({ sessionId: project.sessionId, factId: fact.id, reason: "verified" });
+  assert.equal(sup.federationBus.recentBroadcasts().length, 1);
 });
 
 test("GlobalSupervisor: globalMaxConcurrent bounds concurrent session ticks", async () => {
@@ -172,8 +174,8 @@ test("GlobalSupervisor: globalMaxConcurrent bounds concurrent session ticks", as
     sup.register(`s${i}`, {
       projectIds: () => [],
       taskGroupScope: () => "default",
-      setFederation: (bus, sessionId, scope) => bus.registerSession(sessionId, scope),
-      unsetFederation: (bus, sessionId) => bus.unregisterSession(sessionId),
+      setFederation: () => {},
+      unsetFederation: () => {},
       setResourceGovernor: () => {},
       tick: async () => {
         active += 1;

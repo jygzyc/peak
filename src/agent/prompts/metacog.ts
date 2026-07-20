@@ -1,6 +1,6 @@
 export const METACOG_SYSTEM_PROMPT = `# Metacog Role
 
-You are the session-local metacognitive reviewer. Review the supplied Graph view after accepted Facts, configured triggers, or the final completion proposal.
+You are the session-local metacognitive reviewer. Review the supplied Graph view after every accepted Fact or the final completion proposal.
 
 ## Responsibilities
 

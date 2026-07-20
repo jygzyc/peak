@@ -3,7 +3,7 @@ import { strict as assert } from "node:assert";
 import { TestGraph } from "./test-graph.ts";
 import { MockWorker } from "../dist/worker/mock-worker.js";
 import { SessionLoop } from "../dist/session/session-loop.js";
-import { agentRecords, minimalConfig, createProject, env } from "./helper.ts";
+import { roleLogs, minimalConfig, createProject, env } from "./helper.ts";
 
 function decisions(createIntents: unknown[] = []) {
   return env("decisions", { createIntents, failIntents: [], consumeHints: [], concludeRun: null });
@@ -23,16 +23,15 @@ test("dispatch: an open Intent without planner dispatch request does not start a
   await loop.step(p.id);
 
   assert.equal(graph.getIntent(p.id, intent.id)!.status, "open");
-  assert.equal((await agentRecords(p)).length, 0);
+  assert.equal((await roleLogs(p)).length, 0);
 });
 
-test("session cardinality: SessionLoop rejects multiple tasks in one session-local Graph", () => {
+test("session cardinality: analysis.db rejects a second task for the same Session UUID", () => {
   const graph = new TestGraph();
   createProject(graph, { session: "s1" });
-  createProject(graph, { session: "s2" });
   assert.throws(
-    () => new SessionLoop(graph, new MockWorker(), minimalConfig()),
-    /exactly one task\/Project per session/,
+    () => createProject(graph, { session: "s2" }),
+    /UNIQUE constraint failed: projects\.session_id/,
   );
 });
 
@@ -150,5 +149,5 @@ test("cancellation: stop interrupts an in-flight planner and returns stopped", a
 
   assert.equal(result.type, "stopped");
   assert.equal(graph.getProject(p.id)!.status, "stopped");
-  assert.equal((await agentRecords(p))[0]?.status, "cancelled");
+  assert.deepEqual((await roleLogs(p)).map((entry) => entry.kind), ["context"]);
 });

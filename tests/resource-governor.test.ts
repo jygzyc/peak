@@ -22,14 +22,12 @@ class TrackingWorker implements WorkerPool {
       await sleep(15);
       if (/# Evaluator Role/i.test(request.prompt)) {
         return {
-          workerId: "tracking",
           returncode: 0,
           text: env("verdict", { decision: "pass", reason: "verified" }),
         };
       }
       const intent = /work-a/i.test(request.prompt) ? "a" : "b";
       return {
-        workerId: "tracking",
         returncode: 0,
         text: env("fact", {
           description: `result-${intent}`,
@@ -43,7 +41,6 @@ class TrackingWorker implements WorkerPool {
   }
 
   pickWorker() { return "mock"; }
-  runningCount() { return this.active; }
 }
 
 test("GlobalResourceGovernor: quota must be an integer or Infinity", () => {

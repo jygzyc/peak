@@ -6,14 +6,8 @@ import { join } from "node:path";
 import {
   peakHome,
   peakPath,
-  agentsDir,
-  tasksDir,
   sessionsDir,
-  providersFile,
-  configFile,
   ensurePeakLayout,
-  agentFile,
-  taskFile,
 } from "../dist/config/peak-home.js";
 
 /**
@@ -59,46 +53,23 @@ test("peakPath: joins segments under home", () => {
   });
 });
 
-test("layout dirs: agents/tasks/sessions/providers resolve under home", () => {
+test("layout dirs: sessions resolves under home", () => {
   withTempHome(() => {
     const home = process.env.PEAK_HOME!;
-    assert.equal(agentsDir(), join(home, "agents"));
-    assert.equal(tasksDir(), join(home, "tasks"));
     assert.equal(sessionsDir(), join(home, "sessions"));
-    assert.equal(providersFile(), join(home, "providers.json"));
-    assert.equal(configFile(), join(home, "config.json"));
   });
 });
 
-test("agentFile/taskFile: build named config paths", () => {
-  withTempHome(() => {
-    const home = process.env.PEAK_HOME!;
-    assert.equal(agentFile("android-source-finder"), join(home, "agents", "android-source-finder.json"));
-    assert.equal(taskFile("app-audit"), join(home, "tasks", "app-audit.json"));
-  });
-});
-
-test("agentFile/taskFile: reject names that escape their config directory", () => {
-  withTempHome(() => {
-    for (const name of ["../outside", "nested/name", "nested\\name", "..", " leading"]) {
-      assert.throws(() => agentFile(name), /must not contain a path|must contain only/);
-      assert.throws(() => taskFile(name), /must not contain a path|must contain only/);
-    }
-  });
-});
-
-test("ensurePeakLayout: creates agents/tasks/sessions idempotently", () => {
+test("ensurePeakLayout: creates only sessions idempotently", () => {
   withTempHome(() => {
     const home = process.env.PEAK_HOME!;
     assert.ok(!existsSync(join(home, "agents")));
     ensurePeakLayout();
-    for (const sub of ["agents", "tasks", "sessions"]) {
-      assert.ok(existsSync(join(home, sub)), `${sub} should exist after ensurePeakLayout`);
-    }
+    assert.ok(existsSync(join(home, "sessions")));
+    assert.equal(existsSync(join(home, "agents")), false);
     // Idempotent: running again must not throw.
     ensurePeakLayout();
-    for (const sub of ["agents", "tasks", "sessions"]) {
-      assert.ok(existsSync(join(home, sub)));
-    }
+    assert.equal(existsSync(join(home, "tasks")), false);
+    assert.ok(existsSync(join(home, "sessions")));
   });
 });

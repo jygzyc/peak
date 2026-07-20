@@ -1,177 +1,168 @@
 # Peak 数据流转
 
-本文只说明数据如何进入角色、如何提交 Graph，以及如何跨 session 流动。组件职责见 [README.md](./README.md)。
+本文只描述 Task、角色 JSON、Graph 和跨 Session 数据如何流动。组件所有权见 [README.md](./README.md)。
 
-## 1. Session 初始化
-
-```text
-task/agent/global config
-  -> loadConfig + profile normalization
-  -> SessionManager 创建或打开 sessions/<session>/analysis.db
-  -> 创建/恢复 Project
-  -> 组合 SessionLoop + MetacogSupervisor
-  -> 注册到 GlobalSupervisor、HttpServer、FederationBus
-```
-
-task workspace 与 session 状态目录分离：Worker 的 `cwd` 是 workspace；Graph 和 Agent JSON 写入 session 目录。
-
-## 2. 单次角色调用
-
-四个角色共享同一条 `BaseAgent` 管线：
+## 1. 创建 Session
 
 ```text
-SessionLoop / MetacogSupervisor 选择 profile 与 assignment
-  -> SessionGraphReader 向 embedded/HTTP server 请求 profile-scoped snapshot
-  -> server 从 Graph 生成 GraphContextSnapshot
-  -> BaseAgent 写 agents/<agentId>/context.json
-  -> PromptLoader 加载 system prompt、rules、knowledge、skills
-  -> BaseAgent 根据有效 contract 生成唯一 JSON 输出说明
-  -> PromptBuilder 拼接 system、文件引用、assignment、output contract
-  -> Worker 执行
-  -> parseEnvelope + contract validator
-  -> BaseAgent 写 output.json，并将 record.json 标记 validated
-  -> 控制面检查 profile permission
-  -> Graph transaction 提交语义结果
-  -> record.json 标记 applied
+当前目录 task.json
+  -> loadConfig
+     ├─ 读取 task / agent / workers / scheduler / federation
+     ├─ agent 缺省：加载原生四角色
+     └─ agent=<name>：加载当前目录 <name>.json
+  -> 初始化任务 Skill
+     ├─ 校验 skills/<name>/SKILL.md
+     ├─ OpenCode / Pi：链接到 ~/.agents/skills/<name>
+     └─ Claude Code：链接到 ~/.claude/skills/<name>
+  -> SessionManager 生成随机 UUID
+  -> 写 ~/.peak/sessions/.session.yaml
+  -> 创建 sessions/<uuid>/analysis.db 与 logs/
+  -> 创建 Project
+  -> 注册 SessionLoop、MetacogSupervisor、HttpServer、GlobalSupervisor
 ```
 
-角色始终只看到 `context.json` 的文件引用和 prompt，不看到 Graph/SQLite。输出没有通过 JSON envelope 或合同验证时，不产生 Graph 变更，`record.json` 标记为 `failed`；取消时标记为 `cancelled`。
+`task.json` 所在目录承载 task.json、Agent JSON 与 Skill 源目录；`task.workspace` 只决定 Worker 工作目录。它们都不承载 Session 状态。Skill 软链接只用于 Worker 发现，任务 Skill 的唯一源仍是 task 目录。
+
+## 2. 一次角色执行
 
 ```text
-AgentRecord: running -> validated -> applied | discarded
-              └-----> failed | cancelled
+SessionLoop / MetacogSupervisor 选择角色配置与 Worker
+  -> Server 按 profile.context 读取 Graph
+  -> 生成标准 GraphContextSnapshot
+  -> logs/<timestamp>-<role>-context.json
+  -> PromptBuilder 拼接
+     ├─ 原生 system prompt
+     ├─ 定制 prompt / knowledge / rules / skills
+     ├─ context JSON 文件引用
+     ├─ 当前任务说明与 tools 列表
+     └─ 固定输出合同
+  -> BaseAgent 将完整输入交给角色绑定的 Worker
+  -> BaseWorker 选择配置模型并执行 OpenCode / Codex / Pi / Claude Code
+  -> Worker 返回统一 result
+  -> 解析 JSON envelope 并验证合同
+  -> logs/<同一 timestamp>-<role>-output.json
+  -> 检查角色固定权限
+  -> 提交 Graph transaction
+  -> 追加 logs/main.log
 ```
 
-AgentRecord 是审计流，不是 Graph 状态机。运行中的 `AbortController`、Promise 和并发计数不会落库。
+context 在 Worker 前落地；output 只有通过合同验证才落地。Worker 失败、取消或输出无效时，不写 output、不修改 Graph。没有第三个 record 文件，也没有 Run/Invocation 状态机。
+
+`main.log` 每行是一个 JSON 对象，记录时间、role、operation 以及受影响的 Fact/Intent 等标识。它是图操作历史，不是第二份状态源。
 
 ## 3. SessionLoop 顺序
 
-每个 step 按固定顺序推进：
-
 ```text
-1. consume Directives
-2. evaluate pending broadcasts
-3. run planner（Graph 变化需要规划时）
-4. dispatch explorers（仅派发被 planner 标记的 Intent）
-5. run evaluators（处理 candidate Facts）
-6. run metacog review，并直接持久化广播到 FederationBus
-7. check local / TaskGroup completion
+1. 处理 Directive
+2. 评估待处理的跨 Session 广播
+3. 必要时运行 planner
+4. 派发 planner 指定的 open Intent
+5. evaluator 审查 candidate Fact
+6. metacog 纠偏、终审并发布广播
+7. 检查本 Session / 同 scope Session 是否完成
 ```
 
-角色之间不直接发消息。Fact/Intent 状态、Hint、Directive 与 FederationBus delivery 是协调媒介；调用错误和重试只属于运行时。
+角色之间不直接传消息；本地协作通过 Fact、Intent、Hint、Directive，跨 Session 协作通过广播摘要和引用。
 
-## 4. Planner 数据流
+## 4. Planner
 
 ```text
-Graph snapshot + unconsumed Hints + recent Fact review results
+Graph snapshot + 未消费 Hint + 最近 Fact 审查结果
   -> planner main_decision JSON
-  -> PermissionChecker
-  -> DecisionApplier transaction
-     ├─ 创建 Intent + intent_sets
-     ├─ 请求/停止 explorer dispatch
-     ├─ deny Intent
-     ├─ 消费指定 Hint
-     └─ 创建 EndFact
+  -> 权限检查
+  -> 创建/派发/停止/失败 Intent
+  -> 消费指定 Hint
+  -> 或创建 EndFact
+  -> main.log
 ```
 
-planner 可以创建暂不派发的 open Intent；只有输出中明确请求 explorer，Intent 才能被 claim。EndFact 只是结束提议，不能绕过未完成工作和 TaskGroup 屏障。
+EndFact 是结束提议，不能绕过未完成的 Intent、candidate Fact、metacog 终审或跨 Session 广播。
 
-## 5. Explorer 与 Intent
+## 5. Explorer
 
 ```text
 open + dispatchRequested Intent
-  -> Graph.claimIntent()
-  -> claimed Intent
-  -> SessionLoop 活动执行表持有 controller 和 execution key
-  -> explorer 读取 Intent 与 parent pass Facts
+  -> Graph: open -> claimed
+  -> SessionLoop 内存保存 AbortController 和执行 key
+  -> 选择 explorer_gather / explorer_analysis 等配置
+  -> 对应 Worker 读取 context JSON 与 workspace
   -> candidate_fact JSON
-  -> permission: handle_intent + write_candidate_fact
   -> Graph transaction
-     ├─ 新建 candidate Fact
-     └─ Intent claimed -> pass，并关联 concludedFactId
+     ├─ 创建 candidate Fact
+     └─ Intent: claimed -> pass
+  -> main.log
 ```
 
-Graph 不保存执行所有者或 lease。一个 SessionLoop 内由活动执行表防止重复执行；进程重启时，构造 SessionLoop 会把遗留的 `claimed` Intent 统一恢复为 `open`。
+Graph 的 `claimed` 仅是任务占位，不记录 Worker、lease 或 heartbeat。进程重启后遗留的 `claimed` 统一恢复为 `open`。传输或解析失败不会伪造 deny/dead-end；重试计数只在当前进程内。
 
-Worker/解析失败不会伪造 deny Fact 或 dead-end。达到 retry 上限时 Project 显式失败；未耗尽时释放 Intent 等待重试。
-
-## 6. Evaluator 与 Fact
+## 6. Evaluator
 
 ```text
-candidate Fact + 来源 Intent/parent Facts
-  -> evaluator review JSON（decision/reason/confidence/requiredConditions）
-  -> permission: change_fact
+candidate Fact + 来源 Intent / parent Facts
+  -> evaluator verdict JSON
   -> Graph transaction
-     ├─ pass：成为后续 Intent 可引用的节点
-     ├─ deny：记录 reviewer reason 与 dead-end
-     └─ pending：保存 requiredConditions，等待条件满足
+     ├─ pass：成为后续 Intent 可引用节点
+     ├─ deny：记录原因与 dead-end
+     └─ pending：保存 requiredConditions
+  -> main.log
 ```
 
-Evaluator 的 transport、parse 或 contract 错误不会自动 deny candidate Fact；Fact 保持 candidate 等待重试。
+无效输出不会自动否决 Fact；candidate 保持待审。后续本地 pass Fact 或经过 evaluator 的跨 Session 广播可以满足 pending 条件。
 
-当新的 pass Fact 满足本地 pending Fact 的条件时，控制面可以重新激活该 Fact；跨 session 条件只能通过广播评估触发。
-
-## 7. Metacog 与广播
-
-Metacog 在 pass Fact、配置 trigger 或结束复核时运行：
+## 7. Metacog
 
 ```text
-Graph snapshot
-  -> hints / stop JSON
-  -> create_hint permission
-  -> Hint 写入 Graph
-  -> planner 在后续 step 选择性消费
+每一个 pass Fact / 结束复核
+  -> metacog context JSON
+  -> hints 或 stop JSON
+  -> Hint 写入本地 Graph
+  -> pass Fact 必须发布 {sessionId, factId, reason}
+  -> 发送记录追加到本 Session logs/main.log
 ```
 
-需要广播时，metacog 使用确定性 insight id 直接写入持久 `FederationBus`，再提交本地 Hint/review 任务状态。重复发布由 FederationBus 幂等处理，Graph 不保存投递状态。
+metacog 不直接访问数据库。控制面以 `sessionId + factId` 去重；同一轮出现多个 pass Fact 时逐个审查、逐个广播，不存在定时触发或最终摘要广播。
 
-## 8. 跨 Session 数据流
+## 8. 跨 Session 广播
 
 ```text
-source session pass Fact / pending condition / final summary
-  -> FederationBus insight + target deliveries
-  -> target session pendingForSession()
-  -> target evaluator broadcast_assessment JSON
+来源 Session 的 pass Fact
+  -> metacog 发布 {sessionId, factId, reason}
+  -> 来源 logs/main.log 记录 send_fact_broadcast
+  -> FederationBus 按引用读取来源 pass Fact
+  -> 目标 evaluator 读取广播引用、原因和来源 Fact
+  -> broadcast_assessment JSON
      ├─ relevant
      ├─ irrelevant
      └─ condition_satisfied(targetFactId)
-  -> target Graph 记录评估或重新激活已有 pending Fact
-  -> FederationBus acknowledge + cursor advance
+  -> 目标 logs/main.log 记录 receive_fact_broadcast
+  -> 必要时重新激活目标已有 pending Fact
 ```
 
-广播只包含 summary、confidence、conditions 和 source refs。它不能直接创建目标 session 的 pass Fact；`condition_satisfied` 也只能引用目标 Graph 中已经存在的 pending Fact。
+广播不会把来源 Fact 复制进目标 Graph，也不能直接创建目标 pass Fact。`analysis.db` 没有 federation 表，也没有独立 `federation.db`；进程重启后，FederationBus 根据各 Session 的 `main.log` 重建已发送和已接收集合。
 
-FederationBus 持久化：
-
-- TaskGroup generation 与成员状态；
-- insight、delivery 及其状态；
-- 每个 session 的 cursor；
-- finish-ready 与 group completion 状态。
-
-## 9. TaskGroup 结束
+## 9. 完成
 
 ```text
 每个 planner 创建 EndFact
-  -> 每个 metacog 完成 final review
-  -> 所有 delivery 已 evaluated/irrelevant
-  -> 所有 cursor == stable head
-  -> FederationBus.tryCompleteScope(scope, generation)
-  -> 各 Project completed
+  -> 每个 metacog 完成最终审查
+  -> 所有本地工作结束
+  -> 每个相关广播均已被其他 Session 接收处理
+  -> GlobalSupervisor 将同 scope Projects 标记 completed
 ```
 
-新成员、广播或新的 Graph 工作会使之前的结束提议失效或阻止提交。完成检查在 FederationBus transaction 中再次验证 generation 与水位。
+TaskGroup 成员就是同 scope 下实际注册的 UUID Session，不在 Task 文件中预填成员 ID。
 
-## 10. Directive、取消与恢复
+## 10. 恢复
 
 ```text
-POST /api/sessions/:sessionId/directives
-  -> Directive 持久写入 Graph
-  -> SessionLoop 消费
-     ├─ stop：Project stopped + abort 活动调用
-     ├─ pause：Project paused + abort 活动调用
-     ├─ resume：Project active
-     ├─ kill-intent：Intent deny + abort 对应 explorer
-     └─ hint/spawn-intent：写入相应 Graph 状态
+peak resume [name|uuid]
+  -> 无参数时读取 sessions/.session.yaml
+  -> 打开 sessions/<uuid>/analysis.db
+  -> 从 analysis.db 恢复 Project / Fact / Intent / Hint / Directive
+  -> 从 logs/main.log 恢复广播发送/接收集合
+  -> 从原 Task workspace 重新校验并安装 Skill 软链接
+  -> claimed Intent 恢复 open
+  -> 重建内存调度状态
 ```
 
-恢复只依赖 Graph 中的任务状态和 FederationBus 自己的 insight/delivery/cursor 水位。SessionLoop 的重试、cooldown、verdict inbox 和活动调用不会恢复；遗留 `claimed` Intent 会重新变为 `open`。调用 JSON 只用于审计，是否完成以 Graph transaction 是否提交为准。
+重试、cooldown、活动 Worker、取消控制器不会恢复。context/output 与 `main.log` 是历史记录；任务真相仍以 `analysis.db` 为准。

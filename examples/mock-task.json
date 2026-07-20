@@ -1,7 +1,0 @@
-{
-  "task": {
-    "target": "mock-target",
-    "goal": "demonstrate the peak runtime end-to-end (planner → explorer → evaluator → verified fact)",
-    "session": "mock-demo"
-  }
-}

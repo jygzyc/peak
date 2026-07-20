@@ -13,8 +13,7 @@ import { GlobalSupervisor } from "../session/supervisor.js";
 import { HttpServer, type HttpServerOptions } from "../server/http-server.js";
 import { HttpSessionGraphReader } from "../agent/context-builder.js";
 import { FederationBus } from "../graph/federation-bus.js";
-import { federationFile } from "../config/peak-home.js";
-import { join } from "node:path";
+import { SessionManager } from "../session/session-manager.js";
 
 export interface SessionRuntimeFactoryOptions {
   baseDir?: string;
@@ -41,40 +40,40 @@ export class SessionRuntimeFactory {
   readonly httpServer?: HttpServer;
   private readonly runtimes = new Map<string, CreatedSessionRuntime>();
   private readonly ownsSupervisor: boolean;
+  private readonly sessionManager: SessionManager;
   private closePromise?: Promise<void>;
 
   constructor(private readonly options: SessionRuntimeFactoryOptions = {}) {
     this.ownsSupervisor = !options.supervisor;
+    this.sessionManager = new SessionManager(options.baseDir);
     this.supervisor = options.supervisor ?? new GlobalSupervisor({
       globalMaxConcurrent: options.globalMaxConcurrent,
-      federationBus: new FederationBus({
-        dbPath: options.baseDir ? join(options.baseDir, "federation.db") : federationFile(),
-      }),
+      federationBus: new FederationBus(),
     });
     if (options.useHttp) this.httpServer = new HttpServer(this.supervisor.federationBus);
   }
 
   async create(config: TaskConfig, options: CreateSessionOptions = {}): Promise<CreatedSessionRuntime> {
     if (this.closePromise) throw new Error("session runtime factory is closed");
-    const sessionId = options.sessionId ?? config.task.session;
-    if (!sessionId) throw new Error("session runtime requires task.session or an explicit sessionId");
+    const name = options.name ?? config.task.name ?? config.task.target;
+    const selected = options.sessionId
+      ? { id: options.sessionId, name }
+      : this.sessionManager.create(name);
+    if (options.sessionId) this.sessionManager.activate(selected);
+    const sessionId = selected.id;
     if (this.runtimes.has(sessionId) || this.supervisor.get(sessionId)) {
       throw new Error(`session already exists: ${sessionId}`);
     }
 
-    const boundConfig: TaskConfig = config.task.session === sessionId
-      ? config
-      : { ...config, task: { ...config.task, session: sessionId } };
-    const runtime = new AgentRuntime(boundConfig, {
+    const runtime = new AgentRuntime(config, {
       baseDir: this.options.baseDir,
       workerPool: this.options.workerPool,
       // A factory owns one unified server; individual runtimes must not bind
       // competing ports or expose a partial single-session view.
       useHttp: false,
-      useMetacogSupervisor: true,
       globalSupervisor: this.supervisor,
       sessionId,
-      federationScope: boundConfig.federation?.scope,
+      federationScope: config.federation?.scope,
       graphReader: this.httpServer
         ? new HttpSessionGraphReader(() => this.httpServer!.baseUrl)
         : undefined,
@@ -82,8 +81,8 @@ export class SessionRuntimeFactory {
 
     try {
       const projectId = runtime.createProject({
-        session: sessionId,
-        name: options.name,
+        session: selected.name,
+        name: selected.name,
         configPath: options.configPath,
       });
       const created = { sessionId, projectId, runtime };
@@ -91,7 +90,7 @@ export class SessionRuntimeFactory {
         sessionId,
         projectId,
         graph: runtime.graph,
-        taskGroupScope: boundConfig.federation?.scope ?? sessionId,
+        taskGroupScope: config.federation?.scope ?? sessionId,
       });
       this.runtimes.set(sessionId, created);
       return created;
