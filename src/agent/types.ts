@@ -309,7 +309,6 @@ export type Permission =
   | "change_fact"
   | "receive_fact_broadcast"
   | "create_hint"
-  | "get_graph"
   | "send_fact_broadcast";
 
 /**
@@ -422,5 +421,5 @@ export const BUILTIN_PERMISSIONS: Record<SessionRole, Permission[]> = {
   ],
   explorer: ["handle_intent", "write_candidate_fact"],
   evaluator: ["change_fact", "receive_fact_broadcast"],
-  metacog: ["create_hint", "get_graph", "send_fact_broadcast"],
+  metacog: ["create_hint", "send_fact_broadcast"],
 };

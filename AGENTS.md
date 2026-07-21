@@ -78,7 +78,7 @@ Important points:
 - `task.target` and `task.goal` are required.
 - `agent` selects exactly one role bundle beside `task.json`. Omit it to use the native four roles.
 - Agent files contain `roles`; custom ids may provide multiple roles of one protocol type, such as `explorer_gather` and `explorer_analysis`.
-- A role config may set Worker refs, prompt, tools, skills, context and execution knobs. Permissions and output contracts are fixed by the four protocol roles and cannot be overridden.
+- A role config may set Worker refs, prompt, tools, skills, context and execution knobs. Permissions and output contracts are fixed by the four protocol roles and cannot be overridden. Permissions govern Graph mutations only; the control plane builds each role's Graph context from its fixed profile context policy and passes only the resulting JSON artifact to the Worker.
 - `workers` defines named CLI workers: `type` is `opencode | codex | pi | claude-code`; optional fields are `model`, `args`, and `timeoutMs`.
 - **There is no `workflow` concept.** Termination is natural (planner produces no new intent). `scheduler` (`maxConcurrent`/`refillPerTick`) is the only top-level execution knob and is optional. A `workflow` field is rejected as outside the first-version config schema.
 - Old `profiles`, `agents` arrays, `control`, `task.session`, and `workflow` fields are rejected.

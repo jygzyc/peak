@@ -28,6 +28,7 @@ test("BaseAgent: planner writes timestamped context and output JSON under logs",
     /# Planner Role[\s\S]*Contract: main_decision[\s\S]*"kind": "decisions"/,
   );
   assert.match(worker.calls()[0]!.prompt, /Configured tools for this role: read, grep/);
+  assert.doesNotMatch(worker.calls()[0]!.prompt, /\/api\/sessions|graph\/snapshot|https?:\/\//);
   assert.equal(records.length, 2);
   const context = records.find((entry) => entry.kind === "context")!;
   const output = records.find((entry) => entry.kind === "output")!;

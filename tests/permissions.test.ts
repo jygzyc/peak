@@ -46,6 +46,6 @@ test("builtin role capabilities match the first-version protocol", () => {
     ],
     explorer: ["handle_intent", "write_candidate_fact"],
     evaluator: ["change_fact", "receive_fact_broadcast"],
-    metacog: ["create_hint", "get_graph", "send_fact_broadcast"],
+    metacog: ["create_hint", "send_fact_broadcast"],
   });
 });

@@ -149,7 +149,6 @@ export class MetacogSupervisor {
 
     try {
       const permissions = new PermissionChecker(profile);
-      permissions.require("get_graph");
       const result = await agent.run({
         workerName,
         signal: controller.signal,

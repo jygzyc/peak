@@ -53,7 +53,7 @@ test("loadAgent supports multiple explorer configurations with different workers
 test("loadAgent rejects old single-slot files and permission/output overrides", () => {
   for (const value of [
     { slot: "explorer", runtime: { worker: "x" } },
-    { roles: { x: { role: "explorer", permissions: ["get_graph"] } } },
+    { roles: { x: { role: "explorer", permissions: ["create_intent"] } } },
     { roles: { x: { role: "explorer", output: { contract: "hints" } } } },
   ]) {
     const { dir } = bundle(value);

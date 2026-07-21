@@ -138,15 +138,18 @@ export class HttpServer {
       }
 
       if (path === "/api/sessions" && method === "POST") {
+        if (!this.authorizeReadModel(req, res)) return;
         return this.json(res, this.sessionBindings().map((binding) => this.sessionSummary(binding)));
       }
 
       if (path === "/api/task-groups" && method === "POST") {
+        if (!this.authorizeReadModel(req, res)) return;
         return this.json(res, this.federationBus?.taskGroups() ?? []);
       }
 
       const taskGroupMatch = path.match(/^\/api\/task-groups\/([^/]+)$/);
       if (taskGroupMatch && method === "POST") {
+        if (!this.authorizeReadModel(req, res)) return;
         const group = this.federationBus?.taskGroup(decodeURIComponent(taskGroupMatch[1]));
         return group
           ? this.json(res, group)
@@ -155,6 +158,7 @@ export class HttpServer {
 
       const snapshotMatch = path.match(/^\/api\/sessions\/([^/]+)\/graph\/snapshot$/);
       if (snapshotMatch && method === "POST") {
+        if (!this.authorizeReadModel(req, res)) return;
         const binding = this.sessionBinding(decodeURIComponent(snapshotMatch[1]));
         const project = binding && this.bindingProject(binding);
         if (!binding || !project) return this.json(res, { error: "session not found" }, 404);
@@ -204,6 +208,7 @@ export class HttpServer {
 
       const sessionCollectionMatch = path.match(/^\/api\/sessions\/([^/]+)\/(facts|intents|end-facts|events)$/);
       if (sessionCollectionMatch && method === "POST") {
+        if (!this.authorizeReadModel(req, res)) return;
         const binding = this.sessionBinding(decodeURIComponent(sessionCollectionMatch[1]));
         const project = binding && this.bindingProject(binding);
         if (!binding || !project) return this.json(res, { error: "session not found" }, 404);
@@ -222,6 +227,7 @@ export class HttpServer {
 
       const sessionMatch = path.match(/^\/api\/sessions\/([^/]+)$/);
       if (sessionMatch && method === "POST") {
+        if (!this.authorizeReadModel(req, res)) return;
         const binding = this.sessionBinding(decodeURIComponent(sessionMatch[1]));
         const project = binding && this.bindingProject(binding);
         if (!binding || !project) return this.json(res, { error: "session not found" }, 404);
@@ -345,6 +351,12 @@ export class HttpServer {
     res.setHeader("www-authenticate", "Bearer");
     this.json(res, { error: "control token required" }, 401);
     return false;
+  }
+
+  /** Graph/context reads are trusted on loopback; remote callers need the
+   * Server token. Role context selection is not a Worker capability. */
+  private authorizeReadModel(req: IncomingMessage, res: ServerResponse): boolean {
+    return isLoopbackAddress(req.socket.remoteAddress) || this.authorizeControl(req, res);
   }
 }
 

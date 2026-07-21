@@ -22,10 +22,9 @@ import { explorerExtra, evaluatorExtra, broadcastEvaluatorExtra } from "../agent
 import { PromptLoader } from "../config/prompt-loader.js";
 import type { FederationBus } from "../graph/federation-bus.js";
 import type { MetacogSupervisor } from "./metacog-supervisor.js";
-import { PermissionChecker, PermissionDeniedError } from "../agent/permissions.js";
+import { PermissionChecker } from "../agent/permissions.js";
 import type { GlobalResourceGovernor } from "../worker/resource-governor.js";
 import { SessionCoordinator } from "./session-coordinator.js";
-import type { Permission } from "../agent/types.js";
 import type { SessionGraphReader } from "../agent/context-builder.js";
 import { ServerSessionGraphReader } from "../server/session-graph-reader.js";
 import { appendGraphOperation } from "../server/graph-operation-log.js";
@@ -121,12 +120,6 @@ export class SessionLoop {
     if (this.federationBus && this.sessionId && existingProjects.length === 1) {
       this.registerFederationMembership(this.federationBus, this.sessionId, this.federationScope);
     }
-  }
-
-  requireProfilePermission(profileId: string, permission: Permission): void {
-    const profile = this.config.profiles[profileId];
-    if (!profile) throw new PermissionDeniedError(profileId, permission);
-    new PermissionChecker(profile).require(permission);
   }
 
   setFederation(bus: FederationBus, sessionId: string, scope = this.federationScope): void {

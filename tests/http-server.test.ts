@@ -145,7 +145,7 @@ test("http-server: one server isolates sessions and matches the local snapshot r
   }
 });
 
-test("http-server: graph snapshots are role-scoped JSON, not direct database access", async () => {
+test("http-server: graph context is fixed by the persisted profile, not a read capability", async () => {
   const graph = new TestGraph();
   const config = minimalConfig();
   config.profiles.explorer.permissions = ["handle_intent", "write_candidate_fact"];
@@ -162,7 +162,7 @@ test("http-server: graph snapshots are role-scoped JSON, not direct database acc
     const scoped = await post(endpoint, {
       projectId: project.id,
       profileId: "explorer",
-      spec: { graphView: "focused" },
+      spec: { graphView: "full" },
     });
     assert.equal(scoped.status, 200);
     assert.equal((await scoped.json()).view, config.profiles.explorer.context.graphView);
@@ -237,6 +237,8 @@ test("http-server: control endpoints require the configured bearer token", async
     });
     assert.equal(denied.status, 401);
     assert.equal(graph.unconsumedDirectives(project.id).length, 0);
+    assert.equal((await post(`http://127.0.0.1:${server.port}/api/sessions`)).status, 200);
+    assert.equal((await post(`http://127.0.0.1:${server.port}/api/sessions/${project.sessionId}`)).status, 200);
 
     const allowed = await fetch(endpoint, {
       method: "POST",

@@ -54,11 +54,12 @@ test("loadConfig loads one Agent bundle and validates each referenced Worker", (
   assert.equal(loaded.config.workers.deep?.model, "openai/gpt");
 });
 
-test("loadConfig rejects old profiles, agents array, control, and task.session", () => {
+test("loadConfig rejects removed role/control fields and graph access policy", () => {
   for (const extra of [
     { profiles: {} },
     { agents: ["x"] },
     { control: {} },
+    { graph: { readers: ["planner"] } },
     { task: { target: "x", goal: "g", session: "old" } },
   ]) {
     const value = "task" in extra

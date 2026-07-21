@@ -77,14 +77,15 @@ timeoutMs  可选执行超时
 
 Skill 配置必须位于 `skills/<name>/SKILL.md`，角色只填写纯名称。Task 初始化时，OpenCode/Pi 的 Skill 链接到 `~/.agents/skills/<name>`，Claude Code 链接到 `~/.claude/skills/<name>`；Codex 暂不安装。软链接幂等更新，但不覆盖已有真实目录。
 
-权限和输出合同不能由 Agent 文件覆盖：
+权限和输出合同不能由 Agent 文件覆盖。权限只约束角色输出可能触发的 Graph 写操作；
+Graph context 由控制面按 profile 的固定 context 策略生成，不属于 Worker capability：
 
 | 角色 | 合同 | 权限上限 |
 |---|---|---|
 | planner | `main_decision` | `create_intent`、`fail_intent`、`handle_hint`、`create_subagent_explorer`、`stop_subagent_explorer`、`create_end_fact` |
 | explorer | `candidate_fact` | `handle_intent`、`write_candidate_fact` |
 | evaluator | `verdict` / 广播评估 | `change_fact`、`receive_fact_broadcast` |
-| metacog | `hints` / `stop` | `create_hint`、`get_graph`、`send_fact_broadcast` |
+| metacog | `hints` / `stop` | `create_hint`、`send_fact_broadcast` |
 
 ## Session 与目录
 
@@ -135,7 +136,12 @@ Graph 不保存：执行所有者、lease、heartbeat、重试、cooldown、Work
 - `POST /api/sessions/:uuid/directives`
 - `POST /api/task-groups`
 
-Server 使用 UUID 校验 Session 与 Project 绑定。非 loopback 监听必须提供 token。
+Server 使用 UUID 校验 Session 与 Project 绑定。`graph/snapshot` 是 Peak 控制面的
+context 构造接口：`profileId` 只选择该 Session 持久化 Task 配置中的 context 策略，
+不是授权身份；客户端不能覆盖 `graphView`、范围或过滤策略。Worker 只获得落盘后的
+context JSON 引用，不获得 Server URL、token、Graph 对象或数据库路径。Session/TaskGroup
+原始读模型属于 Dashboard/运维控制面，使用 loopback 或 HTTP token 控制。非 loopback
+监听必须提供 token。
 
 ## 跨 Session 与结束
 
