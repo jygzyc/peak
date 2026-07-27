@@ -4,9 +4,8 @@
  * Pipeline:
  *   1. `tsc --noEmit` for type checking (fail fast on type errors).
  *   2. Clean dist/ and bundle src/cli.ts with esbuild into a single
- *      minified, mangled ESM file. The four npm dependencies
- *      (commander) and node:* builtins
- *      stay external so consumers' node_modules satisfy them.
+ *      minified, mangled ESM file. Runtime npm dependencies and node:*
+ *      builtins stay external so consumers' node_modules satisfy them.
  *   3. Verify the declared npm binary boots: `node dist/cli.js workers`
  *      must print valid JSON.
  *   4. `npm pack` the bundled dist into dist-packages/.
@@ -54,6 +53,7 @@ if (!new Set(["all", "prepare", "archive"]).has(mode)) {
 }
 
 const EXTERNAL = [
+  "@earendil-works/pi-coding-agent",
   "commander",
 ];
 
@@ -76,8 +76,9 @@ try {
     mkdirSync(distDir, { recursive: true });
   });
 
-  if (mode !== "archive") await step("copy dashboard.html", () => {
-    copyFileSync(join(root, "src", "server", "dashboard.html"), join(distDir, "dashboard.html"));
+  if (mode !== "archive") await step("copy runtime assets", () => {
+    copyFileSync(join(root, "src", "graph", "dashboard.html"), join(distDir, "dashboard.html"));
+    cpDirectory(join(root, "src", "runtime", "prompts"), join(distDir, "runtime", "prompts"));
   });
 
   if (mode !== "archive") await step("esbuild bundle", async () => {
@@ -211,6 +212,13 @@ try {
   });
 } finally {
   rmSync(npmCache, { recursive: true, force: true });
+}
+
+function cpDirectory(source, target) {
+  mkdirSync(target, { recursive: true });
+  for (const name of ["plan.md", "supervise.md", "execute.md", "execute-finalize.md"]) {
+    copyFileSync(join(source, name), join(target, name));
+  }
 }
 
 async function step(name, fn) {

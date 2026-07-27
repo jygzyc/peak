@@ -4,9 +4,8 @@ declare module "node:sqlite" {
     get(...params: unknown[]): Record<string, unknown> | undefined;
     all(...params: unknown[]): Array<Record<string, unknown>>;
   }
-
   export class DatabaseSync {
-    constructor(path: string);
+    constructor(path: string, options?: { readOnly?: boolean });
     exec(sql: string): void;
     prepare(sql: string): StatementSync;
     close(): void;

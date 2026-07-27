@@ -1,112 +1,57 @@
-/** Install task-local Skills into the selected Agent CLI discovery folders. */
-import {
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  readlinkSync,
-  realpathSync,
-  symlinkSync,
-  unlinkSync,
-} from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readlinkSync, realpathSync, symlinkSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import type { TaskConfig, WorkerType } from "../agent/types.js";
+import type { InstalledSkill, ResolvedTaskConfig, WorkerType } from "./types.js";
 
-export interface TaskSkillInstallOptions {
-  agentsSkillsDir?: string;
-  claudeSkillsDir?: string;
+export interface SkillInstallOptions {
+  agentsDir?: string;
+  claudeDir?: string;
 }
 
-export interface InstalledTaskSkill {
-  name: string;
-  source: string;
-  targets: string[];
-}
-
-export function installTaskSkills(
-  config: TaskConfig,
-  taskDir: string,
-  options: TaskSkillInstallOptions = {},
-): InstalledTaskSkill[] {
-  const requirements = collectSkillRequirements(config);
-  const installed: InstalledTaskSkill[] = [];
-
-  for (const [name, workerTypes] of requirements) {
-    const source = resolve(taskDir, "skills", name);
-    requireSkillSource(name, source);
-    const targets = skillTargets(workerTypes, options);
-    for (const root of targets) linkSkill(source, join(root, name));
-    installed.push({ name, source, targets: targets.map((root) => join(root, name)) });
-  }
-
-  return installed;
+export function initializeTaskSkills(
+  config: ResolvedTaskConfig,
+  options: SkillInstallOptions = {},
+): InstalledSkill[] {
+  const sources = config.task.skills.map((name) => {
+    assertSkillName(name);
+    const source = resolve(config.taskDir, "skills", name);
+    const entry = join(source, "SKILL.md");
+    if (!existsSync(entry) || !lstatSync(entry).isFile()) {
+      throw new Error(`task skill must contain SKILL.md: ${entry}`);
+    }
+    return { name, source: realpathSync(source) };
+  });
+  const roots = skillRoots(Object.values(config.workers).map((worker) => worker.type), options);
+  return sources.map(({ name, source }) => {
+    const targets = roots.map((root) => join(root, name));
+    for (const target of targets) link(source, target);
+    return { name, source, targets };
+  });
 }
 
 export function assertSkillName(name: string): void {
-  if (!/^[a-z0-9][a-z0-9-]*$/.test(name)) {
-    throw new Error(`skill name must use lowercase letters, digits, and hyphens: ${name}`);
-  }
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(name)) throw new Error(`invalid skill name: ${name}`);
 }
 
-function collectSkillRequirements(config: TaskConfig): Map<string, Set<WorkerType>> {
-  const result = new Map<string, Set<WorkerType>>();
-  for (const profile of Object.values(config.profiles)) {
-    const skills = profile.prompt.skills ?? [];
-    const workers = profile.runtime.workers?.length
-      ? profile.runtime.workers
-      : [profile.runtime.worker];
-    for (const name of skills) {
-      assertSkillName(name);
-      const types = result.get(name) ?? new Set<WorkerType>();
-      for (const workerName of workers) {
-        const worker = config.workers[workerName];
-        if (!worker) throw new Error(`skill "${name}" references missing worker "${workerName}"`);
-        types.add(worker.type);
-      }
-      result.set(name, types);
-    }
-  }
-  return result;
-}
-
-function requireSkillSource(name: string, source: string): void {
-  if (!existsSync(source) || !lstatSync(source).isDirectory()) {
-    throw new Error(`task skill not found: ${name} (expected ${source})`);
-  }
-  const entrypoint = join(source, "SKILL.md");
-  if (!existsSync(entrypoint) || !lstatSync(entrypoint).isFile()) {
-    throw new Error(`task skill "${name}" must contain SKILL.md: ${entrypoint}`);
-  }
-}
-
-function skillTargets(
-  workerTypes: Set<WorkerType>,
-  options: TaskSkillInstallOptions,
-): string[] {
+function skillRoots(types: WorkerType[], options: SkillInstallOptions): string[] {
   const roots = new Set<string>();
-  if (workerTypes.has("opencode") || workerTypes.has("pi")) {
-    roots.add(resolve(options.agentsSkillsDir ?? join(homedir(), ".agents", "skills")));
+  if (types.includes("opencode") || types.includes("pi")) {
+    roots.add(resolve(options.agentsDir ?? join(homedir(), ".agents", "skills")));
   }
-  if (workerTypes.has("claude-code")) {
-    roots.add(resolve(options.claudeSkillsDir ?? join(homedir(), ".claude", "skills")));
+  if (types.includes("claude-code")) {
+    roots.add(resolve(options.claudeDir ?? join(homedir(), ".claude", "skills")));
   }
   return [...roots];
 }
 
-function linkSkill(source: string, target: string): void {
-  const canonicalSource = realpathSync(source);
-  if (resolve(target) === resolve(source)) return;
+function link(source: string, target: string): void {
   mkdirSync(dirname(target), { recursive: true });
-
   const stat = lstatSync(target, { throwIfNoEntry: false });
   if (stat) {
-    if (!stat.isSymbolicLink()) {
-      throw new Error(`cannot install task skill over an existing directory: ${target}`);
-    }
+    if (!stat.isSymbolicLink()) throw new Error(`refusing to replace existing skill: ${target}`);
     const current = resolve(dirname(target), readlinkSync(target));
-    if (existsSync(current) && realpathSync(current) === canonicalSource) return;
+    if (existsSync(current) && realpathSync(current) === source) return;
     unlinkSync(target);
   }
-
-  symlinkSync(canonicalSource, target, process.platform === "win32" ? "junction" : "dir");
+  symlinkSync(source, target, process.platform === "win32" ? "junction" : "dir");
 }

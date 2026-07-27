@@ -1,0 +1,34 @@
+{
+  "task": {
+    "name": "daily-ai-hotspots",
+    "target": "Today's public AI developments (Asia/Shanghai calendar day) are uncollected.",
+    "goal": "A concise, evidence-backed digest of today's most significant AI developments with direct sources, publication times, deduplication, and impact analysis.",
+    "workspace": ".",
+    "skills": ["daily-ai-hotspots"]
+  },
+  "workers": {
+    "opencode": {
+      "type": "opencode",
+      "taskTypes": ["plan", "supervise", "execute"],
+      "maxRunning": 2,
+      "priority": 1,
+      "args": []
+    }
+  },
+  "scheduler": {
+    "maxConcurrent": 3,
+    "maxRunningProjects": 1,
+    "maxProjectConcurrent": 2,
+    "refillPerTick": 3,
+    "intervalMs": 3000
+  },
+  "tasks": {
+    "plan": { "timeoutMs": 120000, "maxIntents": 4 },
+    "supervise": { "timeoutMs": 120000, "intervalMs": 90000 },
+    "execute": {
+      "timeoutMs": 900000,
+      "finalizeTimeoutMs": 180000,
+      "maxArtifactBytes": 10485760
+    }
+  }
+}

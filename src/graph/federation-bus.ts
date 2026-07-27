@@ -1,224 +1,101 @@
-/** Process-local coordination for Fact references shared between Sessions.
- *
- * Broadcasts are not Graph rows. Metacog records sends/receives in each
- * Session's logs/main.log; this coordinator rebuilds its queue from those logs
- * when Sessions are registered again.
- */
-import { existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { Fact } from "../agent/types.js";
-import type { Graph } from "./graph.js";
+import type { FactRef } from "./types.js";
 
-export type TaskGroupStatus = "running" | "completed";
-export type TaskGroupMemberStatus = "active" | "completed";
-
-export interface FactBroadcast {
-  sessionId: string;
-  factId: string;
-  reason: string;
-}
-
-export interface TaskGroupState {
-  scope: string;
-  status: TaskGroupStatus;
-  pendingBroadcasts: number;
-  members: Array<{
-    sessionId: string;
-    projectId?: string;
-    status: TaskGroupMemberStatus;
-    finishReady: boolean;
-    completed: boolean;
-  }>;
-}
-
-interface RegisteredSession {
-  scope: string;
-  projectId?: string;
-  graph: Graph;
-  finishReady: boolean;
-  completed: boolean;
-  handled: Set<string>;
-}
+export interface FederationReference extends FactRef { provenance: string; sourceProjectId: string }
+interface Registration { scope?: string; projectDir: string }
 
 export class FederationBus {
-  private readonly sessions = new Map<string, RegisteredSession>();
-  private readonly broadcasts = new Map<string, FactBroadcast>();
-  private readonly completedScopes = new Set<string>();
+  private readonly projects = new Map<string, Registration>();
+  private readonly pending = new Map<string, FederationReference[]>();
 
-  close(): void {
-    this.sessions.clear();
-    this.broadcasts.clear();
-    this.completedScopes.clear();
+  register(projectId: string, projectDir: string, scope?: string): void {
+    this.projects.set(projectId, { projectDir, scope });
+    this.rebuild();
   }
 
-  registerSession(sessionId: string, scope: string, projectId: string | undefined, graph: Graph): void {
-    if (!sessionId || !scope) throw new Error("federation session and scope must be non-empty");
-    const handled = new Set<string>();
-    this.sessions.set(sessionId, {
-      scope,
-      projectId,
-      graph,
-      finishReady: false,
-      completed: false,
-      handled,
-    });
-    this.loadLog(sessionId, graph, handled);
+  unregister(projectId: string): void {
+    this.projects.delete(projectId);
+    this.pending.delete(projectId);
   }
 
-  publish(broadcast: FactBroadcast): FactBroadcast {
-    const source = this.requireSession(broadcast.sessionId);
-    const fact = source.projectId
-      ? source.graph.getFact(source.projectId, broadcast.factId)
-      : undefined;
-    if (!fact || fact.status !== "pass") {
-      throw new Error(`broadcast source is not a pass Fact: ${broadcast.sessionId}/${broadcast.factId}`);
+  publish(ref: FactRef, provenance: string): void {
+    const source = this.projects.get(ref.projectId);
+    if (!source) throw new Error(`federation source not registered: ${ref.projectId}`);
+    if (!source.scope) return;
+    for (const [targetProjectId, target] of this.projects) {
+      if (targetProjectId === ref.projectId || target.scope !== source.scope) continue;
+      const reference = { ...ref, provenance, sourceProjectId: ref.projectId };
+      if (this.has(targetProjectId, reference)) continue;
+      this.log(source.projectDir, { type: "send_fact_reference", targetProjectId, ...reference });
+      this.queue(targetProjectId, reference);
     }
-    const key = broadcastKey(broadcast);
-    const existing = this.broadcasts.get(key);
-    if (existing && existing.reason !== broadcast.reason) {
-      throw new Error(`Fact broadcast already exists with a different reason: ${key}`);
+  }
+
+  pendingFor(projectId: string): FederationReference[] {
+    return [...(this.pending.get(projectId) ?? [])];
+  }
+
+  markHandled(projectId: string, refs: FederationReference[]): void {
+    const registration = this.projects.get(projectId);
+    if (!registration) throw new Error(`federation target not registered: ${projectId}`);
+    const keys = new Set(refs.map(key));
+    for (const ref of refs) this.log(registration.projectDir, { type: "receive_fact_reference", ...ref });
+    this.pending.set(projectId, (this.pending.get(projectId) ?? []).filter((ref) => !keys.has(key(ref))));
+  }
+
+  private rebuild(): void {
+    this.pending.clear();
+    const sends: Array<{ targetProjectId: string; ref: FederationReference }> = [];
+    const handled = new Map<string, Set<string>>();
+    for (const [projectId, registration] of this.projects) {
+      for (const event of this.events(registration.projectDir)) {
+        if (event.type === "send_fact_reference" && typeof event.targetProjectId === "string") {
+          const ref = parseReference(event);
+          if (ref) sends.push({ targetProjectId: event.targetProjectId, ref });
+        }
+        if (event.type === "receive_fact_reference") {
+          const ref = parseReference(event);
+          if (ref) {
+            const values = handled.get(projectId) ?? new Set<string>();
+            values.add(key(ref));
+            handled.set(projectId, values);
+          }
+        }
+      }
     }
-    this.broadcasts.set(key, existing ?? broadcast);
-    return existing ?? broadcast;
-  }
-
-  sourceFact(broadcast: FactBroadcast): Fact | undefined {
-    const source = this.sessions.get(broadcast.sessionId);
-    return source?.projectId
-      ? source.graph.getFact(source.projectId, broadcast.factId)
-      : undefined;
-  }
-
-  recentBroadcasts(limit = 50, scope?: string): FactBroadcast[] {
-    return [...this.broadcasts.values()]
-      .filter((broadcast) => !scope || this.sessions.get(broadcast.sessionId)?.scope === scope)
-      .slice(-limit)
-      .reverse();
-  }
-
-  pendingForSession(sessionId: string, limit = 50): FactBroadcast[] {
-    const target = this.requireSession(sessionId);
-    return [...this.broadcasts.values()]
-      .filter((broadcast) => broadcast.sessionId !== sessionId)
-      .filter((broadcast) => this.sessions.get(broadcast.sessionId)?.scope === target.scope)
-      .filter((broadcast) => !target.handled.has(broadcastKey(broadcast)))
-      .slice(0, limit);
-  }
-
-  markHandled(sessionId: string, broadcast: FactBroadcast): void {
-    this.requireSession(sessionId).handled.add(broadcastKey(broadcast));
-  }
-
-  hasPendingBroadcasts(scope: string): boolean {
-    return this.registeredSessions(scope).some((member) => this.pendingForSession(member.sessionId, 1).length > 0);
-  }
-
-  setSessionFinishReady(sessionId: string, projectId: string, ready: boolean): void {
-    const session = this.requireSession(sessionId);
-    session.projectId = projectId;
-    session.finishReady = ready;
-  }
-
-  allSessionsFinishReady(scope: string): boolean {
-    const members = this.registeredSessions(scope);
-    return members.length > 0 && members.every((member) => member.finishReady || member.completed);
-  }
-
-  tryCompleteScope(scope: string): boolean {
-    if (!this.allSessionsFinishReady(scope) || this.hasPendingBroadcasts(scope)) return false;
-    this.completedScopes.add(scope);
-    for (const session of this.sessions.values()) {
-      if (session.scope === scope) session.completed = true;
+    for (const send of sends) {
+      if (this.projects.has(send.targetProjectId) && !handled.get(send.targetProjectId)?.has(key(send.ref))) {
+        this.queue(send.targetProjectId, send.ref);
+      }
     }
-    return true;
   }
 
-  registeredSessions(scope: string): Array<{
-    sessionId: string;
-    projectId?: string;
-    scope: string;
-    finishReady: boolean;
-    completed: boolean;
-  }> {
-    return [...this.sessions.entries()]
-      .filter(([, session]) => session.scope === scope)
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([sessionId, session]) => ({
-        sessionId,
-        projectId: session.projectId,
-        scope,
-        finishReady: session.finishReady,
-        completed: session.completed,
-      }));
+  private queue(projectId: string, ref: FederationReference): void {
+    this.pending.set(projectId, [...(this.pending.get(projectId) ?? []), ref]);
   }
-
-  unregisterSession(sessionId: string): void {
-    this.sessions.delete(sessionId);
+  private has(projectId: string, ref: FederationReference): boolean {
+    return (this.pending.get(projectId) ?? []).some((item) => key(item) === key(ref));
   }
-
-  taskGroup(scope: string): TaskGroupState | undefined {
-    const members = this.registeredSessions(scope);
-    if (members.length === 0) return undefined;
-    return {
-      scope,
-      status: this.completedScopes.has(scope) ? "completed" : "running",
-      pendingBroadcasts: members.reduce(
-        (count, member) => count + this.pendingForSession(member.sessionId, Number.MAX_SAFE_INTEGER).length,
-        0,
-      ),
-      members: members.map((member) => ({
-        ...member,
-        status: member.completed ? "completed" : "active",
-      })),
-    };
+  private log(projectDir: string, event: Record<string, unknown>): void {
+    const dir = join(projectDir, "logs");
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(join(dir, "main.log"), `${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`);
   }
-
-  taskGroups(): TaskGroupState[] {
-    const scopes = new Set([...this.sessions.values()].map((session) => session.scope));
-    return [...scopes].sort().map((scope) => this.taskGroup(scope)!).filter(Boolean);
-  }
-
-  private requireSession(sessionId: string): RegisteredSession {
-    const session = this.sessions.get(sessionId);
-    if (!session) throw new Error(`federation session is not registered: ${sessionId}`);
-    return session;
-  }
-
-  private loadLog(sessionId: string, graph: Graph, handled: Set<string>): void {
-    const project = graph.listProjects()[0];
-    if (!project) return;
-    const path = join(project.sessionDir, "logs", "main.log");
-    if (!existsSync(path)) return;
-    for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
-      if (!line) continue;
+  private events(projectDir: string): Array<Record<string, unknown>> {
+    const path = join(projectDir, "logs", "main.log");
+    if (!existsSync(path)) return [];
+    return readFileSync(path, "utf8").split(/\r?\n/).filter(Boolean).flatMap((line) => {
       try {
-        const entry = JSON.parse(line) as Record<string, unknown>;
-        const changes = entry.changes as Record<string, unknown> | undefined;
-        if (!changes) continue;
-        if (entry.operation === "send_fact_broadcast"
-          && typeof entry.sessionId === "string"
-          && typeof changes.factId === "string"
-          && typeof changes.reason === "string") {
-          const broadcast = {
-            sessionId: entry.sessionId,
-            factId: changes.factId,
-            reason: changes.reason,
-          };
-          this.broadcasts.set(broadcastKey(broadcast), broadcast);
-        }
-        if (entry.operation === "receive_fact_broadcast"
-          && typeof changes.sourceSessionId === "string"
-          && typeof changes.factId === "string") {
-          handled.add(`${changes.sourceSessionId}:${changes.factId}`);
-        }
-      } catch { /* malformed audit lines do not become broadcasts */ }
-    }
-    if (project.sessionId !== sessionId) {
-      throw new Error(`registered Session does not match Graph: ${sessionId}`);
-    }
+        const value = JSON.parse(line) as unknown;
+        return value && typeof value === "object" && !Array.isArray(value) ? [value as Record<string, unknown>] : [];
+      } catch { return []; }
+    });
   }
 }
 
-export function broadcastKey(broadcast: Pick<FactBroadcast, "sessionId" | "factId">): string {
-  return `${broadcast.sessionId}:${broadcast.factId}`;
+function key(ref: FactRef): string { return `${ref.projectId}/${ref.factId}`; }
+function parseReference(value: Record<string, unknown>): FederationReference | undefined {
+  if (typeof value.projectId !== "string" || typeof value.factId !== "string" || typeof value.provenance !== "string") return undefined;
+  return { projectId: value.projectId, factId: value.factId, provenance: value.provenance, sourceProjectId: value.projectId };
 }

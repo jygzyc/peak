@@ -1,7 +1,7 @@
 {
   "name": "@jygzyc/peak",
   "version": "0.1.0",
-  "description": "Standalone configured agent runtime",
+  "description": "HTTP-native distributed Graph agent runtime",
   "type": "module",
   "files": [
     "dist",
@@ -16,12 +16,13 @@
     "build": "node scripts/build.mjs",
     "copy-assets": "node scripts/build.mjs copy-assets",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node --test tests/*.test.ts",
+    "test": "npm run build && node --test \"tests/**/*.test.ts\"",
     "smoke": "node scripts/smoke.mjs",
     "pack": "node scripts/pack.mjs archive",
     "prepack": "node scripts/pack.mjs prepare"
   },
   "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.82.1",
     "commander": "^15.0.0"
   },
   "devDependencies": {
@@ -30,7 +31,7 @@
     "typescript": "^7.0.2"
   },
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=22.19.0"
   },
   "license": "GPL-3.0"
 }

@@ -1,140 +1,139 @@
-/** Load a project-local task file and its optional reusable Agent bundle. */
 import { existsSync, readFileSync } from "node:fs";
-import { basename, dirname, resolve } from "node:path";
-import type { SchedulerConfig, TaskConfig, WorkerConfig, WorkerName } from "../agent/types.js";
-import { DEFAULT_SCHEDULER } from "../agent/types.js";
-import { loadAgent } from "./agent-loader.js";
-import { defaultConfig } from "./default-config.js";
+import { dirname, resolve } from "node:path";
+import { DEFAULT_SCHEDULER, DEFAULT_TASKS } from "./defaults.js";
+import type { ResolvedTaskConfig, TaskType, WorkerConfig, WorkerType } from "./types.js";
 
-export interface LoadedConfig {
-  config: TaskConfig;
-  session: string;
-  sessionDir: string;
-  workspaceDir: string;
-  configPath: string;
-}
+const WORKER_TYPES: WorkerType[] = ["opencode", "codex", "pi", "claude-code"];
+const TASK_TYPES: TaskType[] = ["plan", "supervise", "execute"];
 
-export function loadConfig(
-  configPath: string,
-  sessionOverride?: string,
-): LoadedConfig {
-  const absPath = resolve(configPath);
-  if (!existsSync(absPath)) throw new Error(`task config not found: ${absPath}`);
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(absPath, "utf8"));
-  } catch (error) {
-    throw new Error(`task config is not valid JSON: ${(error as Error).message}`);
+export function loadTaskConfig(path: string): ResolvedTaskConfig {
+  const configPath = resolve(path);
+  if (!existsSync(configPath)) throw new Error(`task config not found: ${configPath}`);
+  const root = object(parseJson(readFileSync(configPath, "utf8")), "task config");
+  keys(root, ["task", "workers", "scheduler", "tasks", "federation"], "task config");
+  const taskDir = dirname(configPath);
+  const task = object(root.task, "task");
+  keys(task, ["name", "target", "goal", "workspace", "skills"], "task");
+  const workers = parseWorkers(root.workers);
+  if (!Object.values(workers).some((worker) => worker.taskTypes.includes("supervise"))) {
+    throw new Error("at least one worker must support supervise");
   }
-  const root = objectValue(parsed, "task config");
-  assertKeys(root, ["task", "agent", "workers", "scheduler", "federation"], "task config");
-  const task = objectValue(root.task, "task config.task");
-  assertKeys(task, ["target", "goal", "name", "workspace"], "task config.task");
-
-  const target = requiredString(task.target, "task.target");
-  const goal = requiredString(task.goal, "task.goal");
-  const name = optionalString(task.name, "task.name");
-  const workspace = optionalString(task.workspace, "task.workspace");
-  const agent = optionalString(root.agent, "task config.agent");
-  const taskDir = dirname(absPath);
-  const workspaceDir = workspace ? resolve(taskDir, workspace) : taskDir;
-  const native = defaultConfig();
-  const profiles = agent ? loadAgent(agent, taskDir) : native.profiles;
-  const workers = parseWorkers(root.workers, native.workers);
-  validateProfileWorkers(profiles, workers);
-
-  const config: TaskConfig = {
-    task: { target, goal, name, workspace: workspaceDir },
-    ...(agent ? { agent } : {}),
-    profiles,
+  return deepFreeze({
+    configPath,
+    taskDir,
+    task: {
+      name: optionalString(task.name, "task.name"),
+      target: requiredString(task.target, "task.target"),
+      goal: requiredString(task.goal, "task.goal"),
+      workspace: resolve(taskDir, optionalString(task.workspace, "task.workspace") ?? "."),
+      skills: strings(task.skills, "task.skills") ?? [],
+    },
     workers,
     scheduler: parseScheduler(root.scheduler),
+    tasks: parseTasks(root.tasks),
     federation: parseFederation(root.federation),
-  };
-  const session = sessionOverride ?? name ?? deriveSessionFromTarget(target) ?? deriveSessionName(absPath);
-  return { config, session, sessionDir: taskDir, workspaceDir, configPath: absPath };
+  });
 }
 
-function parseWorkers(
-  raw: unknown,
-  native: Record<WorkerName, WorkerConfig>,
-): Record<WorkerName, WorkerConfig> {
-  if (raw === undefined) return { ...native };
-  const workers = objectValue(raw, "task config.workers");
-  const result: Record<WorkerName, WorkerConfig> = {};
-  for (const [name, value] of Object.entries(workers)) {
-    const worker = objectValue(value, `worker "${name}"`);
-    assertKeys(worker, ["type", "model", "args", "timeoutMs"], `worker "${name}"`);
-    result[name] = {
-      type: requiredEnum(
-        worker.type,
-        ["opencode", "codex", "pi", "claude-code"],
-        `worker "${name}".type`,
-      ),
-      model: optionalString(worker.model, `worker "${name}".model`),
-      args: optionalStrings(worker.args, `worker "${name}".args`),
-      timeoutMs: optionalPositiveInt(worker.timeoutMs, `worker "${name}".timeoutMs`),
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === "object") {
+    for (const item of Object.values(value as Record<string, unknown>)) deepFreeze(item);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+function parseWorkers(value: unknown): Record<string, WorkerConfig> {
+  const input = object(value, "workers");
+  if (Object.keys(input).length === 0) throw new Error("workers must not be empty");
+  const output: Record<string, WorkerConfig> = {};
+  for (const [name, raw] of Object.entries(input)) {
+    const worker = object(raw, `worker ${name}`);
+    keys(worker, ["type", "model", "taskTypes", "maxRunning", "priority", "args"], `worker ${name}`);
+    const type = enumeration(worker.type, WORKER_TYPES, `worker ${name}.type`);
+    const args = strings(worker.args, `worker ${name}.args`) ?? [];
+    if (type === "pi" && args.length) throw new Error(`worker ${name}.args is not supported for Pi SDK workers`);
+    output[name] = {
+      type,
+      model: optionalString(worker.model, `worker ${name}.model`),
+      taskTypes: enumerations(worker.taskTypes, TASK_TYPES, `worker ${name}.taskTypes`) ?? [...TASK_TYPES],
+      maxRunning: integer(worker.maxRunning, `worker ${name}.maxRunning`) ?? 1,
+      priority: integer(worker.priority, `worker ${name}.priority`, 0) ?? 1,
+      args,
     };
   }
+  return output;
+}
+
+function parseScheduler(value: unknown): ResolvedTaskConfig["scheduler"] {
+  if (value === undefined) return { ...DEFAULT_SCHEDULER };
+  const input = object(value, "scheduler");
+  keys(input, Object.keys(DEFAULT_SCHEDULER), "scheduler");
+  return {
+    maxConcurrent: integer(input.maxConcurrent, "scheduler.maxConcurrent") ?? DEFAULT_SCHEDULER.maxConcurrent,
+    maxRunningProjects: integer(input.maxRunningProjects, "scheduler.maxRunningProjects") ?? DEFAULT_SCHEDULER.maxRunningProjects,
+    maxProjectConcurrent: integer(input.maxProjectConcurrent, "scheduler.maxProjectConcurrent") ?? DEFAULT_SCHEDULER.maxProjectConcurrent,
+    refillPerTick: integer(input.refillPerTick, "scheduler.refillPerTick") ?? DEFAULT_SCHEDULER.refillPerTick,
+    intervalMs: integer(input.intervalMs, "scheduler.intervalMs") ?? DEFAULT_SCHEDULER.intervalMs,
+  };
+}
+
+function parseTasks(value: unknown): ResolvedTaskConfig["tasks"] {
+  if (value === undefined) return structuredClone(DEFAULT_TASKS);
+  const input = object(value, "tasks");
+  keys(input, ["plan", "supervise", "execute"], "tasks");
+  const plan = section(input.plan, "tasks.plan", ["timeoutMs", "maxIntents"]);
+  const supervise = section(input.supervise, "tasks.supervise", ["timeoutMs", "intervalMs"]);
+  const execute = section(input.execute, "tasks.execute", ["timeoutMs", "finalizeTimeoutMs", "maxArtifactBytes"]);
+  return {
+    plan: {
+      timeoutMs: integer(plan.timeoutMs, "tasks.plan.timeoutMs") ?? DEFAULT_TASKS.plan.timeoutMs,
+      maxIntents: integer(plan.maxIntents, "tasks.plan.maxIntents") ?? DEFAULT_TASKS.plan.maxIntents,
+    },
+    supervise: {
+      timeoutMs: integer(supervise.timeoutMs, "tasks.supervise.timeoutMs") ?? DEFAULT_TASKS.supervise.timeoutMs,
+      intervalMs: integer(supervise.intervalMs, "tasks.supervise.intervalMs") ?? DEFAULT_TASKS.supervise.intervalMs,
+    },
+    execute: {
+      timeoutMs: integer(execute.timeoutMs, "tasks.execute.timeoutMs") ?? DEFAULT_TASKS.execute.timeoutMs,
+      finalizeTimeoutMs: integer(execute.finalizeTimeoutMs, "tasks.execute.finalizeTimeoutMs") ?? DEFAULT_TASKS.execute.finalizeTimeoutMs,
+      maxArtifactBytes: integer(execute.maxArtifactBytes, "tasks.execute.maxArtifactBytes") ?? DEFAULT_TASKS.execute.maxArtifactBytes,
+    },
+  };
+}
+
+function parseFederation(value: unknown): ResolvedTaskConfig["federation"] {
+  if (value === undefined) return undefined;
+  const input = object(value, "federation");
+  keys(input, ["scope"], "federation");
+  return { scope: optionalString(input.scope, "federation.scope") };
+}
+
+function section(value: unknown, label: string, allowed: string[]): Record<string, unknown> {
+  if (value === undefined) return {};
+  const result = object(value, label);
+  keys(result, allowed, label);
   return result;
 }
 
-function parseScheduler(raw: unknown): SchedulerConfig {
-  if (raw === undefined) return { ...DEFAULT_SCHEDULER };
-  const value = objectValue(raw, "task config.scheduler");
-  assertKeys(value, ["maxConcurrent", "refillPerTick"], "task config.scheduler");
-  return {
-    maxConcurrent: optionalPositiveInt(value.maxConcurrent, "scheduler.maxConcurrent") ?? DEFAULT_SCHEDULER.maxConcurrent,
-    refillPerTick: optionalPositiveInt(value.refillPerTick, "scheduler.refillPerTick") ?? DEFAULT_SCHEDULER.refillPerTick,
-  };
+function parseJson(text: string): unknown {
+  try { return JSON.parse(text) as unknown; }
+  catch (error) { throw new Error(`invalid task JSON: ${(error as Error).message}`); }
 }
 
-function parseFederation(raw: unknown): TaskConfig["federation"] {
-  if (raw === undefined) return undefined;
-  const value = objectValue(raw, "task config.federation");
-  assertKeys(value, ["scope"], "task config.federation");
-  return {
-    scope: optionalString(value.scope, "federation.scope"),
-  };
-}
-
-function validateProfileWorkers(
-  profiles: TaskConfig["profiles"],
-  workers: TaskConfig["workers"],
-): void {
-  for (const [profileId, profile] of Object.entries(profiles)) {
-    const names = profile.runtime.workers ?? [profile.runtime.worker];
-    for (const name of names) {
-      if (!workers[name]) throw new Error(`agent role "${profileId}" references missing worker "${name}"`);
-    }
-  }
-}
-
-function deriveSessionFromTarget(target: string): string | undefined {
-  const stem = basename(target.replace(/[\\/]/g, "/")).replace(/\.[^.]+$/, "");
-  const safe = stem.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
-  return safe || undefined;
-}
-
-function deriveSessionName(path: string): string {
-  return basename(dirname(path)).replace(/[^a-zA-Z0-9_-]/g, "-") || "session";
-}
-
-function objectValue(value: unknown, label: string): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be a JSON object`);
+function object(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
   return value as Record<string, unknown>;
 }
 
-function assertKeys(value: Record<string, unknown>, allowed: string[], label: string): void {
-  const keys = new Set(allowed);
-  const unknown = Object.keys(value).find((key) => !keys.has(key));
-  if (unknown) throw new Error(`${label} contains unknown field "${unknown}"`);
+function keys(value: Record<string, unknown>, allowed: string[], label: string): void {
+  const invalid = Object.keys(value).find((key) => !allowed.includes(key));
+  if (invalid) throw new Error(`${label} contains unknown field "${invalid}"`);
 }
 
 function requiredString(value: unknown, label: string): string {
   const result = optionalString(value, label);
-  if (!result) throw new Error(`${label} is required in task config`);
+  if (!result) throw new Error(`${label} is required`);
   return result;
 }
 
@@ -144,29 +143,25 @@ function optionalString(value: unknown, label: string): string | undefined {
   return value.trim();
 }
 
-function optionalStrings(value: unknown, label: string): string[] | undefined {
+function strings(value: unknown, label: string): string[] | undefined {
   if (value === undefined) return undefined;
-  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.trim() === "")) {
-    throw new Error(`${label} must be an array of non-empty strings`);
-  }
-  return [...new Set(value.map((item) => item.trim()))];
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+  return [...new Set(value.map((item) => requiredString(item, label)))];
 }
 
-function optionalPositiveInt(value: unknown, label: string): number | undefined {
+function integer(value: unknown, label: string, minimum = 1): number | undefined {
   if (value === undefined) return undefined;
-  if (!Number.isInteger(value) || (value as number) <= 0) throw new Error(`${label} must be a positive integer`);
+  if (!Number.isInteger(value) || (value as number) < minimum) throw new Error(`${label} must be an integer >= ${minimum}`);
   return value as number;
 }
 
-function optionalEnum<T extends string>(value: unknown, allowed: readonly T[], label: string): T | undefined {
-  const parsed = optionalString(value, label);
-  if (parsed === undefined) return undefined;
-  if (!allowed.includes(parsed as T)) throw new Error(`${label} must be one of: ${allowed.join(", ")}`);
-  return parsed as T;
+function enumeration<T extends string>(value: unknown, allowed: T[], label: string): T {
+  const result = requiredString(value, label);
+  if (!allowed.includes(result as T)) throw new Error(`${label} must be one of: ${allowed.join(", ")}`);
+  return result as T;
 }
 
-function requiredEnum<T extends string>(value: unknown, allowed: readonly T[], label: string): T {
-  const parsed = optionalEnum(value, allowed, label);
-  if (!parsed) throw new Error(`${label} is required`);
-  return parsed;
+function enumerations<T extends string>(value: unknown, allowed: T[], label: string): T[] | undefined {
+  const values = strings(value, label);
+  return values?.map((item) => enumeration(item, allowed, label));
 }

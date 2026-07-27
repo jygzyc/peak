@@ -1,175 +1,143 @@
 # AGENTS.md
 
-Coding guidance for the optional TypeScript `peak` package.
+## Scope
 
-## Package role
+Peak is a standalone TypeScript package and CLI for running generic, HTTP-native proof Graph projects. Keep Graph, scheduling, worker, federation, storage, and Web UI mechanisms domain-neutral. Domain behavior belongs in Task Skills.
 
-- `peak` is a standalone npm package (`@jygzyc/peak`) with its own `peak` binary.
-- Treat it as a generic configured agent runtime. Do not add fixed business task subcommands.
-- Keep domain-specific behavior in task config, prompts, rules, and skills rather than hardcoding it in source.
+Runtime requirements are ESM and Node.js `>=22.19.0`.
 
-## Architecture
-
-`peak` implements a configured multi-Agent control plane:
+## Current Architecture
 
 ```text
-GlobalSupervisor / AgentRuntime
-  -> manages multiple SessionLoops
-  -> global resource scheduling, worker quota, HTTP/API
-  -> coordinates cross-session broadcasts without a separate database
-
-SessionLoop(session)
-  -> owns the session-local Graph
-  -> owns the session-local MainAgent / Planner
-  -> owns the session-local MetacogSupervisor
-  -> controls active role executions in memory
-  -> writes context/output JSON and main.log under sessions/<uuid>/logs
-  -> writes back to the session Graph via permission-checked DecisionApplier
-
-SubagentProfile
-  = runtime + prompt + context policy + permissions + output contract + maxActive
-
-Graph
-  = persistent analysis truth per session: Fact / Intent / Hint / Directive / Link / Event
+Browser Web UI -----------------------------> GraphHttpServer
+AgentRuntime -> RuntimeScheduler -> ProjectLoop -> TaskExecutor
+TaskExecutor -> GraphClient -> loopback HTTP -> GraphHttpServer
+GraphHttpServer -> ProjectStoreRegistry -> private per-Project SQLite/Artifact stores
+TaskExecutor -> Plan | Supervise | Execute | Finalize -> WorkerRuntime
+WorkerRuntime -> PiDriver -> Pi Agent SDK
+WorkerRuntime -> OpenCode/Codex/Claude Code drivers -> ProcessRunner -> Agent CLI
+FederationBus -> FactRef delivery recovered from each Project logs/main.log
 ```
 
-Core principles:
+The HTTP API is the only live Graph protocol, including calls made by the in-process runtime. Workers receive a path to an immutable YAML Graph context, not a live Graph object.
 
-1. Source implements mechanism only — no hardcoded role semantics.
-2. Roles, prompts, tools, skills, workers, permissions, and context policies come from configuration. A Worker's optional model is passed to its Agent CLI.
-3. The Graph is the single session-local source of truth.
-4. Main loop is easy to find: `session/session-loop.ts` (per-session) and `session/supervisor.ts` (global).
-5. All four roles extend BaseAgent; live cancellation and concurrency are runtime state, while each execution writes only context/output JSON outside Graph.
-6. Each active session has its own MainAgent/Planner and Metacog; the global layer only supervises.
-7. Session-internal task state goes through Graph/events. Every pass Fact triggers metacog and one `{sessionId, factId, reason}` broadcast; FederationBus resolves the source Fact by reference and never writes either Session Graph.
+## Non-Negotiable Boundaries
 
-Architecture and runtime data flow are documented in `docs/README.md` and `docs/data-flow.md`.
+1. Do not bypass `GraphClient` for runtime Graph reads or writes.
+2. Only `graph/http-server.ts` and `graph/project-store-registry.ts` may import `sqlite-store.ts` or `artifact-store.ts`.
+3. Projects use UUID ids and independent `analysis.db` shards.
+4. Cross-Project proof persists only `FactRef`; never copy source Facts or Artifacts into the target Project.
+5. Project completion is immediate and independent after a valid Goal proof. It does not wait for another Project or pending federation delivery.
+6. Facts are immutable. Every Fact and Intent has a non-empty, trimmed description of at most 16 KiB UTF-8.
+7. Active executions, cancellation, worker cooldowns, retained Agent sessions, reservations, and scheduling checkpoints stay in memory.
+8. Workers never receive Graph/store instances, SQLite paths, Server URL/token, HTTP credentials, or `FederationBus`.
+9. Task customization is Skill-only. Do not add configurable roles, workflows, custom prompts, permissions, provider credentials, or direct provider API clients.
+10. The Pi Agent SDK is the sole in-process Agent integration. Do not add another model/provider SDK without an explicit architecture change.
+11. Built-in prompts live in `src/runtime/prompts/`; Task files cannot override them.
+12. Do not add compatibility layers for the removed Session/four-role architecture.
 
-## Source layout
+Do not recreate top-level `agent/`, `app/`, `server/`, `client/`, `session/`, or `task/` directories.
+
+## Source Layout
 
 ```text
-src/
-├── app/       # runtime composition root (AgentRuntime)
-├── config/    # task/Agent/default config and prompt-loader
-├── session/   # SessionLoop, GlobalSupervisor, MetacogSupervisor, SessionCoordinator, SessionManager
-├── agent/     # MainAgent, DecisionApplier, contracts, permissions, context-builder, graph-view,
-│              # parse-envelope, prompts/builtins, and role implementations
-├── graph/     # Graph interface, persistent SQLite store, FederatedGraph, FederationBus
-├── worker/    # BaseWorker, four Agent CLI workers, runtime pool, mock worker
-├── server/    # HTTP API and embedded dashboard
-├── cli.ts     # CLI entrypoint
-└── index.ts   # public exports
+src/config/   Strict Task schema/defaults and Task Skill initialization
+src/graph/    Graph types/API/client/server, private stores, federation, exports, dashboard
+src/project/  ProjectManager, ProjectLoop, and GraphSupervisor timing
+src/runtime/  Runtime composition, scheduler, execution registry, contracts, contexts, prompts
+src/worker/   Pi Agent SDK integration, Agent CLI drivers, resource selection, ProcessRunner
+src/cli.ts    run/resume/serve/init/workers commands and process signal lifecycle
 ```
 
-## Config model
+## Graph Model and Persistence
 
-A Task file has one narrow top-level schema:
+A Project starts with immutable `origin` and `goal` Facts. A normal Intent has one or more `FactRef` sources and `to: null` while open; conclusion atomically creates one local Fact and fills `to`. Completion creates the single Intent targeting the current Project's `goal` and marks the Project `completed` in the same transaction.
+
+Hints are independent Graph inputs. They may be added to active, stopped, or completed Projects, but adding a Hint does not resume or reopen a Project. Reopen must be explicit and records external feedback as a new Fact/Intent.
 
 ```text
-task
-agent       (optional task-local <name>.json bundle)
-workers
-scheduler   (optional — scheduler resource knobs only; NOT a "workflow")
-federation  (optional scope)
+~/.peak/projects/<uuid>/
+├── analysis.db
+├── artifacts/<sha256>
+└── logs/
+    ├── main.log
+    └── graph-<monotonic-utc-timestamp>-<plan|supervise|execute|finalize>.yaml
 ```
 
-Important points:
-
-- `task.target` and `task.goal` are required.
-- `agent` selects exactly one role bundle beside `task.json`. Omit it to use the native four roles.
-- Agent files contain `roles`; custom ids may provide multiple roles of one protocol type, such as `explorer_gather` and `explorer_analysis`.
-- A role config may set Worker refs, prompt, tools, skills, context and execution knobs. Permissions and output contracts are fixed by the four protocol roles and cannot be overridden. Permissions govern Graph mutations only; the control plane builds each role's Graph context from its fixed profile context policy and passes only the resulting JSON artifact to the Worker.
-- `workers` defines named CLI workers: `type` is `opencode | codex | pi | claude-code`; optional fields are `model`, `args`, and `timeoutMs`.
-- **There is no `workflow` concept.** Termination is natural (planner produces no new intent). `scheduler` (`maxConcurrent`/`refillPerTick`) is the only top-level execution knob and is optional. A `workflow` field is rejected as outside the first-version config schema.
-- Old `profiles`, `agents` arrays, `control`, `task.session`, and `workflow` fields are rejected.
-
-## Task workspace and Peak home
-
-Task configuration is self-contained:
+SQLite contains only:
 
 ```text
-workspace/
-├── task.json
-├── <task-agent>.json
-└── skills/<skill>/SKILL.md
+project, artifacts, facts, intents, intent_sources, hints, counters
 ```
 
-Persistent Session state lives under `PEAK_HOME` (default `~/.peak`):
+Do not add execution, lease, event, directive, verdict, dead-end, worker, session, or federation tables. Artifact bodies are content-addressed files; SQLite stores metadata and Fact references only. Unreferenced Artifacts are garbage-collected after the safety window.
+
+Use `fileURLToPath()` for module URL paths. Validate UUIDs, hashes, workspace boundaries, symlinks, and Artifact sizes. Close SQLite handles before deleting test directories.
+
+## HTTP Server and Web UI
+
+- `GET /` serves `src/graph/dashboard.html`. The HTML shell is intentionally reachable without bearer authentication so the browser can request a token.
+- All `/api/*` routes require `Authorization: Bearer <token>` when `--token` is configured.
+- Binding a non-loopback host requires a token.
+- The dashboard is a self-contained HTML/CSS/JavaScript asset with no CDN dependency.
+- It polls Project state, renders Facts as nodes, Intents as directed edges, and Hints as independent nodes.
+- Human Hint entry is through the dashboard and writes `POST /api/projects/{id}/hints`; the creator defaults to `human:web` and is editable.
+- The UI also exposes Project stop/resume, explicit reopen, details, pan/zoom/fit, and YAML snapshot export.
+- UI changes must preserve token handling, auto-refresh, immutable Graph semantics, and mobile layout.
+
+Lifecycle behavior:
+
+- `peak run` and `peak resume` start the Graph server and scheduler, print the Web URL, and remain alive after the watched Project becomes `stopped` or `completed`.
+- They shut down only on `SIGINT`, `SIGTERM`, or a fatal monitor error. Shutdown stops scheduling, cancels executions, disposes retained Pi sessions, closes HTTP, then closes SQLite stores.
+- `peak serve` starts only the persisted Graph UI/API, with no scheduler or workers, and remains alive until `SIGINT`/`SIGTERM`.
+- Default ports are ephemeral (`0`) for `run`/`resume` and `8000` for `serve`.
+
+## Runtime and Worker Behavior
+
+ProjectLoop schedules, in order per tick, due Supervise work, needed Plan work, then open Intent execution, subject to global and per-Project slots. A non-active Project cancels its active in-memory executions.
+
+Worker selection filters by task support, `maxRunning`, and retry cooldown, then sorts by priority, current load, and name. Reservations prevent over-selection before execution starts.
+
+- `pi`: runs in-process through `@earendil-works/pi-coding-agent`; uses an in-memory Pi `SessionManager`; supports Pi model references and thinking levels; rejects CLI `args`.
+- `opencode`: runs `opencode run --format json`; does not currently support Finalize resume.
+- `codex`: runs `codex exec --json` and supports resume from its thread id.
+- `claude-code`: runs `claude -p --output-format json` with an explicit session id and supports resume.
+
+Execute may invoke Finalize once after timeout or malformed successful output only when execution started, was not externally cancelled, the Project/Intent is still active/open, and a resumable session exists. Pi Execute sessions retained for this path expire from memory after 10 minutes. Finalize returns the same Fact contract and never creates a separate Graph operation.
+
+CLI subprocesses receive prompts through stdin, run in `task.workspace`, have bounded 10 MiB stdout/stderr capture, and are terminated as process trees on timeout/cancellation. Keep authentication and provider configuration owned by each Agent tool.
+
+Worker contract parsing accepts the final fenced JSON block or outermost JSON object, then strictly rejects unknown/missing fields. Do not loosen the typed Plan/Supervise/Execute shapes.
+
+## Config and Skills
+
+Top-level Task fields are exactly:
 
 ```text
-~/.peak/
-└── sessions/
-    ├── .session.yaml
-    └── <uuid>/
-        ├── analysis.db
-        └── logs/<timestamp>-<role>-context|output.json + main.log
+task, workers, optional scheduler, optional tasks, optional federation
 ```
 
-- A Task's singular `agent` references `<task-dir>/<name>.json`; role Worker refs must resolve in the Task's `workers`.
-- Role Skill entries are names, never paths. Task initialization validates `<task-dir>/skills/<name>/SKILL.md` and links it to `~/.agents/skills` for OpenCode/Pi or `~/.claude/skills` for Claude Code. Existing real directories are never overwritten.
-- Session display name: `--session` > `task.name` > derived from `task.target` > derived from the task directory. The state directory always uses a random UUID.
-- `ensurePeakLayout()` creates only `sessions/`.
+Unknown fields are rejected recursively. At least one Worker must support `supervise`. Supported worker types are `opencode`, `codex`, `pi`, and `claude-code`; task types are `plan`, `supervise`, and `execute`.
 
-## Graph model
+Skills are names resolving to `<task-dir>/skills/<name>/SKILL.md`:
 
-Graph state is session-local and is the source of truth:
+- OpenCode and Pi link to `~/.agents/skills/<name>`.
+- Claude Code links to `~/.claude/skills/<name>`.
+- Codex does not install Skills.
+- Never overwrite a real destination file or directory.
 
-- Projects
-- Facts (`candidate` -> `pass` / `deny` / `pending`)
-- Intents (`open` -> `claimed` -> `pass` / `deny`)
-- Hints
-- Directives
-- Links
-- Events
-- Dead-end route hashes
+`loadTaskConfig()` is strict and side-effect free. Skill initialization happens when a Project is registered unless `--no-install-skills` is used.
 
-Role execution state is intentionally not part of Graph. Active controllers, cancellation, and concurrency live in memory; only timestamped context/output files and Graph operation `main.log` remain as history.
+## Build, Tests, and Packaging
 
-Intent stores only task state (`open/claimed/pass/deny`). Worker ownership, lease epochs, heartbeats, retry counters, and planner cooldowns are not Graph data. A new SessionLoop reopens orphaned `claimed` Intents. Broadcast send/receive history is JSONL in each Session's `logs/main.log`; FederationBus rebuilds its in-memory queue from those logs and owns no database.
-
-Do not introduce domain-specific fact enums. Keep domain meaning in descriptions, evidence, prompts, and references.
-
-## Agent protocol layer
-
-- `agent/permissions.ts` — PermissionChecker enforces per-profile capability tokens before any graph mutation.
-- `agent/contracts.ts` — named output validators (main_decision, candidate_fact, verdict, hints, stop, chain).
-- `agent/context-builder.ts` — assembles dynamic prompt context from the graph per profile.context.
-- `agent/graph-view.ts` — renders graph state per view policy (full / focused / evidence-only / summary).
-- `agent/main-agent.ts` — session-local MainAgent wrapper around the planner profile.
-- `agent/decision-applier.ts` — applies MainDecision to the graph with permission checks.
-- `agent/parse-envelope.ts` — JSON envelope extraction shared by stages, contracts, and the applier.
-
-## Workers
-
-Worker adapters are bottom-layer execution only. They must not own graph state, Agent prompt policy, or scheduling policy.
-
-- `BaseWorker` owns subprocess execution, stdin, timeout, cancellation, output limits, and result shaping.
-- `OpenCodeWorker`, `CodexWorker`, `PiWorker`, and `ClaudeCodeWorker` inherit `BaseWorker` and implement only CLI arguments plus JSON result parsing.
-- `BaseAgent` supplies the complete role input assembled from prompt, tools, skills, context, assignment, and output contract.
-- Worker `model` is passed to the selected CLI's `--model`; authentication and provider configuration stay in that CLI.
-- Peak has no direct model API/SDK path, no HTTP Worker, and no `providers.json`.
-
-## Editing gotchas
-
-- Worker configuration has one taxonomy only: `WorkerConfig.type`. Do not reintroduce `kind`, `backend`, `transport`, Provider, or API Worker layers.
-- **Windows path handling in scripts:** use `fileURLToPath(new URL("..", import.meta.url))` for the repo root, never `new URL("..", import.meta.url).pathname` (yields a malformed `\\E:\\` drive path on Windows). When deleting SQLite-backed session dirs in tests, `close()` the graph handle before `rmSync` (open files fail with EPERM on Windows).
-- **Session ids are filesystem-derived.** `SessionManager` sanitizes them via `safeSessionName` and rejects paths that escape `baseDir` — never bypass `sessionDir()` by joining `baseDir` with a raw id.
-
-## Validation
-
-This repo *is* the package root (there is no nested `peak/` directory). Run all commands from the repo root:
+Tests import modular files from `dist/`, never directly from `src/`. `npm test` runs a clean TypeScript build first. HTTP/CLI tests must stop servers and close registries before removing temporary directories.
 
 ```bash
-npm run typecheck   # tsc --noEmit — fast, run before commits
-npm run build       # clean + tsc + copy dashboard.html → dist/
-npm test            # builds first, then node --test tests/*.test.ts
-npm run smoke       # exercises the built CLI; requires dist/cli.js (build first)
-npm run pack        # builds the npm tarball into dist-packages/
+npm run typecheck
+npm run build
+npm test
+npm run smoke
+npm run pack
 ```
 
-Testing conventions:
-
-- Tests import compiled output via `../dist/**.js`, **never** `../src/`. `npm test` builds first for this reason — after editing source you must rebuild before tests see the change.
-- `tests/helper.ts` provides `minimalConfig()`, `createProject()`, `freshSetup()` (on-disk TestGraph + MockWorker), and `env(kind, data)` (JSON envelope builder). Reuse these instead of hand-rolling fixtures.
-- Builtin role system prompts live in `src/agent/prompts/*.ts` and are referenced as `builtin:<id>`; tests should use those identifiers rather than reaching into `src/` for prompt files.
-- Focused run: `node --test tests/<name>.test.ts` (after a build).
+Run `npm run pack` last: its `prepack` phase replaces modular `dist/` with the production esbuild bundle, copies `dashboard.html` to `dist/dashboard.html`, copies runtime prompts, verifies `dist/cli.js workers`, and writes the tarball plus manifest under `dist-packages/`.
