@@ -7,7 +7,7 @@ export class ProcessRunner {
   run(spec: ProcessSpec, cwd: string, timeoutMs: number, signal?: AbortSignal): Promise<ProcessResult> {
     if (signal?.aborted) return Promise.resolve(result(false, "", "cancelled", 1, false, true));
     return new Promise((resolve) => {
-      const child = spawn(spec.argv[0]!, spec.argv.slice(1), {
+      const child = spawn(...launchTarget(spec.argv), {
         cwd, env: { ...process.env, ...spec.env, PEAK_AGENT_ACTIVE: "1" },
         stdio: [spec.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
         detached: process.platform !== "win32", windowsHide: true,
@@ -60,4 +60,36 @@ export class ProcessRunner {
 
 function result(started: boolean, stdout: string, stderr: string, returncode: number, timedOut: boolean, cancelled: boolean): ProcessResult {
   return { started, stdout, stderr, returncode, timedOut, cancelled };
+}
+
+/**
+ * Returns the `[command, args]` tuple for spawning a worker CLI.
+ *
+ * On Windows, npm-installed CLIs ship as `.cmd` batch shims that Node cannot
+ * exec directly (`spawn ... EINVAL`/`ENOENT`). They must be driven through
+ * `cmd.exe`, which resolves the shim via PATHEXT. We invoke cmd.exe ourselves
+ * (instead of `spawn(..., { shell: true })`) so we fully own argument quoting
+ * and never pass unescaped args to a shell; argv is trusted Board config and
+ * the prompt is always piped via stdin, never placed on the command line.
+ * Unix stays shell-less so detached process-group kills keep working.
+ */
+function launchTarget(argv: string[]): [string, string[]] {
+  if (process.platform !== "win32") return [argv[0]!, argv.slice(1)];
+  const line = argv.map(quoteWindowsArg).join(" ");
+  return [process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", line]];
+}
+
+/** Quotes a single argv element for the Windows CRT (CommandLineToArgvW). */
+function quoteWindowsArg(arg: string): string {
+  if (arg === "") return '""';
+  if (!/[\s"]/.test(arg)) return arg;
+  let out = '"';
+  let slashes = 0;
+  for (let i = 0; i < arg.length; i += 1) {
+    const ch = arg[i]!;
+    if (ch === "\\") slashes += 1;
+    else if (ch === '"') { out += "\\".repeat(slashes * 2 + 1) + '"'; slashes = 0; }
+    else { out += "\\".repeat(slashes) + ch; slashes = 0; }
+  }
+  return `${out}${"\\".repeat(slashes * 2)}"`;
 }

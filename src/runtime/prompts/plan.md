@@ -1,9 +1,11 @@
 # Plan
 
-Read the entire Graph YAML at {graphPath}. It contains the project task, the full Fact/Intent/Hint graph, and any configured Skills.
+Read the proof-frontier JSON at {graphPath}.
 
-Decide only the next proof structure: create Intents, prove the Goal, or make no change. Do not execute an Intent, do not use tools, do not search. Apply the task Skills as your planning methodology.
+Required Skills: {skills}. Use them as the planning method.
 
-Output format: respond with ONE raw JSON object and nothing else — no markdown, no code fences, no prose before or after.
+From the current leaf Facts, open Intents, Hints, pending Federation Facts, origin, and goal, choose the next proof step: create atomic Intents, prove the goal, or noop. `availableFactRefs` is constructed by the runtime and is the only canonical source list. Each entry is an immutable hyperlink node with `projectId`, `factId`, and `description`; copy all three fields exactly when selecting it—do not fetch, enrich, strip, or rewrite reference data. Each Intent must consume existing FactRefs and define one verifiable outcome. Do not execute tasks, search, use tools, bundle unrelated outcomes, or fill the Intent budget unnecessarily.
+
+Output exactly one raw JSON object in this format, with no markdown or extra text:
 
 {contract}

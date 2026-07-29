@@ -1,6 +1,6 @@
 export type ProjectStatus = "active" | "stopped" | "completed";
 
-export interface FactRef { projectId: string; factId: string }
+export interface FactRef { projectId: string; factId: string; description: string }
 export interface ArtifactRef { path: string; sha256: string; mediaType: string; sizeBytes: number }
 export interface Fact { id: string; description: string; artifact: ArtifactRef | null; createdAt: string }
 export interface Intent {
@@ -23,3 +23,15 @@ export interface ConcludeInput { description: string; artifact?: ArtifactRef | n
 export interface CompleteInput { from: FactRef[]; description: string; completedBy: string }
 export interface ReopenInput { description: string; creator: string }
 export interface AddHintInput { content: string; creator: string }
+
+/** Current proof frontier: Facts that have not produced a later local Fact. */
+export function leafFacts(graph: ProjectGraph): Fact[] {
+  const superseded = new Set(
+    graph.intents
+      .filter((intent) => intent.to !== null && intent.to.factId !== "goal")
+      .flatMap((intent) => intent.from)
+      .filter((ref) => ref.projectId === graph.project.id)
+      .map((ref) => ref.factId),
+  );
+  return graph.facts.filter((fact) => fact.id !== "goal" && !superseded.has(fact.id));
+}

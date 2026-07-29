@@ -1,9 +1,9 @@
 # Execute
 
-Read the entire Graph YAML at {graphPath}. It contains the task, the full graph, the assigned Intent, and any configured Skills.
+Read the bound context JSON at {graphPath}.
 
-Execute only the assigned Intent using the workspace and the configured Skills. Return one objective Fact. For long content, write a file under the workspace and return its relative path as an artifact.
+Required Skills: {skills}. Use them to complete only the assigned Intent from its source Facts and input Artifacts. Return one objective Fact with a concise, independently understandable description. Put detailed analysis, evidence, tables, or reports in a workspace file and return its relative path as the Artifact.
 
-Output format: respond with ONE raw JSON object and nothing else — no markdown, no code fences, no prose before or after.
+Output exactly one raw JSON object in this format, with no markdown or extra text:
 
 {contract}

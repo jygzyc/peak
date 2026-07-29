@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, readdirSync, rmSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
+import { initializeProjectsDirectory } from "../config/paths.js";
 import { ApiError, requireUuid } from "./api.js";
 import { ArtifactStore } from "./artifact-store.js";
 import { SqliteStore } from "./sqlite-store.js";
@@ -13,8 +14,7 @@ export class ProjectStoreRegistry {
   readonly baseDir: string;
 
   constructor(baseDir: string) {
-    this.baseDir = resolve(baseDir);
-    mkdirSync(this.baseDir, { recursive: true });
+    this.baseDir = initializeProjectsDirectory(baseDir);
     this.load();
   }
 
@@ -45,9 +45,11 @@ export class ProjectStoreRegistry {
       unique.add(key);
       if (!allowGoal && ref.factId === "goal") throw new ApiError(400, "goal cannot be a source");
       const source = this.get(ref.projectId).graph;
-      if (!source.fact(ref.factId)) throw new ApiError(400, `fact not found: ${key}`);
+      const fact = source.fact(ref.factId);
+      if (!fact) throw new ApiError(400, `fact not found: ${key}`);
+      if (ref.description !== fact.description) throw new ApiError(400, `FactRef description mismatch: ${key}`);
       const sourceProject = source.project()!;
-      if (ref.projectId !== targetProjectId && (!target.scope || sourceProject.scope !== target.scope)) {
+      if (ref.projectId !== targetProjectId && sourceProject.scope !== target.scope) {
         throw new ApiError(400, "FactRef crosses federation scope");
       }
     }
@@ -84,6 +86,9 @@ export class ProjectStoreRegistry {
     for (const name of readdirSync(this.baseDir)) {
       if (!isUuid(name) || !existsSync(join(this.baseDir, name, "analysis.db"))) continue;
       this.open(name);
+    }
+    for (const stores of this.stores.values()) {
+      stores.graph.repairSourceDescriptions((projectId, factId) => this.stores.get(projectId)?.graph.fact(factId)?.description);
     }
   }
 

@@ -20,7 +20,7 @@ export class ProjectLoop {
     private readonly executions: ExecutionRegistry,
     private readonly pendingCount: () => number,
   ) {
-    this.supervisor = new GraphSupervisor(config.tasks.supervise.intervalMs);
+    this.supervisor = new GraphSupervisor(config.phase.supervise.intervalMs);
   }
 
   async tick(globalSlots: number): Promise<number> {
@@ -49,6 +49,10 @@ export class ProjectLoop {
       available--; started++;
     }
     return started;
+  }
+
+  dispose(): void {
+    this.executions.cancelProject(this.projectId);
   }
 
   private planNeeded(project: ProjectGraph): boolean {

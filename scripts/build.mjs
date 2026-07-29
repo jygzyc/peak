@@ -22,8 +22,8 @@ function compile() {
   if (result.status !== 0) process.exit(result.status ?? 1);
 }
 function copyAssets() {
-  mkdirSync(join(dist, "graph"), { recursive: true });
+  mkdirSync(join(dist, "ui"), { recursive: true });
   mkdirSync(join(dist, "runtime"), { recursive: true });
-  cpSync(join(root, "src", "graph", "dashboard.html"), join(dist, "graph", "dashboard.html"));
+  cpSync(join(root, "src", "ui", "dashboard.html"), join(dist, "ui", "dashboard.html"));
   cpSync(join(root, "src", "runtime", "prompts"), join(dist, "runtime", "prompts"), { recursive: true });
 }

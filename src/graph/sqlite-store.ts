@@ -1,7 +1,9 @@
-import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { ApiError, requireDescription } from "./api.js";
+import { initializeProjectDirectory } from "../config/paths.js";
+import {
+  ApiError, requireDescription, requireFactDescription, requireIntentDescription, requireShortDescription,
+} from "./api.js";
 import type {
   AddHintInput, ArtifactRef, CompleteInput, ConcludeInput, CreateIntentInput, CreateProjectInput,
   Fact, FactRef, Hint, Intent, ProjectGraph, ProjectMeta, ProjectStatus, ReopenInput,
@@ -9,12 +11,14 @@ import type {
 
 export class SqliteStore {
   readonly database: DatabaseSync;
+  readonly projectDir: string;
 
-  constructor(readonly projectDir: string) {
-    mkdirSync(projectDir, { recursive: true });
-    this.database = new DatabaseSync(join(projectDir, "analysis.db"));
+  constructor(projectDir: string) {
+    this.projectDir = initializeProjectDirectory(projectDir);
+    this.database = new DatabaseSync(join(this.projectDir, "analysis.db"));
     this.database.exec("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;");
     this.database.exec(SCHEMA);
+    this.migrateFactRefDescriptions();
   }
 
   initialize(id: string, input: CreateProjectInput): ProjectMeta {
@@ -22,7 +26,7 @@ export class SqliteStore {
     const now = timestamp();
     this.transaction(() => {
       this.database.prepare("INSERT INTO project(id,title,status,scope,created_at) VALUES(?,?,?,?,?)")
-        .run(id, requireDescription(input.title, "title"), "active", input.scope ?? null, now);
+        .run(id, requireShortDescription(input.title, "title"), "active", input.scope ?? null, now);
       this.database.prepare("INSERT INTO facts(id,description,artifact_sha256,created_at) VALUES(?,?,NULL,?)")
         .run("origin", requireDescription(input.target, "target"), now);
       this.database.prepare("INSERT INTO facts(id,description,artifact_sha256,created_at) VALUES(?,?,NULL,?)")
@@ -63,12 +67,17 @@ export class SqliteStore {
   intents(projectId: string): Intent[] {
     const rows = this.database.prepare("SELECT * FROM intents ORDER BY created_at,id").all();
     const sources = this.database.prepare("SELECT * FROM intent_sources ORDER BY intent_id,position").all();
+    const descriptions = new Map(this.database.prepare("SELECT id,description FROM facts").all()
+      .map((row) => [text(row.id), text(row.description)]));
     return rows.map((row) => ({
       id: text(row.id),
       from: sources.filter((source) => source.intent_id === row.id).map((source) => ({
         projectId: text(source.source_project_id), factId: text(source.source_fact_id),
+        description: text(source.source_description),
       })),
-      to: row.to_fact_id === null ? null : { projectId, factId: text(row.to_fact_id) },
+      to: row.to_fact_id === null ? null : {
+        projectId, factId: text(row.to_fact_id), description: descriptions.get(text(row.to_fact_id))!,
+      },
       description: text(row.description), createdBy: text(row.created_by), createdAt: text(row.created_at),
       concludedBy: nullableNull(row.concluded_by), concludedAt: nullableNull(row.concluded_at),
     }));
@@ -102,13 +111,13 @@ export class SqliteStore {
   }
 
   addHint(input: AddHintInput): Hint {
-    const content = requireDescription(input.content, "content");
+    const content = requireShortDescription(input.content, "content");
     const existing = this.database.prepare("SELECT id FROM hints WHERE trim(content)=?").get(content);
     if (existing) throw new ApiError(409, "duplicate hint");
     const id = this.nextId("hint", "h");
     const createdAt = timestamp();
     this.database.prepare("INSERT INTO hints(id,content,creator,created_at) VALUES(?,?,?,?)")
-      .run(id, content, requireDescription(input.creator, "creator"), createdAt);
+      .run(id, content, requireShortDescription(input.creator, "creator"), createdAt);
     return { id, content, creator: input.creator.trim(), createdAt };
   }
 
@@ -117,8 +126,8 @@ export class SqliteStore {
     if (input.from.length === 0) throw new ApiError(400, "intent requires a source");
     const id = this.nextId("intent", "i");
     const createdAt = timestamp();
-    const description = requireDescription(input.description);
-    const createdBy = requireDescription(input.createdBy, "createdBy");
+    const description = requireIntentDescription(input.description);
+    const createdBy = requireShortDescription(input.createdBy, "createdBy");
     this.transaction(() => {
       this.database.prepare(`INSERT INTO intents(id,to_fact_id,description,created_by,created_at,concluded_by,concluded_at)
         VALUES(?,NULL,?,?,?,NULL,NULL)`).run(id, description, createdBy, createdAt);
@@ -129,8 +138,8 @@ export class SqliteStore {
 
   conclude(intentId: string, input: ConcludeInput): { intent: Intent; fact: Fact } {
     this.requireActive();
-    const description = requireDescription(input.description);
-    const concludedBy = requireDescription(input.concludedBy, "concludedBy");
+    const description = requireFactDescription(input.description);
+    const concludedBy = requireShortDescription(input.concludedBy, "concludedBy");
     const artifact = input.artifact ?? null;
     if (artifact && !this.artifact(artifact.sha256)) throw new ApiError(400, "artifact not found");
     let created!: Fact;
@@ -157,8 +166,8 @@ export class SqliteStore {
     if (current) throw new ApiError(409, "project already has a completion");
     const id = this.nextId("intent", "i");
     const now = timestamp();
-    const description = requireDescription(input.description);
-    const actor = requireDescription(input.completedBy, "completedBy");
+    const description = requireIntentDescription(input.description);
+    const actor = requireShortDescription(input.completedBy, "completedBy");
     this.transaction(() => {
       this.database.prepare(`INSERT INTO intents(id,to_fact_id,description,created_by,created_at,concluded_by,concluded_at)
         VALUES(?,'goal',?,?,?,?,?)`).run(id, description, actor, now, actor, now);
@@ -173,8 +182,8 @@ export class SqliteStore {
     if (!project || project.status !== "completed") throw new ApiError(409, "project is not completed");
     const completion = this.database.prepare("SELECT id FROM intents WHERE to_fact_id='goal'").get();
     if (!completion) throw new ApiError(409, "completion not found");
-    const description = requireDescription(input.description);
-    const creator = requireDescription(input.creator, "creator");
+    const description = requireFactDescription(input.description);
+    const creator = requireShortDescription(input.creator, "creator");
     this.transaction(() => {
       this.database.prepare("DELETE FROM intent_sources WHERE intent_id=?").run(completion.id);
       this.database.prepare("DELETE FROM intents WHERE id=?").run(completion.id);
@@ -185,14 +194,16 @@ export class SqliteStore {
         .run(factId, description, now);
       this.database.prepare(`INSERT INTO intents(id,to_fact_id,description,created_by,created_at,concluded_by,concluded_at)
         VALUES(?,?,?,?,?,?,?)`).run(intentId, factId, "External feedback", creator, now, creator, now);
-      this.insertSources(intentId, [{ projectId: project.id, factId: "origin" }]);
+      this.insertSources(intentId, [{
+        projectId: project.id, factId: "origin", description: this.fact("origin")!.description,
+      }]);
       this.database.prepare("UPDATE project SET status='active'").run();
     });
     return this.graph();
   }
 
   setTitle(title: string): ProjectMeta {
-    this.database.prepare("UPDATE project SET title=?").run(requireDescription(title, "title"));
+    this.database.prepare("UPDATE project SET title=?").run(requireShortDescription(title, "title"));
     return this.project()!;
   }
 
@@ -208,10 +219,35 @@ export class SqliteStore {
     return number(row?.count);
   }
 
+  repairSourceDescriptions(resolveDescription: (projectId: string, factId: string) => string | undefined): void {
+    const rows = this.database.prepare(`SELECT intent_id,position,source_project_id,source_fact_id FROM intent_sources
+      WHERE source_description=''`).all();
+    const update = this.database.prepare("UPDATE intent_sources SET source_description=? WHERE intent_id=? AND position=?");
+    for (const row of rows) {
+      const description = resolveDescription(text(row.source_project_id), text(row.source_fact_id));
+      if (description !== undefined) update.run(description, row.intent_id, row.position);
+    }
+  }
+
   private insertSources(intentId: string, sources: FactRef[]): void {
-    const insert = this.database.prepare(`INSERT INTO intent_sources(intent_id,position,source_project_id,source_fact_id)
-      VALUES(?,?,?,?)`);
-    sources.forEach((source, position) => insert.run(intentId, position, source.projectId, source.factId));
+    const insert = this.database.prepare(`INSERT INTO intent_sources(intent_id,position,source_project_id,source_fact_id,source_description)
+      VALUES(?,?,?,?,?)`);
+    sources.forEach((source, position) => insert.run(
+      intentId, position, source.projectId, source.factId, source.description,
+    ));
+  }
+
+  private migrateFactRefDescriptions(): void {
+    const columns = this.database.prepare("PRAGMA table_info(intent_sources)").all().map((row) => text(row.name));
+    if (!columns.includes("source_description")) {
+      this.database.exec("ALTER TABLE intent_sources ADD COLUMN source_description TEXT NOT NULL DEFAULT ''");
+    }
+    const project = this.project();
+    if (project) {
+      this.database.prepare(`UPDATE intent_sources SET source_description=(
+        SELECT description FROM facts WHERE facts.id=intent_sources.source_fact_id
+      ) WHERE source_project_id=? AND source_description=''`).run(project.id);
+    }
   }
 
   private nextId(counter: "fact" | "intent" | "hint", prefix: string): string {
@@ -236,7 +272,7 @@ CREATE TABLE IF NOT EXISTS project(id TEXT PRIMARY KEY,title TEXT NOT NULL,statu
 CREATE TABLE IF NOT EXISTS artifacts(sha256 TEXT PRIMARY KEY,path TEXT NOT NULL,media_type TEXT NOT NULL,size_bytes INTEGER NOT NULL,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS facts(id TEXT PRIMARY KEY,description TEXT NOT NULL,artifact_sha256 TEXT REFERENCES artifacts(sha256),created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS intents(id TEXT PRIMARY KEY,to_fact_id TEXT REFERENCES facts(id),description TEXT NOT NULL,created_by TEXT NOT NULL,created_at TEXT NOT NULL,concluded_by TEXT,concluded_at TEXT);
-CREATE TABLE IF NOT EXISTS intent_sources(intent_id TEXT NOT NULL REFERENCES intents(id) ON DELETE CASCADE,position INTEGER NOT NULL,source_project_id TEXT NOT NULL,source_fact_id TEXT NOT NULL,PRIMARY KEY(intent_id,position),UNIQUE(intent_id,source_project_id,source_fact_id));
+CREATE TABLE IF NOT EXISTS intent_sources(intent_id TEXT NOT NULL REFERENCES intents(id) ON DELETE CASCADE,position INTEGER NOT NULL,source_project_id TEXT NOT NULL,source_fact_id TEXT NOT NULL,source_description TEXT NOT NULL,PRIMARY KEY(intent_id,position),UNIQUE(intent_id,source_project_id,source_fact_id));
 CREATE TABLE IF NOT EXISTS hints(id TEXT PRIMARY KEY,content TEXT NOT NULL,creator TEXT NOT NULL,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS counters(name TEXT PRIMARY KEY,value INTEGER NOT NULL);
 `;

@@ -1,16 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, createWriteStream, existsSync, lstatSync, mkdirSync, renameSync, rmSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, lstatSync, renameSync, rmSync } from "node:fs";
 import { once } from "node:events";
 import { join, resolve } from "node:path";
 import type { Readable } from "node:stream";
+import { initializeArtifactDirectory } from "../config/paths.js";
 import type { ArtifactRef } from "./types.js";
 
 export class ArtifactStore {
   readonly dir: string;
 
   constructor(readonly projectDir: string) {
-    this.dir = join(projectDir, "artifacts");
-    mkdirSync(this.dir, { recursive: true });
+    this.dir = initializeArtifactDirectory(projectDir);
   }
 
   async save(input: Readable, mediaType: string, maxBytes: number): Promise<ArtifactRef> {

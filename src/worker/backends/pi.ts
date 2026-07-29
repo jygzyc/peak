@@ -5,7 +5,7 @@ import {
   resolveCliModel,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import type { DirectWorkerDriver, SessionRef, WorkerRequest, WorkerResult } from "../types.js";
+import type { SessionRef, WorkerDriver, WorkerRequest, WorkerResult } from "../types.js";
 
 const SESSION_TTL_MS = 10 * 60_000;
 
@@ -14,7 +14,7 @@ interface RetainedSession {
   timer: NodeJS.Timeout;
 }
 
-export class PiDriver implements DirectWorkerDriver {
+export class PiDriver implements WorkerDriver {
   readonly type = "pi";
   readonly canResume = true;
   private readonly sessions = new Map<string, RetainedSession>();
@@ -89,7 +89,7 @@ export class PiDriver implements DirectWorkerDriver {
     }
 
     text ||= streamed.trim();
-    const resumable = taskType === "execute" && !cancelled && (timedOut || !error);
+    const resumable = taskType === "execute" && !currentSession && !cancelled;
     const sessionRef = resumable ? this.retain(session) : undefined;
     if (!resumable) session.dispose();
     const stderr = [warning, error].filter(Boolean).join("\n");

@@ -18,28 +18,42 @@ export interface SchedulerConfig {
   intervalMs: number;
 }
 
+export interface ProjectConfig {
+  id?: string;
+  name: string;
+  goal: string;
+}
+
+export interface TaskProjectConfig extends ProjectConfig {
+  key: string;
+  origin: string;
+}
+
 export interface ResolvedTaskConfig {
   configPath: string;
   taskDir: string;
-  task: {
+  board: {
     name?: string;
-    target: string;
-    goal: string;
     workspace: string;
     skills: string[];
+    projects: ProjectConfig[];
   };
   workers: Record<string, WorkerConfig>;
   scheduler: SchedulerConfig;
-  tasks: {
-    plan: { timeoutMs: number; maxIntents: number };
-    supervise: { timeoutMs: number; intervalMs: number };
-    execute: { timeoutMs: number; finalizeTimeoutMs: number; maxArtifactBytes: number };
+  phase: {
+    plan: { maxIntents: number };
+    supervise: { intervalMs: number };
+    execute: { maxArtifactBytes: number };
   };
-  federation?: { scope?: string };
 }
 
 export interface InstalledSkill {
   name: string;
-  source: string;
   targets: string[];
+  temporaryTargets: string[];
+}
+
+export interface SkillInstallOptions {
+  agentsDir?: string;
+  claudeDir?: string;
 }

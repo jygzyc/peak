@@ -1,13 +1,13 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { appendFileSync, createReadStream, existsSync, mkdirSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { ApiError, requireDescription } from "./api.js";
-import { toTimeline, toYaml } from "./export.js";
+import { appendFileSync, createReadStream } from "node:fs";
+import { join } from "node:path";
+import { initializeProjectLogsDirectory } from "../config/paths.js";
+import {
+  ApiError, requireDescription, requireFactDescription, requireIntentDescription, requireShortDescription,
+} from "./api.js";
+import { toTimeline } from "./export.js";
 import { ProjectStoreRegistry } from "./project-store-registry.js";
 import type { ArtifactRef, CompleteInput, ConcludeInput, CreateIntentInput, FactRef } from "./types.js";
-
-const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 
 export interface HttpServerOptions {
   host?: string;
@@ -16,6 +16,8 @@ export interface HttpServerOptions {
   maxArtifactBytes?: number;
 }
 
+export type HttpRootHandler = (response: ServerResponse) => boolean;
+
 export class GraphHttpServer {
   private server?: ReturnType<typeof createServer>;
   private host = "127.0.0.1";
@@ -23,7 +25,10 @@ export class GraphHttpServer {
   private token?: string;
   private maxArtifactBytes = 100 * 1024 * 1024;
 
-  constructor(readonly registry: ProjectStoreRegistry) {}
+  constructor(
+    readonly registry: ProjectStoreRegistry,
+    private readonly rootHandler?: HttpRootHandler,
+  ) {}
 
   get baseUrl(): string {
     if (!this.server) throw new Error("server is not running");
@@ -78,8 +83,10 @@ export class GraphHttpServer {
       const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
       const method = request.method ?? "GET";
       const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
-      // The dashboard contains no Project data and must be reachable before a browser can provide a bearer token.
-      if (parts.length === 0 && method === "GET") return this.dashboard(response);
+      if (parts.length === 0 && method === "GET") {
+        if (this.rootHandler?.(response)) return;
+        throw new ApiError(404, "not found");
+      }
       if (!this.authorized(request)) throw new ApiError(401, "unauthorized");
       if (parts[0] !== "api") throw new ApiError(404, "not found");
 
@@ -89,7 +96,7 @@ export class GraphHttpServer {
           const body = await bodyObject(request);
           exact(body, ["title", "target", "goal", "scope"], ["scope"]);
           const project = this.registry.create({
-            title: requireDescription(body.title, "title"),
+            title: requireShortDescription(body.title, "title"),
             target: requireDescription(body.target, "target"),
             goal: requireDescription(body.goal, "goal"),
             scope: optionalString(body.scope),
@@ -125,7 +132,7 @@ export class GraphHttpServer {
       if (parts[3] === "title" && method === "PUT") {
         const body = await bodyObject(request);
         exact(body, ["title"]);
-        const project = stores.graph.setTitle(requireString(body.title, "title"));
+        const project = stores.graph.setTitle(requireShortDescription(body.title, "title"));
         operation(stores.dir, "project_title_changed", { projectId });
         return json(response, project);
       }
@@ -162,7 +169,9 @@ export class GraphHttpServer {
       if (parts[3] === "hints" && method === "POST") {
         const body = await bodyObject(request);
         exact(body, ["content", "creator"]);
-        const hint = stores.graph.addHint({ content: requireString(body.content, "content"), creator: requireString(body.creator, "creator") });
+        const hint = stores.graph.addHint({
+          content: requireShortDescription(body.content, "content"), creator: requireShortDescription(body.creator, "creator"),
+        });
         operation(stores.dir, "hint_added", { projectId, hintId: hint.id, creator: hint.creator });
         return json(response, hint, 201);
       }
@@ -170,8 +179,8 @@ export class GraphHttpServer {
         const body = await bodyObject(request);
         exact(body, ["from", "description", "createdBy"]);
         const input: CreateIntentInput = {
-          from: factRefs(body.from), description: requireString(body.description, "description"),
-          createdBy: requireString(body.createdBy, "createdBy"),
+          from: factRefs(body.from), description: requireIntentDescription(body.description),
+          createdBy: requireShortDescription(body.createdBy, "createdBy"),
         };
         this.registry.validateRefs(projectId, input.from);
         const intent = stores.graph.createIntent(input);
@@ -185,8 +194,8 @@ export class GraphHttpServer {
         const canonical = requested ? stores.graph.artifact(requested.sha256) : undefined;
         if (requested && (!canonical || JSON.stringify(canonical) !== JSON.stringify(requested))) throw new ApiError(400, "invalid artifact reference");
         const input: ConcludeInput = {
-          description: requireString(body.description, "description"), artifact: canonical ?? null,
-          concludedBy: requireString(body.concludedBy, "concludedBy"),
+          description: requireFactDescription(body.description), artifact: canonical ?? null,
+          concludedBy: requireShortDescription(body.concludedBy, "concludedBy"),
         };
         const result = stores.graph.conclude(parts[4], input);
         operation(stores.dir, "intent_concluded", { projectId, intentId: parts[4], factId: result.fact.id, concludedBy: input.concludedBy });
@@ -196,8 +205,8 @@ export class GraphHttpServer {
         const body = await bodyObject(request);
         exact(body, ["from", "description", "completedBy"]);
         const input: CompleteInput = {
-          from: factRefs(body.from), description: requireString(body.description, "description"),
-          completedBy: requireString(body.completedBy, "completedBy"),
+          from: factRefs(body.from), description: requireIntentDescription(body.description),
+          completedBy: requireShortDescription(body.completedBy, "completedBy"),
         };
         this.registry.validateRefs(projectId, input.from);
         const completion = stores.graph.complete(input);
@@ -208,7 +217,7 @@ export class GraphHttpServer {
         const body = await bodyObject(request);
         exact(body, ["description", "creator"]);
         const graph = stores.graph.reopen({
-          description: requireString(body.description, "description"), creator: requireString(body.creator, "creator"),
+          description: requireFactDescription(body.description), creator: requireShortDescription(body.creator, "creator"),
         });
         operation(stores.dir, "project_reopened", { projectId, creator: body.creator });
         return json(response, graph);
@@ -223,19 +232,6 @@ export class GraphHttpServer {
   private authorized(request: IncomingMessage): boolean {
     if (!this.token) return true;
     return request.headers.authorization === `Bearer ${this.token}`;
-  }
-
-  private dashboard(response: ServerResponse): void {
-    const candidates = [join(MODULE_DIR, "dashboard.html"), join(MODULE_DIR, "graph", "dashboard.html")];
-    const path = candidates.find(existsSync);
-    if (!path) throw new ApiError(404, "dashboard missing");
-    response.writeHead(200, {
-      "content-type": "text/html; charset=utf-8",
-      "cache-control": "no-store",
-      "x-content-type-options": "nosniff",
-      "referrer-policy": "no-referrer",
-    });
-    response.end(readFileSync(path));
   }
 }
 
@@ -260,8 +256,12 @@ function factRefs(value: unknown): FactRef[] {
   return value.map((item) => {
     if (!item || typeof item !== "object" || Array.isArray(item)) throw new ApiError(400, "invalid FactRef");
     const ref = item as Record<string, unknown>;
-    exact(ref, ["projectId", "factId"]);
-    return { projectId: requireString(ref.projectId, "projectId"), factId: requireString(ref.factId, "factId") };
+    exact(ref, ["projectId", "factId", "description"]);
+    return {
+      projectId: requireString(ref.projectId, "projectId"),
+      factId: requireString(ref.factId, "factId"),
+      description: requireDescription(ref.description, "description"),
+    };
   });
 }
 
@@ -288,14 +288,12 @@ function json(response: ServerResponse, value: unknown, status = 200): void {
   response.end(JSON.stringify(value));
 }
 function exported(response: ServerResponse, value: Parameters<typeof toTimeline>[0], format: string | null): void {
-  if (format === "timeline") return json(response, toTimeline(value));
-  response.writeHead(200, { "content-type": "application/yaml; charset=utf-8" });
-  response.end(toYaml(value));
+  if (format !== null && format !== "json" && format !== "timeline") throw new ApiError(400, "invalid export format");
+  json(response, format === "timeline" ? toTimeline(value) : value);
 }
 function empty(response: ServerResponse, status: number): void { response.writeHead(status); response.end(); }
 function isLoopback(host: string): boolean { return host === "127.0.0.1" || host === "localhost" || host === "::1"; }
 function operation(projectDir: string, type: string, data: Record<string, unknown>): void {
-  const logs = join(projectDir, "logs");
-  mkdirSync(logs, { recursive: true });
+  const logs = initializeProjectLogsDirectory(projectDir);
   appendFileSync(join(logs, "main.log"), `${JSON.stringify({ at: new Date().toISOString(), type, ...data })}\n`);
 }

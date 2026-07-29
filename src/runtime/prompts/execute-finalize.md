@@ -1,9 +1,9 @@
 # Finalize
 
-Stop all further exploration and tool use. Read the bound Graph YAML at {graphPath}.
+Read the bound context JSON at {graphPath}.
 
-Summarize only results already confirmed earlier in this session, then return the Execute contract immediately.
+Required Skills: {skills}. Without further exploration or tool use, apply them only to finalize results already confirmed in this session. Return one concise Fact and preserve detailed content in the existing Artifact when available.
 
-Output format: respond with ONE raw JSON object and nothing else — no markdown, no code fences, no prose before or after.
+Output exactly one raw JSON object in this format, with no markdown or extra text:
 
 {contract}

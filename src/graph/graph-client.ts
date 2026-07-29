@@ -42,7 +42,7 @@ export class GraphClient {
     await pipeline(Readable.fromWeb(response.body as import("node:stream/web").ReadableStream), createWriteStream(path));
   }
 
-  async exportProject(id: string, format: "yaml" | "timeline" = "yaml"): Promise<string> {
+  async exportProject(id: string, format: "json" | "timeline" = "json"): Promise<string> {
     return this.text("GET", `/api/projects/${id}/export?format=${format}`);
   }
 

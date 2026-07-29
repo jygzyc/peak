@@ -1,0 +1,65 @@
+{
+  "board": {
+    "name": "AI 智能体安全",
+    "workspace": ".",
+    "skills": [
+      "ai-agent-safety-zh"
+    ],
+    "projects": [
+      {
+        "id": "",
+        "name": "最新 AI 安全情报",
+        "goal": "收集并分析最新、可信的 AI 安全研究、事件、标准、政策与工程实践，产出一份带来源的要点摘要，涵盖最重要的发现、趋势与影响。"
+      },
+      {
+        "id": "",
+        "name": "AI 智能体护栏设计",
+        "goal": "产出一份可落地的 AI 智能体安全护栏建设方案，覆盖威胁建模、身份与授权、工具与数据控制、沙箱与隔离、策略执行、运行时监控、评测、应急响应、灰度发布阶段，以及可度量的验收标准。"
+      }
+    ]
+  },
+  "workers": [
+    {
+      "type": "pi",
+      "model": "zai-coding-cn/glm-5.2",
+      "taskTypes": [
+        "plan",
+        "supervise"
+      ],
+      "maxRunning": 1,
+      "priority": 1,
+      "args": []
+    },
+    {
+      "type": "codex",
+      "model": "",
+      "taskTypes": [
+        "plan"
+      ],
+      "maxRunning": 1,
+      "priority": 2,
+      "args": []
+    },
+    {
+      "type": "opencode",
+      "model": "minimax/MiniMax-M3",
+      "taskTypes": [
+        "execute"
+      ],
+      "maxRunning": 4,
+      "priority": 1,
+      "args": []
+    }
+  ],
+  "phase": {
+    "plan": {
+      "maxIntents": 4
+    },
+    "supervise": {
+      "intervalMs": 60000
+    },
+    "execute": {
+      "maxArtifactBytes": 10485760
+    }
+  }
+}

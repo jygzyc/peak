@@ -8,8 +8,8 @@ export const DEFAULT_SCHEDULER: SchedulerConfig = {
   intervalMs: 3_000,
 };
 
-export const DEFAULT_TASKS: ResolvedTaskConfig["tasks"] = {
-  plan: { timeoutMs: 45_000, maxIntents: 3 },
-  supervise: { timeoutMs: 45_000, intervalMs: 60_000 },
-  execute: { timeoutMs: 600_000, finalizeTimeoutMs: 120_000, maxArtifactBytes: 100 * 1024 * 1024 },
+export const DEFAULT_PHASE: ResolvedTaskConfig["phase"] = {
+  plan: { maxIntents: 3 },
+  supervise: { intervalMs: 60_000 },
+  execute: { maxArtifactBytes: 100 * 1024 * 1024 },
 };

@@ -13,9 +13,9 @@ class RejectingProcessRunner extends ProcessRunner {
 
 test("WorkerRuntime drives the registered PiDriver through the Agent SDK path", async () => {
   const config = configuration();
-  const resources = new WorkerResources();
+  const resources = new WorkerResources(new RejectingProcessRunner());
   try {
-    const runtime = new WorkerRuntime(config, resources, new RejectingProcessRunner());
+    const runtime = new WorkerRuntime(config, resources);
     const result = await runtime.execute("pi", "execute", "prompt", 1_000, process.cwd());
     assert.equal(result.started, false);
     assert.match(result.stderr, /not supported by the Pi Agent SDK/);
@@ -28,7 +28,11 @@ function configuration(): ResolvedTaskConfig {
   return {
     configPath: "/task.json",
     taskDir: "/",
-    task: { target: "start", goal: "done", workspace: process.cwd(), skills: [] },
+    board: {
+      workspace: process.cwd(),
+      skills: [],
+      projects: [{ name: "Main", goal: "done" }],
+    },
     workers: {
       pi: {
         type: "pi",
@@ -45,10 +49,10 @@ function configuration(): ResolvedTaskConfig {
       refillPerTick: 1,
       intervalMs: 1_000,
     },
-    tasks: {
-      plan: { timeoutMs: 1_000, maxIntents: 1 },
-      supervise: { timeoutMs: 1_000, intervalMs: 1_000 },
-      execute: { timeoutMs: 1_000, finalizeTimeoutMs: 1_000, maxArtifactBytes: 1_024 },
+    phase: {
+      plan: { maxIntents: 1 },
+      supervise: { intervalMs: 1_000 },
+      execute: { maxArtifactBytes: 1_024 },
     },
   };
 }

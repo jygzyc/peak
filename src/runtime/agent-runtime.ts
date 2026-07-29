@@ -1,15 +1,15 @@
-import { mkdirSync } from "node:fs";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
-import type { ResolvedTaskConfig } from "../config/types.js";
-import { initializeTaskSkills } from "../config/task-skill-installer.js";
+import { initializePeakPaths } from "../config/paths.js";
+import { persistProjectId } from "../config/task-config.js";
+import type { InstalledSkill, ResolvedTaskConfig, TaskProjectConfig } from "../config/types.js";
+import { cleanupTaskSkills, initializeTaskSkills } from "../config/task-skill-installer.js";
 import { FederationBus } from "../graph/federation-bus.js";
 import { GraphClient } from "../graph/graph-client.js";
 import { GraphHttpServer, type HttpServerOptions } from "../graph/http-server.js";
 import { ProjectStoreRegistry } from "../graph/project-store-registry.js";
-import type { ProjectMeta } from "../graph/types.js";
+import { leafFacts, type ProjectMeta } from "../graph/types.js";
 import { ProjectLoop } from "../project/project-loop.js";
 import { ProjectManager } from "../project/project-manager.js";
+import { serveDashboard } from "../ui/dashboard.js";
 import { WorkerResources, WorkerRuntime } from "../worker/worker-runtime.js";
 import { ExecutionRegistry } from "./execution-registry.js";
 import { RuntimeScheduler } from "./scheduler.js";
@@ -24,68 +24,129 @@ export class AgentRuntime {
   private client?: GraphClient;
   private projectsDir?: string;
   private firstProjectId?: string;
+  private readonly projectIds = new Map<number, string>();
   private readonly federation = new FederationBus();
   private readonly executions = new ExecutionRegistry();
   private readonly workerResources = new WorkerResources();
+  private taskSkills?: InstalledSkill[];
 
   constructor(readonly config: ResolvedTaskConfig, readonly options: RuntimeOptions = {}) {}
 
-  async start(projectTitle?: string, projectId?: string): Promise<ProjectMeta> {
+  async start(projectName?: string, projectId?: string): Promise<ProjectMeta[]> {
     if (this.server) throw new Error("runtime already started");
-    const peakHome = resolve(this.options.peakHome ?? process.env.PEAK_HOME ?? join(homedir(), ".peak"));
-    this.projectsDir = join(peakHome, "projects");
-    mkdirSync(this.projectsDir, { recursive: true });
-    this.registry = new ProjectStoreRegistry(this.projectsDir);
-    this.server = new GraphHttpServer(this.registry);
-    await this.server.start({ ...this.options, maxArtifactBytes: this.config.tasks.execute.maxArtifactBytes });
-    this.client = new GraphClient(this.server.baseUrl, this.options.token);
-    this.scheduler = new RuntimeScheduler(this.config.scheduler, this.executions);
-    const project = projectId
-      ? await this.attachProject(projectId, this.config)
-      : await this.addProject(this.config, projectTitle);
-    this.scheduler.start();
+    try {
+      if (this.options.installSkills !== false) this.taskSkills = initializeTaskSkills(this.config);
+      this.projectsDir = initializePeakPaths(this.options.peakHome).projectsDir;
+      this.registry = new ProjectStoreRegistry(this.projectsDir);
+      this.server = new GraphHttpServer(this.registry, serveDashboard);
+      await this.server.start({ ...this.options, maxArtifactBytes: this.config.phase.execute.maxArtifactBytes });
+      this.client = new GraphClient(this.server.baseUrl, this.options.token);
+      this.scheduler = new RuntimeScheduler(this.config.scheduler, this.executions);
+      const projects: ProjectMeta[] = [];
+      if (projectId) {
+        projects.push(await this.attachProject(projectId, projectName));
+      } else if (projectName) {
+        projects.push(await this.addProject(projectName));
+      } else {
+        for (let index = 0; index < this.config.board.projects.length; index++) {
+          projects.push(await this.ensureProject(index));
+        }
+      }
+      await this.seedExistingFacts(projects);
+      this.scheduler.start();
+      return projects;
+    } catch (error) {
+      await this.stop();
+      throw error;
+    }
+  }
+
+  async addProject(projectName: string): Promise<ProjectMeta> {
+    const index = this.projectIndex(projectName);
+    return this.ensureProject(index);
+  }
+
+  async attachProject(projectId: string, projectName?: string): Promise<ProjectMeta> {
+    if (!this.client) throw new Error("runtime not started");
+    const graph = await this.client.getProject(projectId);
+    const goal = graph.facts.find((fact) => fact.id === "goal")?.description;
+    const candidates = projectName
+      ? [this.workProject(this.projectIndex(projectName))]
+      : this.config.board.projects.map((_project, index) => this.workProject(index));
+    const matches = candidates.filter((project) => (!project.id || project.id === projectId) && goal === project.goal);
+    if (matches.length === 0) throw new Error("Board config does not match persisted Project");
+    if (matches.length > 1) throw new Error("persisted Project matches multiple configured Projects; select one with --project <name>");
+    const matched = matches[0]!;
+    const index = Number.parseInt(matched.key.slice("project-".length), 10) - 1;
+    if (!matched.id) persistProjectId(this.config, index, projectId);
+    this.projectIds.set(index, projectId);
+    return this.registerProject(graph.project, { ...matched, id: projectId });
+  }
+
+  private projectIndex(selector: string): number {
+    const index = this.config.board.projects.findIndex((project, item) => project.name === selector || `project-${item + 1}` === selector);
+    if (index < 0) throw new Error(`configured Project not found: ${selector}`);
+    return index;
+  }
+
+  private workProject(index: number): TaskProjectConfig {
+    const project = this.config.board.projects[index];
+    if (!project) throw new Error(`configured Project not found: project-${index + 1}`);
+    return {
+      ...project,
+      id: this.projectIds.get(index) ?? project.id,
+      key: `project-${index + 1}`,
+      origin: `Project "${project.name}" is open and has not yet proven its goal.`,
+    };
+  }
+
+  private async ensureProject(index: number): Promise<ProjectMeta> {
+    const configured = this.workProject(index);
+    if (configured.id) return this.attachProject(configured.id, configured.name);
+    const project = await this.createProject(configured);
+    persistProjectId(this.config, index, project.id);
+    this.projectIds.set(index, project.id);
     return project;
   }
 
-  async addProject(config: ResolvedTaskConfig, projectTitle?: string): Promise<ProjectMeta> {
+  private async createProject(configured: TaskProjectConfig): Promise<ProjectMeta> {
     if (!this.client || !this.projectsDir) throw new Error("runtime not started");
     const manager = new ProjectManager(this.projectsDir, this.client);
     const project = await manager.create({
-      title: projectTitle ?? config.task.name ?? "project",
-      target: config.task.target,
-      goal: config.task.goal,
-      scope: config.federation?.scope,
+      title: configured.name,
+      target: configured.origin,
+      goal: configured.goal,
     });
-    return this.registerProject(project, config);
+    return this.registerProject(project, { ...configured, id: project.id });
   }
 
-  async attachProject(projectId: string, config: ResolvedTaskConfig): Promise<ProjectMeta> {
+  private async seedExistingFacts(projects: ProjectMeta[]): Promise<void> {
     if (!this.client) throw new Error("runtime not started");
-    const graph = await this.client.getProject(projectId);
-    if (graph.project.scope !== config.federation?.scope
-      || graph.facts.find((fact) => fact.id === "origin")?.description !== config.task.target
-      || graph.facts.find((fact) => fact.id === "goal")?.description !== config.task.goal) {
-      throw new Error("task config does not match persisted Project");
+    for (const project of projects) {
+      const graph = await this.client.getProject(project.id);
+      for (const fact of leafFacts(graph)) {
+        if (fact.id === "origin") continue;
+        this.federation.publish({ projectId: project.id, factId: fact.id, description: fact.description });
+      }
     }
-    return this.registerProject(graph.project, config);
   }
 
-  private registerProject(project: ProjectMeta, config: ResolvedTaskConfig): ProjectMeta {
+  private registerProject(project: ProjectMeta, configured: TaskProjectConfig): ProjectMeta {
     if (!this.client || !this.projectsDir || !this.scheduler) throw new Error("runtime not started");
-    if (this.options.installSkills !== false) initializeTaskSkills(config);
     const projectDir = new ProjectManager(this.projectsDir, this.client).projectDir(project.id);
     this.federation.register(project.id, projectDir, project.scope);
     const executor = new TaskExecutor(
-      config,
+      this.config,
+      configured,
       this.client,
-      new WorkerRuntime(config, this.workerResources),
+      new WorkerRuntime(this.config, this.workerResources),
       this.federation,
       projectDir,
       () => this.executions.cancelProject(project.id),
     );
     this.scheduler.add(new ProjectLoop(
       project.id,
-      config,
+      this.config,
       this.client,
       executor,
       this.executions,
@@ -107,6 +168,8 @@ export class AgentRuntime {
   async stop(): Promise<void> {
     this.scheduler?.stop();
     this.workerResources.dispose();
+    if (this.taskSkills) cleanupTaskSkills(this.taskSkills);
+    this.taskSkills = undefined;
     await this.server?.stop();
     this.registry?.close();
     this.scheduler = undefined;
@@ -115,6 +178,7 @@ export class AgentRuntime {
     this.client = undefined;
     this.projectsDir = undefined;
     this.firstProjectId = undefined;
+    this.projectIds.clear();
   }
 
   get webUrl(): string {

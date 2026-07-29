@@ -1,19 +1,23 @@
-import type { WorkerConfig } from "../../config/types.js";
-import type { ProcessResult, ProcessSpec, SessionRef, WorkerDriver } from "../types.js";
-import { jsonLines, session, textFromJson } from "./base.js";
+import type { ProcessResult, ProcessSpec, SessionRef, WorkerRequest } from "../types.js";
+import { CliWorkerDriver, jsonLines, session, textFromJson } from "./base.js";
 
-export class CodexDriver implements WorkerDriver {
+export class CodexDriver extends CliWorkerDriver {
   readonly type = "codex";
   readonly canResume = true;
-  build(config: WorkerConfig, prompt: string, current?: SessionRef): ProcessSpec {
-    const argv = current ? ["codex", "exec", "resume", current.value, "--json"] : ["codex", "exec", "--json"];
-    if (config.model) argv.push("--model", config.model);
-    argv.push(...config.args, "-");
-    return { argv, input: prompt };
+
+  protected build(request: WorkerRequest, _session: SessionRef | undefined): ProcessSpec {
+    const argv = request.session
+      ? ["codex", "exec", "resume", request.session.value, "--json"]
+      : ["codex", "exec", "--json"];
+    if (request.config.model) argv.push("--model", request.config.model);
+    argv.push(...request.config.args, "-");
+    return { argv, input: request.prompt };
   }
-  parse(result: ProcessResult): { text: string; session?: SessionRef } {
+
+  protected parse(result: ProcessResult): { text: string; session?: SessionRef } {
     const events = jsonLines(result.stdout);
-    const id = events.find((event) => event.type === "thread.started")?.thread_id;
+    const id = events.find((event) => event.type === "thread.started")?.thread_id
+      ?? /session id:\s*([0-9a-f-]+)/i.exec(result.stderr)?.[1];
     const messages = events.flatMap((event) => {
       if (event.type !== "item.completed" || !event.item || typeof event.item !== "object") return [];
       const item = event.item as Record<string, unknown>;

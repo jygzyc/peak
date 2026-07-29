@@ -1,17 +1,18 @@
-import type { WorkerConfig } from "../../config/types.js";
-import type { ProcessResult, ProcessSpec, WorkerDriver } from "../types.js";
-import { textFromJson } from "./base.js";
+import type { ProcessResult, ProcessSpec, SessionRef, WorkerRequest } from "../types.js";
+import { CliWorkerDriver, textFromJson } from "./base.js";
 
-export class OpenCodeDriver implements WorkerDriver {
+export class OpenCodeDriver extends CliWorkerDriver {
   readonly type = "opencode";
   readonly canResume = false;
-  build(config: WorkerConfig, prompt: string): ProcessSpec {
+
+  protected build(request: WorkerRequest, _session: SessionRef | undefined): ProcessSpec {
     const argv = ["opencode", "run", "--format", "json"];
-    if (config.model) argv.push("--model", config.model);
-    argv.push(...config.args, "-");
-    return { argv, input: prompt };
+    if (request.config.model) argv.push("--model", request.config.model);
+    argv.push(...request.config.args, "-");
+    return { argv, input: request.prompt };
   }
-  parse(result: ProcessResult): { text: string } {
+
+  protected parse(result: ProcessResult): { text: string } {
     const texts = result.stdout.split(/\r?\n/).flatMap((line) => {
       try {
         const event = JSON.parse(line) as Record<string, unknown>;

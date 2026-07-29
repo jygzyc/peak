@@ -1,0 +1,65 @@
+{
+  "board": {
+    "name": "ai-agent-safety",
+    "workspace": ".",
+    "skills": [
+      "ai-agent-safety"
+    ],
+    "projects": [
+      {
+        "id": "",
+        "name": "Latest AI Safety Intelligence",
+        "goal": "Collect and analyze the latest credible AI safety research, incidents, standards, policies, and engineering practices, then produce a sourced summary of the most important findings, trends, and implications."
+      },
+      {
+        "id": "",
+        "name": "AI Agent Guardrail Design",
+        "goal": "Produce an actionable AI Agent safety guardrail construction plan covering threat modeling, identity and authorization, tool and data controls, sandboxing, policy enforcement, runtime monitoring, evaluation, incident response, rollout stages, and measurable acceptance criteria."
+      }
+    ]
+  },
+  "workers": [
+    {
+      "type": "pi",
+      "model": "zai-coding-cn/glm-5.2",
+      "taskTypes": [
+        "plan",
+        "supervise"
+      ],
+      "maxRunning": 1,
+      "priority": 1,
+      "args": []
+    },
+    {
+      "type": "codex",
+      "model": "",
+      "taskTypes": [
+        "plan"
+      ],
+      "maxRunning": 1,
+      "priority": 2,
+      "args": []
+    },
+    {
+      "type": "opencode",
+      "model": "minimax/MiniMax-M3",
+      "taskTypes": [
+        "execute"
+      ],
+      "maxRunning": 2,
+      "priority": 1,
+      "args": []
+    }
+  ],
+  "phase": {
+    "plan": {
+      "maxIntents": 4
+    },
+    "supervise": {
+      "intervalMs": 90000
+    },
+    "execute": {
+      "maxArtifactBytes": 10485760
+    }
+  }
+}

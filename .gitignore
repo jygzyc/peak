@@ -1,5 +1,6 @@
 # OS
 .DS_Store
+nul
 
 # Node
 node_modules/
@@ -22,6 +23,7 @@ examples/**/*.db
 examples/**/*.db-shm
 examples/**/*.db-wal
 .test/
+.tmp*/
 
 # Binary test samples (large; fetch separately)
 examples/*.apk

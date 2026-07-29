@@ -10,14 +10,9 @@ export interface WorkerRequest {
   workerName: string; config: WorkerConfig; taskType: TaskType; prompt: string; cwd: string;
   timeoutMs: number; signal?: AbortSignal; session?: SessionRef;
 }
-export interface WorkerDriverBase {
-  type: WorkerType;
-  canResume: boolean;
-}
-export interface WorkerDriver extends WorkerDriverBase {
-  build(config: WorkerConfig, prompt: string, session?: SessionRef): ProcessSpec;
-  parse(result: ProcessResult): { text: string; session?: SessionRef };
-}
-export interface DirectWorkerDriver extends WorkerDriverBase {
+export interface WorkerDriver {
+  readonly type: WorkerType;
+  readonly canResume: boolean;
   execute(request: WorkerRequest): Promise<WorkerResult>;
+  dispose(): void;
 }

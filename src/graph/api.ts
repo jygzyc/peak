@@ -4,10 +4,31 @@ export class ApiError extends Error {
 
 export interface ApiErrorBody { error: string }
 
+export const MAX_DESCRIPTION_BYTES = 4 * 1024;
+export const MAX_SHORT_DESCRIPTION_BYTES = 1024;
+export const MAX_FACT_DESCRIPTION_BYTES = MAX_SHORT_DESCRIPTION_BYTES;
+export const MAX_INTENT_DESCRIPTION_BYTES = 2 * 1024;
+
 export function requireDescription(value: unknown, label = "description"): string {
+  return requireText(value, label, MAX_DESCRIPTION_BYTES, "4 KiB");
+}
+
+export function requireShortDescription(value: unknown, label = "description"): string {
+  return requireText(value, label, MAX_SHORT_DESCRIPTION_BYTES, "1 KiB");
+}
+
+export function requireFactDescription(value: unknown, label = "description"): string {
+  return requireShortDescription(value, label);
+}
+
+export function requireIntentDescription(value: unknown, label = "description"): string {
+  return requireText(value, label, MAX_INTENT_DESCRIPTION_BYTES, "2 KiB");
+}
+
+function requireText(value: unknown, label: string, maxBytes: number, displayLimit: string): string {
   if (typeof value !== "string" || value.trim() === "") throw new ApiError(400, `${label} is required`);
   const result = value.trim();
-  if (Buffer.byteLength(result, "utf8") > 16 * 1024) throw new ApiError(400, `${label} exceeds 16 KiB`);
+  if (Buffer.byteLength(result, "utf8") > maxBytes) throw new ApiError(400, `${label} exceeds ${displayLimit}`);
   return result;
 }
 

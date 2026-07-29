@@ -27,14 +27,14 @@ class ScriptedWorker implements TaskWorkers {
   }
 }
 
-test("ai_hot_analysis example: full lifecycle through HTTP + TaskExecutor", async () => {
+test("ai_agent_safety example: full lifecycle through HTTP + TaskExecutor", async () => {
   const root = mkdtempSync(join(tmpdir(), "peak-aihot-"));
   const workspace = join(root, "workspace");
   const projects = join(root, "projects");
   mkdirSync(workspace, { recursive: true });
   mkdirSync(projects, { recursive: true });
-  const config = structuredClone(loadTaskConfig("examples/ai_hot_analysis/task.json"));
-  config.task.workspace = workspace;
+  const config = structuredClone(loadTaskConfig("examples/ai_agent_safety"));
+  config.board.workspace = workspace;
   initializeTaskSkills(config, { agentsDir: join(root, "agents-skills"), claudeDir: join(root, "claude-skills") });
 
   const registry = new ProjectStoreRegistry(projects);
@@ -42,33 +42,42 @@ test("ai_hot_analysis example: full lifecycle through HTTP + TaskExecutor", asyn
   await server.start();
   const graph = new GraphClient(server.baseUrl);
   try {
+    const configured = config.board.projects[0]!;
+    const origin = `Project "${configured.name}" is open and has not yet proven its goal.`;
     const project = await graph.createProject({
-      title: config.task.name!,
-      target: config.task.target,
-      goal: config.task.goal,
+      title: configured.name,
+      target: origin,
+      goal: configured.goal,
     });
     const projectDir = join(projects, project.id);
     const federation = new FederationBus();
     federation.register(project.id, projectDir, project.scope);
 
-    writeFileSync(join(workspace, "product.md"), "# Product leads\n- Acme launched X\n");
-    writeFileSync(join(workspace, "event-acme-x.md"), "# Acme X\nScore 9. Evidence: ...\n");
+    writeFileSync(join(workspace, "safety-sweep.md"), "# AI safety leads\n- New Agent sandboxing study\n");
+    writeFileSync(join(workspace, "verified-paper.md"), "# Agent sandboxing study\nPrimary paper and repository evidence.\n");
     const worker = new ScriptedWorker([
       { type: "plan", text: JSON.stringify({ kind: "intents", intents: [
-        { from: [{ projectId: project.id, factId: "origin" }], description: "Sweep product/company AI news for today" },
-        { from: [{ projectId: project.id, factId: "origin" }], description: "Sweep research/open-source AI news for today" },
+        { from: [{ projectId: project.id, factId: "origin", description: origin }], description: "Collect recent AI safety research and standards" },
+        { from: [{ projectId: project.id, factId: "origin", description: origin }], description: "Collect recent AI Agent incidents and mitigations" },
       ] }) },
-      { type: "execute", text: JSON.stringify({ kind: "fact", description: "Product sweep: date/cutoff stated; 1 lead Acme/acme-x launch; report in artifact.", artifact: { localPath: "product.md", mediaType: "text/markdown" } }) },
-      { type: "execute", text: JSON.stringify({ kind: "fact", description: "Research sweep: date/cutoff stated; no qualifying papers today." }) },
-      { type: "supervise", text: JSON.stringify({ kind: "hint", content: "No policy/regulation sweep yet; consider coverage there." }) },
+      { type: "execute", text: JSON.stringify({ kind: "fact", description: "Safety research sweep found one relevant Agent sandboxing study; evidence is in the Artifact.", artifact: { localPath: "safety-sweep.md", mediaType: "text/markdown" } }) },
+      { type: "execute", text: JSON.stringify({ kind: "fact", description: "Incident sweep identified tool-confusion and privilege-escalation patterns requiring guardrails." }) },
+      { type: "supervise", text: JSON.stringify({ kind: "hint", content: "Verify the sandboxing study against its primary paper and repository." }) },
       { type: "plan", text: JSON.stringify({ kind: "intents", intents: [
-        { from: [{ projectId: project.id, factId: "f001" }], description: "Verify the Acme X launch event" },
+        { from: [{ projectId: project.id, factId: "f001", description: "Safety research sweep found one relevant Agent sandboxing study; evidence is in the Artifact." }], description: "Verify the Agent sandboxing study" },
       ] }) },
-      { type: "execute", text: JSON.stringify({ kind: "fact", description: "Verified Acme X launch: score 9, primary source confirmed, Asia/Shanghai date eligible. Detail in artifact.", artifact: { localPath: "event-acme-x.md", mediaType: "text/markdown" } }) },
-      { type: "plan", text: JSON.stringify({ kind: "complete", from: [{ projectId: project.id, factId: "f003" }], description: "Digest: today 1 hotspot (Acme X, score 9). Research quiet. Excluded: none unresolved." }) },
+      { type: "execute", text: JSON.stringify({ kind: "fact", description: "Verified Agent sandboxing study with primary paper and repository; findings and limitations are summarized in the Artifact.", artifact: { localPath: "verified-paper.md", mediaType: "text/markdown" } }) },
+      { type: "plan", text: JSON.stringify({ kind: "complete", from: [{ projectId: project.id, factId: "f003", description: "Verified Agent sandboxing study with primary paper and repository; findings and limitations are summarized in the Artifact." }], description: "Current AI safety summary: Agent sandboxing evidence is credible and tool privilege escalation remains a key implementation risk." }) },
     ]);
 
-    const executor = new TaskExecutor(config, graph, worker, federation, projectDir);
+    const executor = new TaskExecutor(
+      config,
+      { key: "project-1", origin, ...configured },
+      graph,
+      worker,
+      federation,
+      projectDir,
+    );
 
     await executor.plan(project.id, "p1");
     let intents = (await graph.getProject(project.id)).intents;
@@ -89,7 +98,7 @@ test("ai_hot_analysis example: full lifecycle through HTTP + TaskExecutor", asyn
     assert.deepEqual(factIds.sort(), ["f001", "f002", "f003", "goal", "origin"]);
     assert.equal(result.facts.find((f) => f.id === "f001")?.artifact?.mediaType, "text/markdown");
     assert.equal(result.hints.length, 1);
-    assert.match(result.hints[0]!.content, /policy/i);
+    assert.match(result.hints[0]!.content, /sandboxing/i);
     const completion = result.intents.find((i) => i.to?.factId === "goal");
     assert.ok(completion && completion.concludedBy, "completion intent must exist and be concluded");
 
@@ -98,11 +107,11 @@ test("ai_hot_analysis example: full lifecycle through HTTP + TaskExecutor", asyn
       assert.match(log, new RegExp(event), `main.log missing ${event}`);
     }
     const logs = readdirSync(join(projectDir, "logs"));
-    assert.ok(logs.some((n) => /^graph-.*-plan\.yaml$/.test(n)));
-    assert.ok(logs.some((n) => /^graph-.*-supervise\.yaml$/.test(n)));
-    assert.ok(logs.some((n) => /^graph-.*-execute\.yaml$/.test(n)));
-    const executeYaml = logs.find((n) => /^graph-.*-execute\.yaml$/.test(n))!;
-    assert.match(readFileSync(join(projectDir, "logs", executeYaml), "utf8"), /daily-ai-hotspots/);
+    assert.ok(logs.some((n) => /^graph-.*-plan\.json$/.test(n)));
+    assert.ok(logs.some((n) => /^graph-.*-supervise\.json$/.test(n)));
+    assert.ok(logs.some((n) => /^graph-.*-execute\.json$/.test(n)));
+    const executeJson = logs.find((n) => /^graph-.*-execute\.json$/.test(n))!;
+    assert.match(readFileSync(join(projectDir, "logs", executeJson), "utf8"), /ai-agent-safety/);
     assert.equal(logs.some((n) => n.includes("output")), false);
   } finally {
     await server.stop();

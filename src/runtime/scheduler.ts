@@ -10,7 +10,10 @@ export class RuntimeScheduler {
 
   constructor(private readonly config: SchedulerConfig, readonly executions: ExecutionRegistry) {}
   add(loop: ProjectLoop): void { this.loops.set(loop.projectId, loop); }
-  remove(projectId: string): void { this.executions.cancelProject(projectId); this.loops.delete(projectId); }
+  remove(projectId: string): void {
+    this.loops.get(projectId)?.dispose();
+    this.loops.delete(projectId);
+  }
 
   start(): void {
     if (this.timer) return;
@@ -22,6 +25,7 @@ export class RuntimeScheduler {
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
+    for (const loop of this.loops.values()) loop.dispose();
     this.executions.cancelAll();
   }
 
@@ -34,10 +38,7 @@ export class RuntimeScheduler {
       if (all.length === 0) return;
       const loops = [...all.slice(this.cursor), ...all.slice(0, this.cursor)].slice(0, this.config.maxRunningProjects);
       this.cursor = (this.cursor + loops.length) % all.length;
-      for (const loop of loops) {
-        if (slots === 0) break;
-        slots -= await loop.tick(slots);
-      }
+      for (const loop of loops) slots -= await loop.tick(slots);
     } finally { this.ticking = false; }
   }
 }
