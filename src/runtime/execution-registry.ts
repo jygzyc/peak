@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type { TaskType } from "../config/types.js";
 
 export interface ActiveExecution {
@@ -13,6 +14,12 @@ export class ExecutionRegistry {
   private readonly values = new Map<string, ActiveExecution>();
   add(execution: ActiveExecution): void { this.values.set(execution.executionId, execution); }
   remove(executionId: string): void { this.values.delete(executionId); }
+  createId(): string {
+    let executionId: string;
+    do executionId = randomBytes(4).toString("hex");
+    while (this.values.has(executionId));
+    return executionId;
+  }
   count(projectId?: string): number {
     return projectId ? [...this.values.values()].filter((item) => item.projectId === projectId).length : this.values.size;
   }

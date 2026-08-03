@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type { ResolvedTaskConfig, TaskType } from "../config/types.js";
 import { GraphClient } from "../graph/graph-client.js";
 import type { ProjectGraph } from "../graph/types.js";
@@ -33,19 +32,27 @@ export class ProjectLoop {
     const projectSlots = Math.max(0, this.config.scheduler.maxProjectConcurrent - this.executions.count(this.projectId));
     let available = Math.min(globalSlots, projectSlots, this.config.scheduler.refillPerTick);
     if (available > 0 && this.supervisor.due() && !this.executions.has(this.projectId, "supervise")) {
-      this.supervisor.mark();
-      this.dispatch("supervise", (signal, executionId) => this.executor.supervise(this.projectId, executionId, signal));
-      available--; started++;
+      const worker = this.executor.reserveWorker("supervise");
+      if (worker) {
+        this.supervisor.mark();
+        this.dispatch("supervise", (signal, executionId) => this.executor.supervise(this.projectId, executionId, signal, worker));
+        available--; started++;
+      }
     }
     if (available > 0 && this.planNeeded(project) && !this.executions.has(this.projectId, "plan")) {
-      this.checkpoint = checkpoint(project, this.pendingCount());
-      this.dispatch("plan", (signal, executionId) => this.executor.plan(this.projectId, executionId, signal), () => { this.checkpoint = undefined; });
-      available--; started++;
+      const worker = this.executor.reserveWorker("plan");
+      if (worker) {
+        this.checkpoint = checkpoint(project, this.pendingCount());
+        this.dispatch("plan", (signal, executionId) => this.executor.plan(this.projectId, executionId, signal, worker), () => { this.checkpoint = undefined; });
+        available--; started++;
+      }
     }
     for (const intent of project.intents.filter((item) => item.to === null)) {
       if (available === 0) break;
       if (this.executions.has(this.projectId, "execute", intent.id)) continue;
-      this.dispatch("execute", (signal, executionId) => this.executor.execute(this.projectId, intent, executionId, signal), undefined, intent.id);
+      const worker = this.executor.reserveWorker("execute");
+      if (!worker) break;
+      this.dispatch("execute", (signal, executionId) => this.executor.execute(this.projectId, intent, executionId, signal, worker), undefined, intent.id);
       available--; started++;
     }
     return started;
@@ -63,7 +70,7 @@ export class ProjectLoop {
   }
 
   private dispatch(kind: TaskType, run: (signal: AbortSignal, executionId: string) => Promise<void>, failed?: () => void, intentId?: string): void {
-    const executionId = randomUUID();
+    const executionId = this.executions.createId();
     const controller = new AbortController();
     this.executions.add({ executionId, projectId: this.projectId, kind, intentId, controller });
     void run(controller.signal, executionId).catch((error) => {

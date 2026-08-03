@@ -24,12 +24,25 @@ test("WorkerRuntime drives the registered PiDriver through the Agent SDK path", 
   }
 });
 
+test("WorkerRuntime reservations apply backpressure before execution starts", () => {
+  const resources = new WorkerResources(new RejectingProcessRunner());
+  try {
+    const runtime = new WorkerRuntime(configuration(), resources);
+    assert.equal(runtime.pick("plan"), "pi");
+    assert.equal(runtime.pick("plan"), undefined);
+    runtime.release("pi");
+    assert.equal(runtime.pick("plan"), "pi");
+    runtime.release("pi");
+  } finally {
+    resources.dispose();
+  }
+});
+
 function configuration(): ResolvedTaskConfig {
   return {
     configPath: "/task.json",
     taskDir: "/",
     board: {
-      workspace: process.cwd(),
       skills: [],
       projects: [{ name: "Main", goal: "done" }],
     },
@@ -52,7 +65,7 @@ function configuration(): ResolvedTaskConfig {
     phase: {
       plan: { maxIntents: 1 },
       supervise: { intervalMs: 1_000 },
-      execute: { maxArtifactBytes: 1_024 },
+      execute: { maxArtifactBytes: 1_024, customProfiles: [] },
     },
   };
 }

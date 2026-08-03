@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -30,5 +30,9 @@ try {
   for (const value of ["opencode", "codex", "pi", "claude-code", "plan", "supervise", "execute"]) {
     if (!workers.includes(value)) throw new Error(`workers output missing ${value}`);
   }
+  // 版本号必须与根目录 version 文件一致。
+  const version = run(["--version"]).trim();
+  const expected = readFileSync(join(root, "version"), "utf8").trim();
+  if (version !== expected) throw new Error(`peak --version (${version}) !== version 文件 (${expected})`);
   console.log("smoke ok");
 } finally { rmSync(workspace, { recursive: true, force: true }); }

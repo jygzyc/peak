@@ -1,5 +1,5 @@
 import { mkdirSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { SkillInstallOptions, WorkerType } from "./types.js";
 
@@ -48,21 +48,10 @@ export function initializeProjectLogsDirectory(projectDir: string): string {
   return logsDir;
 }
 
-export function initializeExecutionInputDirectory(executionId: string): string {
-  if (!/^[a-zA-Z0-9_-]+$/.test(executionId)) throw new Error("invalid execution id");
-  const inputDir = join(tmpdir(), "peak-inputs", executionId);
-  mkdirSync(inputDir, { recursive: true });
-  return inputDir;
-}
-
 export function resolveTaskConfigPaths(directory = "."): TaskConfigPaths {
   const taskDir = resolve(directory);
   const configPath = join(taskDir, "task.json");
   return Object.freeze({ configPath, taskDir });
-}
-
-export function resolveTaskWorkspace(taskDir: string, workspace?: string): string {
-  return resolve(taskDir, workspace ?? ".");
 }
 
 export function resolveTaskSkillSource(taskDir: string, name: string): string {

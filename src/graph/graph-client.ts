@@ -1,9 +1,8 @@
-import { createReadStream, createWriteStream } from "node:fs";
+import { createReadStream } from "node:fs";
 import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
 import type {
   AddHintInput, ArtifactRef, CompleteInput, ConcludeInput, CreateIntentInput, CreateProjectInput,
-  Fact, FactRef, Hint, Intent, ProjectGraph, ProjectMeta, ProjectStatus, ReopenInput,
+  Fact, FactRef, Hint, Intent, ProjectGraph, ProjectMeta, ProjectStatus, ReopenInput, ResolvedFactSource,
 } from "./types.js";
 
 export class GraphClient {
@@ -18,7 +17,7 @@ export class GraphClient {
     return this.request("PUT", `/api/projects/${id}/status`, { status });
   }
   getFact(ref: FactRef): Promise<Fact> { return this.request("GET", `/api/projects/${ref.projectId}/facts/${ref.factId}`); }
-  resolveFactRefs(targetProjectId: string, refs: FactRef[]): Promise<Array<{ ref: FactRef; fact: Fact }>> {
+  resolveFactRefs(targetProjectId: string, refs: FactRef[]): Promise<ResolvedFactSource[]> {
     return this.request("POST", "/api/fact-refs/resolve", { targetProjectId, refs });
   }
   addHint(id: string, input: AddHintInput): Promise<Hint> { return this.request("POST", `/api/projects/${id}/hints`, input); }
@@ -36,10 +35,23 @@ export class GraphClient {
     return this.response<ArtifactRef>(response);
   }
 
-  async downloadArtifact(id: string, sha256: string, path: string): Promise<void> {
+  /** Uploads inline content; the optional filename is a content-based output name, never a graph node id. */
+  async uploadContent(id: string, content: string, mediaType: string, filename?: string): Promise<ArtifactRef> {
+    const response = await fetch(this.url(`/api/projects/${id}/artifacts`), {
+      method: "POST",
+      headers: this.headers({
+        "content-type": mediaType,
+        ...(filename ? { "x-artifact-filename": filename } : {}),
+      }),
+      body: content,
+    });
+    return this.response<ArtifactRef>(response);
+  }
+
+  async artifactContent(id: string, sha256: string): Promise<string> {
     const response = await fetch(this.url(`/api/projects/${id}/artifacts/${sha256}`), { headers: this.headers() });
-    if (!response.ok || !response.body) throw new GraphClientError(response.status, await response.text());
-    await pipeline(Readable.fromWeb(response.body as import("node:stream/web").ReadableStream), createWriteStream(path));
+    if (!response.ok) throw new GraphClientError(response.status, await response.text());
+    return response.text();
   }
 
   async exportProject(id: string, format: "json" | "timeline" = "json"): Promise<string> {

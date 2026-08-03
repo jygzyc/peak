@@ -14,7 +14,6 @@ export function initializeTaskDirectory(directory = "."): InitializedTaskPaths {
   writeFileSync(configPath, `${JSON.stringify({
     board: {
       name: "peak-board",
-      workspace: ".",
       projects: [
         {
           id: "",

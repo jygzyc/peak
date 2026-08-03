@@ -1,7 +1,6 @@
 {
   "board": {
     "name": "ai-agent-safety",
-    "workspace": ".",
     "skills": [
       "ai-agent-safety"
     ],
@@ -9,19 +8,19 @@
       {
         "id": "",
         "name": "Latest AI Safety Intelligence",
-        "goal": "Collect and analyze the latest credible AI safety research, incidents, standards, policies, and engineering practices, then produce a sourced summary of the most important findings, trends, and implications."
+        "goal": "Produce one concise AI safety intelligence brief containing exactly five high-impact, current findings: at least two research or standards findings, at least one documented incident, and at least one policy or engineering-practice finding. For each item include a primary-source URL, publication date, confirmed finding, uncertainty, and practical implication, and conclude with three cross-cutting trends. Build the proof step by step as a multi-level DAG: each new Intent must start from the current leaf Facts and prefer deepening an established line of inquiry over opening a new branch from the Source. There is no fixed depth limit — you may keep extending a line (for example scoping, evidence collection, cross-checking, refinement) for as many levels as needed until the Goal is proven. Do not fan out all Intents from the Source in one round and do not attempt an exhaustive survey."
       },
       {
         "id": "",
         "name": "AI Agent Guardrail Design",
-        "goal": "Produce an actionable AI Agent safety guardrail construction plan covering threat modeling, identity and authorization, tool and data controls, sandboxing, policy enforcement, runtime monitoring, evaluation, incident response, rollout stages, and measurable acceptance criteria."
+        "goal": "Produce one consolidated implementation blueprint for an HTTP-native, tool-using AI Agent covering a bounded threat model, identity and authorization rules, tool, data, and sandbox controls, runtime policy enforcement and monitoring, an evaluation release gate, an incident-response trigger, a three-stage rollout, and one acceptance-criteria table with owners and measurable thresholds. Build the proof step by step as a multi-level DAG: each new Intent must start from the current leaf Facts and prefer deepening an established line of inquiry over opening a new branch from the Source. There is no fixed depth limit — you may keep extending a line (for example scoping, control design, cross-checks, refinement) for as many levels as needed until the Goal is proven. Do not fan out all Intents from the Source in one round and do not create separate reports for every subsection."
       }
     ]
   },
   "workers": [
     {
       "type": "pi",
-      "model": "zai-coding-cn/glm-5.2",
+      "model": "deepseek-v4-flash",
       "taskTypes": [
         "plan",
         "supervise"
@@ -31,18 +30,8 @@
       "args": []
     },
     {
-      "type": "codex",
-      "model": "",
-      "taskTypes": [
-        "plan"
-      ],
-      "maxRunning": 1,
-      "priority": 2,
-      "args": []
-    },
-    {
-      "type": "opencode",
-      "model": "minimax/MiniMax-M3",
+      "type": "pi",
+      "model": "deepseek-v4-flash",
       "taskTypes": [
         "execute"
       ],
@@ -53,13 +42,39 @@
   ],
   "phase": {
     "plan": {
-      "maxIntents": 4
+      "maxIntents": 10
     },
     "supervise": {
-      "intervalMs": 90000
+      "intervalMs": 90000,
+      "customProfile": {
+        "description": "Audit the proof only for completion-blocking evidence defects.",
+        "prompt": "Audit only for a concrete contradiction, a missing required Goal section, or an unsupported claim that would block completion. Return noop when the bounded deliverable and its acceptance criteria are already supported. Do not request optional expansions, exhaustive coverage, or a separate validation report."
+      }
     },
     "execute": {
-      "maxArtifactBytes": 10485760
+      "maxArtifactBytes": 10485760,
+      "customProfiles": [
+        {
+          "description": "Use for defining the bounded deliverable contract and evidence rules for this Project.",
+          "prompt": "Produce exactly one scoping result for the assigned Project. Fix the deliverable structure (required sections, finding slots or control list), the evidence rules (one primary source per item with URL, date, finding, uncertainty, and implication), and the acceptance criteria. Do not collect evidence. If detailed content needs a file, return it inline in the contract with a content-based filename such as scoping.md; otherwise return artifact null. Never write files yourself and never reference internal graph node ids (i001, f001, intent ids, fact ids) in the filename or content."
+        },
+        {
+          "description": "Use for collecting and assessing one current primary research or standards source.",
+          "prompt": "Assess exactly one current primary source or standards document named by the Intent. Record its exact title, publisher, date, URL, one supported finding, uncertainty, and practical implication. Do not add other sources as separate findings or build a matrix. If detailed evidence needs a file, return it inline in the contract with a content-based filename such as primary-research.md; otherwise return artifact null. Never write files yourself and never reference internal graph node ids (i001, f001, intent ids, fact ids) in the filename or content."
+        },
+        {
+          "description": "Use for analyzing one concrete AI or Agent safety incident.",
+          "prompt": "Analyze exactly one concrete AI or Agent safety incident named by the Intent. Separate observed facts, causal hypotheses, impact, mitigation, uncertainty, and the primary disclosure URL. Do not add or compare other incidents. If detailed evidence needs a file, return it inline in the contract with a content-based filename such as incident-analysis.md; otherwise return artifact null. Never write files yourself and never reference internal graph node ids (i001, f001, intent ids, fact ids) in the filename or content."
+        },
+        {
+          "description": "Use for designing one implementable AI Agent guardrail or one bounded threat-model result.",
+          "prompt": "Design exactly one independently testable guardrail or one bounded threat-model result named by the Intent. State its trust boundary, enforcement point, failure behavior, owner, and measurable acceptance criterion. Do not design other controls or produce an integrated blueprint. If detailed content needs a file, return it inline in the contract with a content-based filename such as control-design.md; otherwise return artifact null. Never write files yourself and never reference internal graph node ids (i001, f001, intent ids, fact ids) in the filename or content."
+        },
+        {
+          "description": "Use for the final synthesis that merges only existing leaf Facts into the bounded deliverable.",
+          "prompt": "Merge only the current leaf Facts listed as Intent sources into exactly one bounded deliverable defined by the Goal: an intelligence brief (five findings plus three cross-cutting trends) or a guardrail blueprint (three-stage rollout plus one acceptance-criteria table). Perform no new evidence collection, downloads, or searches. If the deliverable needs a file, return it inline in the contract with a content-based filename such as ai-safety-intelligence-brief.md or guardrail-blueprint.md; otherwise return artifact null. The final document is materialized next to task.json; it must be standalone analysis and must not mention internal graph node ids (i001, f001, intent ids, fact ids). Never write files yourself."
+        }
+      ]
     }
   }
 }

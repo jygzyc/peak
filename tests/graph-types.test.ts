@@ -22,12 +22,17 @@ test("leafFacts keeps only the current ordinary proof frontier", () => {
 
   graph.intents.push(intent("i005", "f002", "goal"));
   assert.deepEqual(leafFacts(graph).map((fact) => fact.id), ["f002", "f003"]);
+
+  graph.facts.push({ id: "f004", description: "f004", artifact: null, createdAt: at });
+  graph.intents.push(intent("i006", ["f002", "f003"], "f004"));
+  assert.deepEqual(leafFacts(graph).map((fact) => fact.id), ["f004"]);
 });
 
-function intent(id: string, from: string, to: string | null) {
+function intent(id: string, from: string | string[], to: string | null) {
+  const sources = Array.isArray(from) ? from : [from];
   return {
     id,
-    from: [{ projectId, factId: from, description: from }],
+    from: sources.map((factId) => ({ projectId, factId, description: factId })),
     to: to === null ? null : { projectId, factId: to, description: to },
     description: id,
     createdBy: "test",

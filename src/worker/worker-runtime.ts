@@ -52,6 +52,12 @@ export class WorkerRuntime {
     return selected;
   }
 
+  release(workerName: string): void {
+    const reserved = this.resources.reserved.get(workerName) ?? 0;
+    if (reserved <= 0) throw new Error(`worker reservation not found: ${workerName}`);
+    this.resources.reserved.set(workerName, reserved - 1);
+  }
+
   async execute(
     workerName: string,
     taskType: TaskType,

@@ -10,6 +10,11 @@ export interface WorkerConfig {
   args: string[];
 }
 
+export interface CustomProfileDefinition {
+  description: string;
+  prompt: string;
+}
+
 export interface SchedulerConfig {
   maxConcurrent: number;
   maxRunningProjects: number;
@@ -34,16 +39,15 @@ export interface ResolvedTaskConfig {
   taskDir: string;
   board: {
     name?: string;
-    workspace: string;
     skills: string[];
     projects: ProjectConfig[];
   };
   workers: Record<string, WorkerConfig>;
   scheduler: SchedulerConfig;
   phase: {
-    plan: { maxIntents: number };
-    supervise: { intervalMs: number };
-    execute: { maxArtifactBytes: number };
+    plan: { maxIntents: number; customProfile?: CustomProfileDefinition };
+    supervise: { intervalMs: number; customProfile?: CustomProfileDefinition };
+    execute: { maxArtifactBytes: number; customProfiles: CustomProfileDefinition[] };
   };
 }
 

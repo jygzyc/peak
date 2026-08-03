@@ -3,7 +3,7 @@ import { appendFileSync, createReadStream } from "node:fs";
 import { join } from "node:path";
 import { initializeProjectLogsDirectory } from "../config/paths.js";
 import {
-  ApiError, requireDescription, requireFactDescription, requireIntentDescription, requireShortDescription,
+  ApiError, localTimestamp, requireCustomProfileDigest, requireDescription, requireFactDescription, requireIntentDescription, requireShortDescription,
 } from "./api.js";
 import { toTimeline } from "./export.js";
 import { ProjectStoreRegistry } from "./project-store-registry.js";
@@ -112,7 +112,21 @@ export class GraphHttpServer {
         const targetProjectId = requireString(body.targetProjectId, "targetProjectId");
         const refs = factRefs(body.refs);
         this.registry.validateRefs(targetProjectId, refs);
-        return json(response, refs.map((ref) => ({ ref, fact: this.registry.get(ref.projectId).graph.fact(ref.factId) })));
+        return json(response, refs.map((ref) => {
+          const source = this.registry.get(ref.projectId);
+          const fact = source.graph.fact(ref.factId)!;
+          return {
+            ref,
+            fact: {
+              id: fact.id, description: fact.description, createdAt: fact.createdAt,
+              artifact: fact.artifact ? {
+                sha256: fact.artifact.sha256, mediaType: fact.artifact.mediaType, sizeBytes: fact.artifact.sizeBytes,
+                filename: fact.artifact.filename,
+                inputPath: source.artifacts.path(fact.artifact.sha256), readOnly: true,
+              } : null,
+            },
+          };
+        }));
       }
 
       if (parts[1] === "scopes" && parts[3] === "export" && method === "GET") {
@@ -153,9 +167,10 @@ export class GraphHttpServer {
         return json(response, fact);
       }
       if (parts[3] === "artifacts" && parts.length === 4 && method === "POST") {
-        const stored = await stores.artifacts.save(request, request.headers["content-type"] ?? "application/octet-stream", this.maxArtifactBytes);
+        const filename = artifactFilename(request.headers["x-artifact-filename"]);
+        const stored = await stores.artifacts.save(request, request.headers["content-type"] ?? "application/octet-stream", this.maxArtifactBytes, filename);
         const ref = stores.graph.registerArtifact(stored);
-        operation(stores.dir, "artifact_uploaded", { projectId, sha256: ref.sha256, sizeBytes: ref.sizeBytes });
+        operation(stores.dir, "artifact_uploaded", { projectId, sha256: ref.sha256, sizeBytes: ref.sizeBytes, filename: ref.filename });
         return json(response, ref, 201);
       }
       if (parts[3] === "artifacts" && parts[4] && (method === "GET" || method === "HEAD")) {
@@ -177,38 +192,48 @@ export class GraphHttpServer {
       }
       if (parts[3] === "intents" && parts.length === 4 && method === "POST") {
         const body = await bodyObject(request);
-        exact(body, ["from", "description", "createdBy"]);
+        exact(body, ["from", "customProfile", "customProfileDigest", "hintIds", "description", "createdBy"], ["customProfile", "customProfileDigest", "hintIds"]);
         const input: CreateIntentInput = {
-          from: factRefs(body.from), description: requireIntentDescription(body.description),
+          from: factRefs(body.from),
+          customProfile: body.customProfile === undefined || body.customProfile === null ? null : requireShortDescription(body.customProfile, "customProfile"),
+          customProfileDigest: body.customProfileDigest === undefined || body.customProfileDigest === null
+            ? null : requireCustomProfileDigest(body.customProfileDigest),
+          hintIds: shortStrings(body.hintIds, "hintIds"),
+          description: requireIntentDescription(body.description),
           createdBy: requireShortDescription(body.createdBy, "createdBy"),
         };
-        this.registry.validateRefs(projectId, input.from);
+        this.registry.validateLeafRefs(projectId, input.from);
         const intent = stores.graph.createIntent(input);
-        operation(stores.dir, "intent_created", { projectId, intentId: intent.id, createdBy: intent.createdBy });
+        operation(stores.dir, "intent_created", { projectId, intentId: intent.id, customProfile: intent.customProfile, customProfileDigest: intent.customProfileDigest, hintIds: intent.hintIds, createdBy: intent.createdBy });
         return json(response, intent, 201);
       }
       if (parts[3] === "intents" && parts[4] && parts[5] === "conclude" && method === "POST") {
         const body = await bodyObject(request);
-        exact(body, ["description", "artifact", "concludedBy"], ["artifact"]);
+        exact(body, ["description", "artifact", "concludedBy"]);
         const requested = artifactRef(body.artifact);
-        const canonical = requested ? stores.graph.artifact(requested.sha256) : undefined;
-        if (requested && (!canonical || JSON.stringify(canonical) !== JSON.stringify(requested))) throw new ApiError(400, "invalid artifact reference");
+        let canonical: ArtifactRef | null = null;
+        if (requested) {
+          const stored = stores.graph.artifact(requested.sha256);
+          if (!stored || JSON.stringify(stored) !== JSON.stringify(requested)) throw new ApiError(400, "invalid artifact reference");
+          canonical = stored;
+        }
         const input: ConcludeInput = {
-          description: requireFactDescription(body.description), artifact: canonical ?? null,
+          description: requireFactDescription(body.description), artifact: canonical,
           concludedBy: requireShortDescription(body.concludedBy, "concludedBy"),
         };
         const result = stores.graph.conclude(parts[4], input);
-        operation(stores.dir, "intent_concluded", { projectId, intentId: parts[4], factId: result.fact.id, concludedBy: input.concludedBy });
+        operation(stores.dir, "intent_concluded", { projectId, intentId: parts[4], factId: result.fact.id, artifact: result.fact.artifact, concludedBy: input.concludedBy });
         return json(response, result);
       }
       if (parts[3] === "complete" && method === "POST") {
         const body = await bodyObject(request);
-        exact(body, ["from", "description", "completedBy"]);
+        exact(body, ["from", "hintIds", "description", "completedBy"], ["hintIds"]);
         const input: CompleteInput = {
-          from: factRefs(body.from), description: requireIntentDescription(body.description),
+          from: factRefs(body.from), hintIds: shortStrings(body.hintIds, "hintIds"),
+          description: requireIntentDescription(body.description),
           completedBy: requireShortDescription(body.completedBy, "completedBy"),
         };
-        this.registry.validateRefs(projectId, input.from);
+        this.registry.validateLeafRefs(projectId, input.from);
         const completion = stores.graph.complete(input);
         operation(stores.dir, "project_completed", { projectId, intentId: completion.id, completedBy: input.completedBy });
         return json(response, completion);
@@ -216,7 +241,7 @@ export class GraphHttpServer {
       if (parts[3] === "reopen" && method === "POST") {
         const body = await bodyObject(request);
         exact(body, ["description", "creator"]);
-        const graph = stores.graph.reopen({
+        const graph = this.registry.reopen(projectId, {
           description: requireFactDescription(body.description), creator: requireShortDescription(body.creator, "creator"),
         });
         operation(stores.dir, "project_reopened", { projectId, creator: body.creator });
@@ -265,15 +290,35 @@ function factRefs(value: unknown): FactRef[] {
   });
 }
 
+function shortStrings(value: unknown, label: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new ApiError(400, `${label} must be an array`);
+  const result = value.map((item) => requireShortDescription(item, label));
+  if (new Set(result).size !== result.length) throw new ApiError(400, `${label} contains duplicates`);
+  return result;
+}
+
+/** Validates the optional content-based output filename sent as x-artifact-filename. */
+function artifactFilename(value: string | string[] | undefined): string | null {
+  if (value === undefined) return null;
+  const name = requireShortDescription(Array.isArray(value) ? value[0] : value, "x-artifact-filename");
+  if (name.includes("\\") || name.startsWith("/")
+    || name.split("/").some((segment) => segment === "" || segment === "." || segment === ".." || segment.startsWith("."))) {
+    throw new ApiError(400, "invalid artifact filename");
+  }
+  return name;
+}
+
 function artifactRef(value: unknown): ArtifactRef | undefined {
   if (value === undefined || value === null) return undefined;
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new ApiError(400, "invalid artifact");
   const ref = value as Record<string, unknown>;
-  exact(ref, ["path", "sha256", "mediaType", "sizeBytes"]);
+  exact(ref, ["path", "sha256", "mediaType", "sizeBytes", "filename"], ["filename"]);
   if (!Number.isInteger(ref.sizeBytes) || (ref.sizeBytes as number) < 0) throw new ApiError(400, "invalid artifact size");
   return {
     path: requireString(ref.path, "artifact.path"), sha256: requireString(ref.sha256, "artifact.sha256"),
     mediaType: requireString(ref.mediaType, "artifact.mediaType"), sizeBytes: ref.sizeBytes as number,
+    filename: ref.filename === undefined || ref.filename === null ? null : requireShortDescription(ref.filename, "artifact.filename"),
   };
 }
 function exact(value: Record<string, unknown>, allowed: string[], optional: string[] = []): void {
@@ -295,5 +340,5 @@ function empty(response: ServerResponse, status: number): void { response.writeH
 function isLoopback(host: string): boolean { return host === "127.0.0.1" || host === "localhost" || host === "::1"; }
 function operation(projectDir: string, type: string, data: Record<string, unknown>): void {
   const logs = initializeProjectLogsDirectory(projectDir);
-  appendFileSync(join(logs, "main.log"), `${JSON.stringify({ at: new Date().toISOString(), type, ...data })}\n`);
+  appendFileSync(join(logs, "main.log"), `${JSON.stringify({ at: localTimestamp(), type, ...data })}\n`);
 }

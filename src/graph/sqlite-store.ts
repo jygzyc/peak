@@ -2,11 +2,11 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { initializeProjectDirectory } from "../config/paths.js";
 import {
-  ApiError, requireDescription, requireFactDescription, requireIntentDescription, requireShortDescription,
+  ApiError, localTimestamp, requireCustomProfileDigest, requireDescription, requireFactDescription, requireIntentDescription, requireShortDescription,
 } from "./api.js";
-import type {
-  AddHintInput, ArtifactRef, CompleteInput, ConcludeInput, CreateIntentInput, CreateProjectInput,
-  Fact, FactRef, Hint, Intent, ProjectGraph, ProjectMeta, ProjectStatus, ReopenInput,
+import {
+  leafFacts, type AddHintInput, type ArtifactRef, type CompleteInput, type ConcludeInput, type CreateIntentInput, type CreateProjectInput,
+  type Fact, type FactRef, type Hint, type Intent, type ProjectGraph, type ProjectMeta, type ProjectStatus, type ReopenInput,
 } from "./types.js";
 
 export class SqliteStore {
@@ -18,7 +18,7 @@ export class SqliteStore {
     this.database = new DatabaseSync(join(this.projectDir, "analysis.db"));
     this.database.exec("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;");
     this.database.exec(SCHEMA);
-    this.migrateFactRefDescriptions();
+    this.migrateSchema();
   }
 
   initialize(id: string, input: CreateProjectInput): ProjectMeta {
@@ -27,10 +27,10 @@ export class SqliteStore {
     this.transaction(() => {
       this.database.prepare("INSERT INTO project(id,title,status,scope,created_at) VALUES(?,?,?,?,?)")
         .run(id, requireShortDescription(input.title, "title"), "active", input.scope ?? null, now);
-      this.database.prepare("INSERT INTO facts(id,description,artifact_sha256,created_at) VALUES(?,?,NULL,?)")
-        .run("origin", requireDescription(input.target, "target"), now);
-      this.database.prepare("INSERT INTO facts(id,description,artifact_sha256,created_at) VALUES(?,?,NULL,?)")
-        .run("goal", requireDescription(input.goal, "goal"), now);
+      this.database.prepare("INSERT INTO facts(id,description,artifact_sha256,created_at) VALUES(?,?,?,?)")
+        .run("origin", requireDescription(input.target, "target"), null, now);
+      this.database.prepare("INSERT INTO facts(id,description,artifact_sha256,created_at) VALUES(?,?,?,?)")
+        .run("goal", requireDescription(input.goal, "goal"), null, now);
       this.database.prepare("INSERT INTO counters(name,value) VALUES('fact',0),('intent',0),('hint',0)").run();
     });
     return this.project()!;
@@ -54,12 +54,12 @@ export class SqliteStore {
   }
 
   facts(): Fact[] {
-    return this.database.prepare(`SELECT f.*,a.path,a.media_type,a.size_bytes FROM facts f
+    return this.database.prepare(`SELECT f.*,a.path,a.media_type,a.size_bytes,a.filename FROM facts f
       LEFT JOIN artifacts a ON a.sha256=f.artifact_sha256 ORDER BY f.created_at,f.id`).all().map(fact);
   }
 
   fact(id: string): Fact | undefined {
-    const row = this.database.prepare(`SELECT f.*,a.path,a.media_type,a.size_bytes FROM facts f
+    const row = this.database.prepare(`SELECT f.*,a.path,a.media_type,a.size_bytes,a.filename FROM facts f
       LEFT JOIN artifacts a ON a.sha256=f.artifact_sha256 WHERE f.id=?`).get(id);
     return row ? fact(row) : undefined;
   }
@@ -69,6 +69,7 @@ export class SqliteStore {
     const sources = this.database.prepare("SELECT * FROM intent_sources ORDER BY intent_id,position").all();
     const descriptions = new Map(this.database.prepare("SELECT id,description FROM facts").all()
       .map((row) => [text(row.id), text(row.description)]));
+    const consumedHints = this.database.prepare("SELECT id,consumed_by_intent_id FROM hints WHERE consumed_by_intent_id IS NOT NULL").all();
     return rows.map((row) => ({
       id: text(row.id),
       from: sources.filter((source) => source.intent_id === row.id).map((source) => ({
@@ -78,6 +79,9 @@ export class SqliteStore {
       to: row.to_fact_id === null ? null : {
         projectId, factId: text(row.to_fact_id), description: descriptions.get(text(row.to_fact_id))!,
       },
+      customProfile: nullableNull(row.custom_profile),
+      customProfileDigest: nullableNull(row.custom_profile_digest),
+      hintIds: consumedHints.filter((hint) => hint.consumed_by_intent_id === row.id).map((hint) => text(hint.id)),
       description: text(row.description), createdBy: text(row.created_by), createdAt: text(row.created_at),
       concludedBy: nullableNull(row.concluded_by), concludedAt: nullableNull(row.concluded_at),
     }));
@@ -86,12 +90,13 @@ export class SqliteStore {
   hints(): Hint[] {
     return this.database.prepare("SELECT * FROM hints ORDER BY created_at,id").all().map((row) => ({
       id: text(row.id), content: text(row.content), creator: text(row.creator), createdAt: text(row.created_at),
+      consumedByIntentId: nullableNull(row.consumed_by_intent_id), consumedAt: nullableNull(row.consumed_at),
     }));
   }
 
   registerArtifact(ref: ArtifactRef): ArtifactRef {
-    this.database.prepare(`INSERT INTO artifacts(sha256,path,media_type,size_bytes,created_at) VALUES(?,?,?,?,?)
-      ON CONFLICT(sha256) DO NOTHING`).run(ref.sha256, ref.path, ref.mediaType, ref.sizeBytes, timestamp());
+    this.database.prepare(`INSERT INTO artifacts(sha256,path,media_type,size_bytes,filename,created_at) VALUES(?,?,?,?,?,?)
+      ON CONFLICT(sha256) DO NOTHING`).run(ref.sha256, ref.path, ref.mediaType, ref.sizeBytes, ref.filename, timestamp());
     return this.artifact(ref.sha256)!;
   }
 
@@ -107,7 +112,7 @@ export class SqliteStore {
 
   artifact(sha256: string): ArtifactRef | undefined {
     const row = this.database.prepare("SELECT * FROM artifacts WHERE sha256=?").get(sha256);
-    return row ? { path: text(row.path), sha256: text(row.sha256), mediaType: text(row.media_type), sizeBytes: number(row.size_bytes) } : undefined;
+    return row ? { path: text(row.path), sha256: text(row.sha256), mediaType: text(row.media_type), sizeBytes: number(row.size_bytes), filename: nullableNull(row.filename) } : undefined;
   }
 
   addHint(input: AddHintInput): Hint {
@@ -116,9 +121,9 @@ export class SqliteStore {
     if (existing) throw new ApiError(409, "duplicate hint");
     const id = this.nextId("hint", "h");
     const createdAt = timestamp();
-    this.database.prepare("INSERT INTO hints(id,content,creator,created_at) VALUES(?,?,?,?)")
+    this.database.prepare("INSERT INTO hints(id,content,creator,created_at,consumed_by_intent_id,consumed_at) VALUES(?,?,?,?,NULL,NULL)")
       .run(id, content, requireShortDescription(input.creator, "creator"), createdAt);
-    return { id, content, creator: input.creator.trim(), createdAt };
+    return { id, content, creator: input.creator.trim(), createdAt, consumedByIntentId: null, consumedAt: null };
   }
 
   createIntent(input: CreateIntentInput): Intent {
@@ -128,19 +133,28 @@ export class SqliteStore {
     const createdAt = timestamp();
     const description = requireIntentDescription(input.description);
     const createdBy = requireShortDescription(input.createdBy, "createdBy");
+    const customProfile = input.customProfile === undefined || input.customProfile === null
+      ? null : requireShortDescription(input.customProfile, "customProfile");
+    const customProfileDigest = input.customProfileDigest === undefined || input.customProfileDigest === null
+      ? null : requireCustomProfileDigest(input.customProfileDigest);
+    if ((customProfile === null) !== (customProfileDigest === null)) {
+      throw new ApiError(400, "customProfile and customProfileDigest must be configured together");
+    }
+    const hintIds = uniqueIds(input.hintIds ?? [], "hintIds");
     this.transaction(() => {
-      this.database.prepare(`INSERT INTO intents(id,to_fact_id,description,created_by,created_at,concluded_by,concluded_at)
-        VALUES(?,NULL,?,?,?,NULL,NULL)`).run(id, description, createdBy, createdAt);
+      this.database.prepare(`INSERT INTO intents(id,to_fact_id,custom_profile,custom_profile_digest,description,created_by,created_at,concluded_by,concluded_at)
+        VALUES(?,NULL,?,?,?,?,?,NULL,NULL)`).run(id, customProfile, customProfileDigest, description, createdBy, createdAt);
       this.insertSources(id, input.from);
+      this.consumeHints(id, hintIds, createdAt);
     });
-    return { id, from: input.from, to: null, description, createdBy, createdAt, concludedBy: null, concludedAt: null };
+    return { id, from: input.from, to: null, customProfile, customProfileDigest, hintIds, description, createdBy, createdAt, concludedBy: null, concludedAt: null };
   }
 
   conclude(intentId: string, input: ConcludeInput): { intent: Intent; fact: Fact } {
     this.requireActive();
     const description = requireFactDescription(input.description);
     const concludedBy = requireShortDescription(input.concludedBy, "concludedBy");
-    const artifact = input.artifact ?? null;
+    const artifact = input.artifact;
     if (artifact && !this.artifact(artifact.sha256)) throw new ApiError(400, "artifact not found");
     let created!: Fact;
     this.transaction(() => {
@@ -168,10 +182,12 @@ export class SqliteStore {
     const now = timestamp();
     const description = requireIntentDescription(input.description);
     const actor = requireShortDescription(input.completedBy, "completedBy");
+    const hintIds = uniqueIds(input.hintIds ?? [], "hintIds");
     this.transaction(() => {
-      this.database.prepare(`INSERT INTO intents(id,to_fact_id,description,created_by,created_at,concluded_by,concluded_at)
-        VALUES(?,'goal',?,?,?,?,?)`).run(id, description, actor, now, actor, now);
+      this.database.prepare(`INSERT INTO intents(id,to_fact_id,custom_profile,custom_profile_digest,description,created_by,created_at,concluded_by,concluded_at)
+        VALUES(?,'goal',NULL,NULL,?,?,?,?,?)`).run(id, description, actor, now, actor, now);
       this.insertSources(id, input.from);
+      this.consumeHints(id, hintIds, now);
       this.database.prepare("UPDATE project SET status='completed'").run();
     });
     return this.intents(this.project()!.id).find((item) => item.id === id)!;
@@ -182,21 +198,24 @@ export class SqliteStore {
     if (!project || project.status !== "completed") throw new ApiError(409, "project is not completed");
     const completion = this.database.prepare("SELECT id FROM intents WHERE to_fact_id='goal'").get();
     if (!completion) throw new ApiError(409, "completion not found");
+    const sources = leafFacts(this.graph()).map((fact): FactRef => ({
+      projectId: project.id, factId: fact.id, description: fact.description,
+    }));
+    if (sources.length === 0) throw new ApiError(409, "completed project has no current leaf Facts");
     const description = requireFactDescription(input.description);
     const creator = requireShortDescription(input.creator, "creator");
     this.transaction(() => {
+      this.database.prepare("UPDATE hints SET consumed_by_intent_id=NULL,consumed_at=NULL WHERE consumed_by_intent_id=?").run(completion.id);
       this.database.prepare("DELETE FROM intent_sources WHERE intent_id=?").run(completion.id);
       this.database.prepare("DELETE FROM intents WHERE id=?").run(completion.id);
       const factId = this.nextId("fact", "f");
       const intentId = this.nextId("intent", "i");
       const now = timestamp();
-      this.database.prepare("INSERT INTO facts(id,description,artifact_sha256,created_at) VALUES(?,?,NULL,?)")
-        .run(factId, description, now);
-      this.database.prepare(`INSERT INTO intents(id,to_fact_id,description,created_by,created_at,concluded_by,concluded_at)
-        VALUES(?,?,?,?,?,?,?)`).run(intentId, factId, "External feedback", creator, now, creator, now);
-      this.insertSources(intentId, [{
-        projectId: project.id, factId: "origin", description: this.fact("origin")!.description,
-      }]);
+      this.database.prepare("INSERT INTO facts(id,description,artifact_sha256,created_at) VALUES(?,?,?,?)")
+        .run(factId, description, null, now);
+      this.database.prepare(`INSERT INTO intents(id,to_fact_id,custom_profile,custom_profile_digest,description,created_by,created_at,concluded_by,concluded_at)
+        VALUES(?,?,NULL,NULL,?,?,?,?,?)`).run(intentId, factId, "External feedback", creator, now, creator, now);
+      this.insertSources(intentId, sources);
       this.database.prepare("UPDATE project SET status='active'").run();
     });
     return this.graph();
@@ -237,16 +256,53 @@ export class SqliteStore {
     ));
   }
 
-  private migrateFactRefDescriptions(): void {
-    const columns = this.database.prepare("PRAGMA table_info(intent_sources)").all().map((row) => text(row.name));
-    if (!columns.includes("source_description")) {
-      this.database.exec("ALTER TABLE intent_sources ADD COLUMN source_description TEXT NOT NULL DEFAULT ''");
+  private consumeHints(intentId: string, hintIds: string[], consumedAt: string): void {
+    const select = this.database.prepare("SELECT consumed_by_intent_id FROM hints WHERE id=?");
+    const update = this.database.prepare("UPDATE hints SET consumed_by_intent_id=?,consumed_at=? WHERE id=?");
+    for (const hintId of hintIds) {
+      const row = select.get(hintId);
+      if (!row) throw new ApiError(400, `hint not found: ${hintId}`);
+      if (row.consumed_by_intent_id !== null) throw new ApiError(409, `hint already consumed: ${hintId}`);
+      update.run(intentId, consumedAt, hintId);
     }
+  }
+
+  private migrateSchema(): void {
+    this.makeFactArtifactOptional();
+    addColumn(this.database, "intents", "custom_profile", "TEXT");
+    addColumn(this.database, "intents", "custom_profile_digest", "TEXT");
+    dropColumn(this.database, "facts", "kind");
+    dropColumn(this.database, "intents", "prompt_kind");
+    dropColumn(this.database, "hints", "kind");
+    addColumn(this.database, "hints", "consumed_by_intent_id", "TEXT");
+    addColumn(this.database, "hints", "consumed_at", "TEXT");
+    addColumn(this.database, "intent_sources", "source_description", "TEXT NOT NULL DEFAULT ''");
+    addColumn(this.database, "artifacts", "filename", "TEXT");
     const project = this.project();
     if (project) {
       this.database.prepare(`UPDATE intent_sources SET source_description=(
         SELECT description FROM facts WHERE facts.id=intent_sources.source_fact_id
       ) WHERE source_project_id=? AND source_description=''`).run(project.id);
+    }
+  }
+
+  private makeFactArtifactOptional(): void {
+    const artifact = this.database.prepare("PRAGMA table_info(facts)").all()
+      .find((row) => text(row.name) === "artifact_sha256");
+    if (!artifact || number(artifact.notnull) === 0) return;
+    this.database.exec("PRAGMA foreign_keys=OFF");
+    try {
+      this.database.exec(`BEGIN IMMEDIATE;
+        CREATE TABLE facts_optional(id TEXT PRIMARY KEY,description TEXT NOT NULL,artifact_sha256 TEXT REFERENCES artifacts(sha256),created_at TEXT NOT NULL);
+        INSERT INTO facts_optional(id,description,artifact_sha256,created_at) SELECT id,description,artifact_sha256,created_at FROM facts;
+        DROP TABLE facts;
+        ALTER TABLE facts_optional RENAME TO facts;
+        COMMIT;`);
+    } catch (error) {
+      try { this.database.exec("ROLLBACK"); } catch { /* no active transaction */ }
+      throw error;
+    } finally {
+      this.database.exec("PRAGMA foreign_keys=ON");
     }
   }
 
@@ -269,11 +325,11 @@ export class SqliteStore {
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS project(id TEXT PRIMARY KEY,title TEXT NOT NULL,status TEXT NOT NULL,scope TEXT,created_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS artifacts(sha256 TEXT PRIMARY KEY,path TEXT NOT NULL,media_type TEXT NOT NULL,size_bytes INTEGER NOT NULL,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS artifacts(sha256 TEXT PRIMARY KEY,path TEXT NOT NULL,media_type TEXT NOT NULL,size_bytes INTEGER NOT NULL,filename TEXT,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS facts(id TEXT PRIMARY KEY,description TEXT NOT NULL,artifact_sha256 TEXT REFERENCES artifacts(sha256),created_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS intents(id TEXT PRIMARY KEY,to_fact_id TEXT REFERENCES facts(id),description TEXT NOT NULL,created_by TEXT NOT NULL,created_at TEXT NOT NULL,concluded_by TEXT,concluded_at TEXT);
+CREATE TABLE IF NOT EXISTS intents(id TEXT PRIMARY KEY,to_fact_id TEXT REFERENCES facts(id),custom_profile TEXT,custom_profile_digest TEXT,description TEXT NOT NULL,created_by TEXT NOT NULL,created_at TEXT NOT NULL,concluded_by TEXT,concluded_at TEXT);
 CREATE TABLE IF NOT EXISTS intent_sources(intent_id TEXT NOT NULL REFERENCES intents(id) ON DELETE CASCADE,position INTEGER NOT NULL,source_project_id TEXT NOT NULL,source_fact_id TEXT NOT NULL,source_description TEXT NOT NULL,PRIMARY KEY(intent_id,position),UNIQUE(intent_id,source_project_id,source_fact_id));
-CREATE TABLE IF NOT EXISTS hints(id TEXT PRIMARY KEY,content TEXT NOT NULL,creator TEXT NOT NULL,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS hints(id TEXT PRIMARY KEY,content TEXT NOT NULL,creator TEXT NOT NULL,created_at TEXT NOT NULL,consumed_by_intent_id TEXT REFERENCES intents(id),consumed_at TEXT);
 CREATE TABLE IF NOT EXISTS counters(name TEXT PRIMARY KEY,value INTEGER NOT NULL);
 `;
 
@@ -281,10 +337,26 @@ function fact(row: Record<string, unknown>): Fact {
   const sha256 = nullable(row.artifact_sha256);
   return {
     id: text(row.id), description: text(row.description), createdAt: text(row.created_at),
-    artifact: sha256 ? { path: text(row.path), sha256, mediaType: text(row.media_type), sizeBytes: number(row.size_bytes) } : null,
+    artifact: sha256
+      ? { path: text(row.path), sha256, mediaType: text(row.media_type), sizeBytes: number(row.size_bytes), filename: nullableNull(row.filename) }
+      : null,
   };
 }
-function timestamp(): string { return new Date().toISOString(); }
+function addColumn(database: DatabaseSync, table: string, column: string, definition: string): void {
+  const columns = database.prepare(`PRAGMA table_info(${table})`).all().map((row) => text(row.name));
+  if (!columns.includes(column)) database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+function dropColumn(database: DatabaseSync, table: string, column: string): void {
+  const columns = database.prepare(`PRAGMA table_info(${table})`).all().map((row) => text(row.name));
+  if (columns.includes(column)) database.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`);
+}
+function uniqueIds(values: string[], label: string): string[] {
+  if (!Array.isArray(values)) throw new ApiError(400, `${label} must be an array`);
+  const result = values.map((value) => requireShortDescription(value, label));
+  if (new Set(result).size !== result.length) throw new ApiError(400, `${label} contains duplicates`);
+  return result;
+}
+function timestamp(): string { return localTimestamp(); }
 function text(value: unknown): string { return String(value); }
 function nullable(value: unknown): string | undefined { return value === null || value === undefined ? undefined : String(value); }
 function nullableNull(value: unknown): string | null { return value === null || value === undefined ? null : String(value); }

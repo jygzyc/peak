@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { initializePeakPaths } from "./config/paths.js";
 import { loadTaskConfig } from "./config/task-config.js";
@@ -7,6 +10,19 @@ import { GraphHttpServer } from "./graph/http-server.js";
 import { ProjectStoreRegistry } from "./graph/project-store-registry.js";
 import { AgentRuntime } from "./runtime/agent-runtime.js";
 import { serveDashboard } from "./ui/dashboard.js";
+
+/** 版本号以代码根目录的 version 文件为准（打包时随 dist 一起发布）。 */
+function packageVersion(): string {
+  const moduleDir = dirname(fileURLToPath(import.meta.url));
+  const candidates = [join(moduleDir, "..", "version"), join(moduleDir, "version")];
+  for (const path of candidates) {
+    try {
+      const value = readFileSync(path, "utf8").trim();
+      if (value) return value;
+    } catch { /* try next */ }
+  }
+  throw new Error(`version file not found (expected at ${join(moduleDir, "..", "version")})`);
+}
 
 interface ServerOptions {
   host: string;
@@ -20,47 +36,55 @@ interface RunOptions extends ServerOptions {
   installSkills: boolean;
 }
 
-const program = new Command().name("peak").description("Distributed Graph agent runtime");
+const program = new Command()
+  .name("peak")
+  .description("Peak — HTTP-native distributed Graph agent runtime")
+  .version(packageVersion());
 
 program.command("run")
+  .description("Create or attach Board Projects and run Plan / Supervise / Execute until SIGINT/SIGTERM")
   .argument("[board-directory]", "Board directory containing task.json", ".")
-  .option("--project <name>", "Run only one configured Project by name; defaults to the full Board")
-  .option("--host <host>", "HTTP host", "127.0.0.1")
-  .option("--port <port>", "HTTP port", "0")
-  .option("--token <token>")
-  .option("--peak-home <directory>")
-  .option("--no-install-skills")
+  .option("--project <name>", "Run only this configured Project by name; default runs the full Board")
+  .option("--host <host>", "HTTP host (non-loopback requires --token)", "127.0.0.1")
+  .option("--port <port>", "HTTP port (0 = ephemeral)", "0")
+  .option("--token <token>", "Bearer token required for every /api/* request")
+  .option("--peak-home <directory>", "Peak home directory (default: ~/.peak or PEAK_HOME)")
+  .option("--no-install-skills", "Skip Board Skill installation")
   .action((taskDirectory: string, options: RunOptions) => run(taskDirectory, options));
 
 program.command("resume")
-  .argument("<project-id>")
+  .description("Attach one persisted Project by UUID and validate its configured Goal")
+  .argument("<project-id>", "UUID of the persisted Project to attach")
   .argument("[board-directory]", "Board directory containing task.json", ".")
   .option("--project <name>", "Configured Project name when matching is ambiguous")
-  .option("--host <host>", "HTTP host", "127.0.0.1")
-  .option("--port <port>", "HTTP port", "0")
-  .option("--token <token>")
-  .option("--peak-home <directory>")
-  .option("--no-install-skills")
+  .option("--host <host>", "HTTP host (non-loopback requires --token)", "127.0.0.1")
+  .option("--port <port>", "HTTP port (0 = ephemeral)", "0")
+  .option("--token <token>", "Bearer token required for every /api/* request")
+  .option("--peak-home <directory>", "Peak home directory (default: ~/.peak or PEAK_HOME)")
+  .option("--no-install-skills", "Skip Board Skill installation")
   .action((projectId: string, taskDirectory: string, options: RunOptions) => run(taskDirectory, options, projectId));
 
 program.command("serve")
-  .description("Serve the Graph UI and API until interrupted")
-  .option("--host <host>", "HTTP host", "127.0.0.1")
+  .description("Serve the persisted Graph API and bundled Web UI; no scheduler or workers")
+  .option("--host <host>", "HTTP host (non-loopback requires --token)", "127.0.0.1")
   .option("--port <port>", "HTTP port", "8000")
-  .option("--token <token>")
-  .option("--peak-home <directory>")
+  .option("--token <token>", "Bearer token required for every /api/* request")
+  .option("--peak-home <directory>", "Peak home directory (default: ~/.peak or PEAK_HOME)")
   .action((options: ServerOptions) => serve(options));
 
 program.command("init")
+  .description("Scaffold a new Board directory with an empty task.json")
   .argument("[board-directory]", "Board directory to initialize", ".")
   .action((directory: string) => {
     const paths = initializeTaskDirectory(directory);
     process.stdout.write(`created: ${paths.configPath}\n`);
   });
 
-program.command("workers").action(() => {
-  process.stdout.write(`${JSON.stringify({ workerTypes: ["opencode", "codex", "pi", "claude-code"], taskTypes: ["plan", "supervise", "execute"] }, null, 2)}\n`);
-});
+program.command("workers")
+  .description("List supported Worker and task types")
+  .action(() => {
+    process.stdout.write(`${JSON.stringify({ workerTypes: ["opencode", "codex", "pi", "claude-code"], taskTypes: ["plan", "supervise", "execute"] }, null, 2)}\n`);
+  });
 
 await program.parseAsync();
 
@@ -85,7 +109,9 @@ async function run(taskDirectory: string, options: RunOptions, projectId?: strin
     ].join("\n"));
     for (const project of projects) {
       void runtime.wait(project.id).then((finished) => {
-        process.stdout.write(`[peak] project status: ${finished.title} (${finished.id}) ${finished.status}; web server remains available\n`);
+        const lines = [`[peak] project status: ${finished.title} (${finished.id}) ${finished.status}; web server remains available`];
+        for (const deliverable of finished.deliverables) lines.push(`[peak] deliverable: ${deliverable}`);
+        process.stdout.write(`${lines.join("\n")}\n`);
       }).catch((error: unknown) => {
         monitorError = error;
         lifecycle.request();

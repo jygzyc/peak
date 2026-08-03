@@ -58,6 +58,14 @@ const EXTERNAL = [
 ];
 
 try {
+  if (mode !== "archive") await step("check scripts", () => {
+    const result = spawnSync(process.execPath, [join(root, "scripts", "check-scripts.mjs")], {
+      cwd: root,
+      stdio: "inherit",
+    });
+    if (result.status !== 0) process.exit(result.status ?? 1);
+  });
+
   if (mode !== "archive") await step("typecheck", () => {
     const npm = npmInvocation(["run", "typecheck"]);
     const result = spawnSync(npm.command, npm.args, {
@@ -140,6 +148,18 @@ try {
     }
   });
 
+  if (mode !== "prepare") await step("sync version", () => {
+    // version 文件是唯一版本来源；npm pack 读取 package.json，因此先同步。
+    const fileVersion = readFileSync(join(root, "version"), "utf8").trim();
+    const packageJsonPath = join(root, "package.json");
+    const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf-8"));
+    if (packageJson.version !== fileVersion) {
+      packageJson.version = fileVersion;
+      writeFileSync(packageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`);
+      process.stdout.write(`[pack] version synced to ${fileVersion}\n`);
+    }
+  });
+
   if (mode !== "prepare") await step("npm pack", () => {
     rmSync(outDir, { recursive: true, force: true });
     mkdirSync(outDir, { recursive: true });
@@ -189,7 +209,7 @@ try {
     const bundleBytes = statSync(distEntry).size;
     const manifest = {
       name: entry.name,
-      version: entry.version,
+      version: entry.version, // 与 version 文件同步（npm pack 前已同步 package.json）
       fileName,
       size: bytes.length,
       unpackedSize: entry.unpackedSize,

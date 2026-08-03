@@ -5,7 +5,10 @@
   "type": "module",
   "files": [
     "dist",
+    "version",
+    "RELEASE.md",
     "README.md",
+    "README_zh.md",
     "AGENTS.md"
   ],
   "bin": {

@@ -2,7 +2,7 @@
 
 Peak 是基于分布式证明图（proof Graph）的通用 Agent 运行时。每个 Project 是独立 Graph 分片，Project 之间通过 `FactRef` 组成证明链。Graph、调度、Worker、Federation、存储和 Web UI 都保持领域无关；具体任务方法只通过 Skill 提供。运行时为 ESM，要求 Node.js `>=22.19.0`。
 
-本文描述 Peak 的架构边界与设计原理。Graph 数据类型、HTTP API、任务协议 JSON 合同、SQLite 模式、持久化布局与各操作的数据流见 [interfaces.md](interfaces.md)。
+本文描述 Peak 的架构边界与设计原理。Graph 数据类型、HTTP API、任务协议 JSON 合同、SQLite 模式、持久化布局与各操作的数据流见 [data-flow.md](data-flow.md)。
 
 ## 1. 设计目标
 
@@ -13,7 +13,7 @@ Peak 是基于分布式证明图（proof Graph）的通用 Agent 运行时。每
 - HTTP API 是 Graph 的唯一在线读写接口，Graph 与 `GraphHttpServer` 绑定；
 - 运行时内部也必须经 loopback HTTP 通过 `GraphClient` 读写 Graph，不直接访问 SQLite 或 Artifact store；
 - Web UI 是可选、可替换的展示与人工操作客户端，不属于 Graph 协议，Graph 正确性不依赖 UI；
-- Worker 只接收 Prompt（内含不可变 Graph JSON 文件路径），不接触 Graph/store 对象、SQLite 路径、Server URL/Token、HTTP 凭据或 `FederationBus`；
+- Worker 只接收按阶段组装的只读 Graph JSON 渲染进 Prompt 文本（快照另存到 `logs/graph-*.json`），不接触 Graph/store 对象、SQLite 路径、Server URL/Token、HTTP 凭据或 `FederationBus`；
 - 领域能力只来自 Skill，不使用 Workflow；
 - 内置 Graph Supervisor 是固定控制协议，只审视图并提出 Hint；
 - 执行、取消、Worker 负载与冷却、Reservation、调度 checkpoint 和短期 Agent session 只存在于内存。
@@ -58,7 +58,7 @@ flowchart TB
 2. 运行时内部也必须通过 `GraphClient` 经 loopback HTTP 读写 Graph，不能直接调用 SQLite 或 Artifact store。
 3. 一个 Board 通过 `board.projects` 声明非空 Project 集合；Runtime 创建缺少 id 的 Project并将 UUID 回写 `task.json`，已有 id 则附加并复用其 Graph。
 4. `ProjectStoreRegistry` 为每个 UUID Project 打开独立的 SQLite 和 Artifact shard，不存在共享数据库或内存数据库。
-5. Worker 只接收 Prompt；Prompt 中包含一个不可变 Graph JSON 文件路径。Worker 不获得 Graph/store 对象、SQLite 路径、Server URL、Token、HTTP 凭据或 `FederationBus`。
+5. Worker 只接收 Prompt；Prompt 文本内含按阶段组装的只读 Graph JSON（不可变快照同时写入 `logs/graph-*.json`）。Worker 不获得 Graph/store 对象、SQLite 路径、Server URL、Token、HTTP 凭据或 `FederationBus`。
 6. Web UI 只是可替换的 HTTP 客户端。Server 从 `/` 提供内置页面仅是发布便利，Graph 正确性不依赖 UI。
 7. 执行、取消、Worker 负载与冷却、Reservation、调度 checkpoint 和短期 Agent session 都只存在于内存中。
 
@@ -93,7 +93,7 @@ Board 自身没有 description、Goal、Graph 或完成状态。每个 Project �
 
 ### 4.2 Fact 不可变、叶节点与 description 优先
 
-Fact 一经创建即不可修改，没有可变状态；变化和纠错通过新 Fact 表达。当前叶 Fact 是尚未作为 source 产出更晚本地 Fact 的普通 Fact。一个 Intent conclusion 产出下游 Fact 后，其本地 source Fact 不再属于当前叶节点；下游 Fact 代表更可信的当前证明状态。`goal` 是保留 target，不属于 source 叶节点。叶 Fact 可以描述正确事实但仍缺少完成 Goal 所需的前置条件，Plan 可从该叶节点继续建立 Intent。每个普通 Fact 都必须有非空且不超过 UTF-8 1 KiB 的 `description`：它只承载可独立理解的简明摘要，不能只写“见附件”或文件路径。详细分析、证据、表格和报告必须放入 Artifact；Artifact 不能代替必填摘要，也不用于保存与 Fact 无关的工作区文件。Intent description 使用 UTF-8 2 KiB 上限，Hint content 和其他持久化短文本使用 1 KiB 上限；保留的 `origin` 与 `goal` description 使用最大的 4 KiB 上限。
+Fact 一经创建即不可修改，没有可变状态；变化和纠错通过 `current leaf Fact(s) -> Intent -> new Fact` 表达。当前叶 Fact 是尚未作为 source 产出更晚本地 Fact 的节点；一个 concluded Intent 产出下游 Fact 后，其本地 source Fact 保留为历史节点但不再是 Leaf，新 Fact 成为当前状态的一部分。DAG 支持从一个 Leaf 分叉、用新 Fact 无状态更新旧 Leaf，以及把多个 Leaf 合并为一个新 Fact。`goal` 是保留 target，不属于 source 叶节点。创建普通 Intent 或 completion 时，所有 source 必须仍是各自 Project 的当前 Leaf；历史非 Leaf source 在 Server 边界被拒绝。每个普通 Fact 都必须有非空且不超过 UTF-8 1 KiB 的 `description`；它必须独立表达结论。Fact 可以不带 Artifact；只有详细内容需要文件时才绑定一个不可变、内容寻址的单文件 Artifact。一个 Intent 表达一次朝 Goal 前进的原子状态转换并只产生一个 Fact；多 Leaf 综合只有在不继续采集证据并只产出一个有界结果时才算原子任务。
 
 ### 4.3 普通 Intent 与 conclusion
 
@@ -111,11 +111,11 @@ Intent 的执行产出的长结果属于结果 Fact，Intent 本身不保存 wor
 
 完成是当前 Project 的本地、原子、即时操作。Server 校验所有 proof `FactRef` 存在、无重复、不引用 `goal`，且跨 Project 引用没有越过 Federation scope，随后在一个事务中：创建从这些 proof FactRef 指向当前 Project `goal` 的唯一完成 Intent，并将 Project 状态改为 `completed`。
 
-完成不等待其他 Project 完成，也不等待尚未消费的 Federation delivery。完成后调度器取消该 Project 的活动内存执行，但 Graph 仍可读取和导出。
+完成不等待其他 Project 完成，也不等待尚未消费的 Federation delivery。完成后调度器取消该 Project 的活动内存执行，但 Graph 仍可读取和导出。完成时，Runtime 把 completion source Fact 中带 `filename` 的 Artifact 内容物化到 `task.json` 同目录（即最终 Goal 交付物，文件名基于内容、不包含图节点编号），供用户直接使用。
 
 ### 4.5 Hint 不参与因果
 
-Hint 是独立的 Graph 输入，不参与因果边，也不自动 resume 或 reopen Project。它可被添加到 active、stopped 或 completed Project；trim 后内容相同的 Hint 被视为重复并返回冲突。Reopen 只适用于 completed Project：它删除当前完成 Intent，记录外部反馈为一个新的不可变本地 Fact，并创建一条从 `origin` 指向该 Fact、描述为 `External feedback` 的已 conclusion Intent，然后把 Project 改回 `active`。历史普通 Fact 和 Intent 不被修改。
+Hint 是独立的 Graph 输入，不参与因果边，也不自动 resume 或 reopen Project。它可被添加到 active、stopped 或 completed Project；trim 后内容相同的 Hint 被视为重复并返回冲突。Reopen 只适用于 completed Project：它删除当前 completion Intent，以当前全部本地 Leaf Facts 为 source，记录外部反馈为一个新的不可变本地 Fact，并创建描述为 `External feedback` 的 concluded Intent，然后把 Project 改回 `active`。原 Leaf 保留为历史节点，反馈 Fact 成为新的当前 Leaf；不会错误地从已经非 Leaf 的 `origin` 重新分叉。
 
 ## 5. Runtime 阶段设计
 
@@ -131,25 +131,27 @@ flowchart LR
   end
 ```
 
-内置 Prompt 位于 `src/runtime/prompts/`，Board 不能覆盖。
+内置英文 Prompt 位于 `src/runtime/prompts/`，Board 不能覆盖其阶段合同和安全边界。`task.json` 可为 Plan、Supervise 各配置一个可选 `customProfile`，并为 Execute 配置多个可选 `customProfiles`。每项都是 `{description,prompt}`：description 向 AI 解释何时应该注入该 prompt；定制内容只作为阶段附加指令。Plan 选中的 Execute profile 只在 Intent 上持久化 description 和 `SHA-256(description + "#" + prompt)` 的前 16 位十六进制签名；Fact、Hint、FactRef 不保存 profile。
 
 ### 5.1 Plan
 
-Plan 不读取完整历史 Graph，而读取当前 proof frontier：本地叶 Fact、open Intent、Hints、待处理 Federation 叶 FactRef、已解析的远端 Fact 和相关 Artifact 输入。Runtime 以纯代码构造 `availableFactRefs`，每项已包含规范的 `projectId`、`factId` 和 `description`；Plan 只选择并原样返回完整引用，不负责获取、补全、删除或改写引用字段。已经产出下游本地 Fact 的上游 Fact 被省略；下游叶 Fact 作为更可信的当前状态。Plan 只能引用 Snapshot 中可见的本地叶 Fact 或 pending Federation 叶 FactRef，不执行 Intent、不搜索、不直接写 store。`complete` 通过 HTTP 原子完成当前 Project。成功处理后，当前 pending Federation references 记录为 handled。
+Plan 不读取完整历史 Graph，而由 Runtime 通过 `GraphClient` 组装只读 `PlanGraphView`：完整 Source Fact、Goal Fact，以及当前 Project、全部本地 Leaf Facts、全部 open Intents、全部未消费 Hints、全部 pending Federation 叶 FactRefs。这个规划视图不做 256 KiB 裁剪；Plan 不得在缺少部分当前状态时规划。每个新 Intent 必须从一个或多个当前 Leaf 出发，通过分叉、无状态更新或合并产出恰好一个更接近 Goal 的 Fact，并避开 open Intent 已覆盖的转换。HTTP Server 再次校验 source 仍是当前 Leaf；`complete` 同样只能从当前 Leaf 原子完成 Project。
+
+Plan 的目标是把证明长成**多层级 DAG**：优先从最相关的现有当前叶继续深挖（把既有研究线推向下一层），同一轮只创建少量（通常 1–3 个）聚焦的深化型 Intent，让前沿逐层前进；**深度不限**——一条线可以延伸到 Goal 所需任意层级。只有不存在可延伸的现有叶时才从 `origin` 开新分支，避免一轮从 `origin` 全面铺开成单层星型树。
 
 ### 5.2 Supervise
 
-Supervise 是固定控制协议，按配置周期独立审视完整 Graph，每轮最多通过 Hint endpoint 提交一个 Hint，也可以 noop。Supervise 不能创建 Fact/Intent、不能完成或 reopen Project、也不能使用工具执行任务。与已有 Hint 内容重复时不重复写入。新 Hint 进入 Graph 后触发下一轮 Plan。stopped/completed Project 不再监督。
+Supervise 是固定控制协议。Runtime 通过 `GraphClient` 组装包含当前 Project、Facts、Intents 和 Hints 的只读 `SuperviseGraphView`；每轮最多通过 Hint endpoint 提交一个 Hint，也可以 noop。Supervise 不能创建 Fact/Intent、不能完成或 reopen Project、也不能使用工具执行任务。与已有 Hint 内容重复时不重复写入。新 Hint 进入 Graph 后触发下一轮 Plan。stopped/completed Project 不再监督。
 
 ### 5.3 Execute
 
-Execute 针对一个 `to: null` 的 Intent，解析其全部 FactRef source，物化 source Artifact，执行后产出恰好一个本地不可变 Fact。Execute 失败不会创建伪 Fact 或持久化失败记录；Intent 保持 open，后续 tick 可以重试。
+Execute 针对一个 `to: null` 的原子 Intent。Runtime 通过 `GraphClient` 解析全部 FactRef，并组装包含当前 Project、Intent 和 resolved sources 的只读 `ExecuteGraphView`。没有 Artifact 的 source 直接以 `artifact: null` 表示；已有 source Artifact 不下载、不复制，Graph Server 返回规范本地 `inputPath` 与 `readOnly: true`，Runtime 在 worker 执行前后校验文件类型、大小和 SHA-256。Intent 的 profile description 和 digest 必须仍与当前配置匹配，随后才注入对应 prompt。**Worker 不被分配 workspace、不写任何文件**：结果需要文件时在合同内联返回 `{filename, mediaType, content}`（filename 是基于内容的输出名，绝不使用 i001/f001 等图节点编号），Runtime 把内容上传到 Project 的 `artifacts/`（内容寻址），并把该 Artifact 绑定到结果 Fact。执行成功产出恰好一个本地不可变 Fact，并可选择绑定零或一个单文件 Artifact；Fact 不携带 profile。失败不会创建伪 Fact或持久化失败记录，Intent 保持 open，后续 tick 可以重试。
 
 ### 5.4 Finalize
 
 Finalize **不是任务类型**。当 Execute 已实际启动，且 Worker 失败、timeout 或输出合同无效时，Runtime 可使用同一 Worker 的 resumable session 执行一次 Finalize。还必须满足：不是外部取消、AbortSignal 未中止、Project 仍为 active、Intent 仍为 open、Worker 返回了兼容的 `SessionRef`。
 
-Finalize 使用独立的不可变 JSON 和固定 Prompt，要求停止探索与工具调用，只总结 session 中已确认结果。它返回与 Execute 完全相同的 Fact 合同，不创建新的 Graph operation 类型。
+Finalize 复用 Execute 的 execution ID、Agent session、Graph view、selected profile 和 Fact 输出合同，并记录 `boundExecution` 指向 Execute snapshot。它只用于把已经开始但返回失败或格式不合格的 Execute 整理为严格结果，不创建新 Intent，也不创建新的 Graph operation 类型；成功 conclusion 的 actor 为 `finalize:<execution-id>`。
 
 ### 5.5 阶段超时
 
@@ -172,13 +174,13 @@ Finalize 使用独立的不可变 JSON 和固定 Prompt，要求停止探索与�
 
 Plan checkpoint 关注 Fact 数、Hint 数、open Intent 从有到无的变化和 pending Federation 数。首次 tick 必须 Plan。Supervise 使用内存计时器（`GraphSupervisor.nextAt`）按 `phase.supervise.intervalMs` 轮询，不写 Graph cursor；Runtime 重启后 active Project 可立即监督。Supervise 与其他任务共享全局和 Project 并发配额。
 
-全局调度由以下配置限制：
+全局调度由以下配置限制（均可选，未配置时使用默认值）：
 
-- `maxConcurrent`：全局活动 execution 上限；
-- `maxRunningProjects`：每 tick 参与调度的 Project 上限；
-- `maxProjectConcurrent`：单 Project 活动 execution 上限；
-- `refillPerTick`：单 Project 每 tick 最多补充数量；
-- `intervalMs`：scheduler tick 周期。
+- `maxConcurrent`（默认 4）：全局活动 execution 上限；
+- `maxRunningProjects`（默认 4）：每 tick 参与调度的 Project 上限；
+- `maxProjectConcurrent`（默认 2）：单 Project 活动 execution 上限；
+- `refillPerTick`（默认 4）：单 Project 每 tick 最多补充数量；
+- `intervalMs`（默认 3000）：scheduler tick 周期。
 
 Project 间使用轮转 cursor。Graph 中不持久化 claim；防止同一阶段或 Intent 被同一 Runtime 重复调度依赖内存 `ExecutionRegistry`。Project 进入 stopped/completed 后取消其活动 execution。Runtime 重启后 open Intent 重新可调度。
 
@@ -206,7 +208,7 @@ Driver 只处理对应工具的调用和输出/session 差异，不读 Graph、�
 CLI Worker 通过 `ProcessRunner`：
 
 - 参数使用 argv 数组，Prompt 通过 stdin；
-- cwd 固定为 `board.workspace`；
+- cwd 固定为 Board 目录（`task.json` 所在目录）；Worker 不被分配 workspace，也不写文件；
 - 环境继承当前进程并增加 `PEAK_AGENT_ACTIVE=1`；
 - 每次调用启动一个独立进程；
 - timeout/cancellation 终止整个进程树（Windows 使用 `taskkill /T /F`，POSIX 使用 detached process group）；
@@ -239,11 +241,13 @@ peak serve [--host <host>] [--port <port>] [--token <token>] [--peak-home <dir>]
 peak workers
 ```
 
-- `run` 默认处理 `board.projects` 的全部配置项：空 id 创建并原子回写 UUID，已有 id 直接附加；`--project <name>` 可只启动一个；默认端口为 `0`。
-- `resume` 按 UUID 附加持久化 Project并校验配置 Goal；匹配不唯一时要求 `--project <name>`；默认端口为 `0`。
-- `serve` 只启动持久化 Graph API 和可选 UI，不启动 Scheduler/Worker；默认端口为 `8000`。
-- `workers` 输出支持的 Worker type 和 task type。
-- `run` / `resume` 在 Project 变为 stopped/completed 后仍保持 HTTP Server 和 Scheduler 存活，允许 API 客户端（含内置 UI）检视状态、添加 Hint、改变状态和显式 reopen；只在 `SIGINT`、`SIGTERM` 或 fatal monitor error 时退出。
+- `run` 创建或附加 Board 的全部配置 Project 并启动 Plan / Supervise / Execute：空 id 创建并原子回写 UUID，已有 id 直接附加；`--project <name>` 可只启动一个；默认端口为 `0`（临时端口）。
+- `resume` 按 UUID 附加一个持久化 Project 并校验配置 Goal；匹配不唯一时要求 `--project <name>`；默认端口为 `0`。
+- `serve` 只启动持久化 Graph API 和内置 Web UI，不启动 Scheduler/Worker；默认端口为 `8000`。
+- `init` 脚手架一个带空 `task.json` 的 Board 目录（不创建 `skills/`）。
+- `workers` 输出支持的 Worker type（`opencode`/`codex`/`pi`/`claude-code`）和 task type（`plan`/`supervise`/`execute`）。
+- 通用 server 选项：`--host`（非 loopback 必须 `--token`）、`--port`、`--token`（所有 `/api/*` 请求的 Bearer）、`--peak-home`（默认 `~/.peak` 或 `PEAK_HOME`）。
+- `run` / `resume` 在 Project 变为 stopped/completed 后仍保持 HTTP Server 和 Scheduler 存活，允许 API 客户端（含内置 UI）检视状态、添加 Hint、改变状态和显式 reopen；Project 完成时打印 `[peak] project status: ... completed` 与物化到 `task.json` 同目录的 `[peak] deliverable: <path>`；只在 `SIGINT`、`SIGTERM` 或 fatal monitor error 时退出。
 
 Runtime shutdown 顺序保证：停止调度、取消 execution、dispose 保留的 Pi session、清理临时 Skill 链接、关闭 HTTP Server，最后关闭 SQLite handle。
 
@@ -257,10 +261,9 @@ UI 不得直接读取文件系统、SQLite 或 Runtime 内存，也不得改变 
 
 - 所有 Project ID、FactRef、Artifact hash 和 Graph JSON shape 必须在 Server 边界验证；
 - 文件 URL 路径使用 `fileURLToPath()`，不能依赖 `URL.pathname`；
-- 所有 workspace/Artifact 路径必须经过 resolve/realpath/boundary/symlink 检查；
+- 所有 Artifact/交付物路径必须经过 resolve/realpath/boundary/symlink 检查；
 - Store handle 必须在删除 Project 或测试临时目录前关闭；
 - Graph operation 必须通过 Server 校验后才写日志；
 - Worker 不可信输出必须经过阶段合同解析和 Server 二次验证；
-- Board 不能注入内置 Prompt、HTTP credential、Provider credential 或直接 store 路径；
+- Board 不能覆盖内置 Prompt 合同，也不能注入 HTTP credential、Provider credential 或直接 store 路径；task 中的 phase-scoped custom Prompt 只能附加分析指令；
 - 所有 `/api/*` 请求在配置 Token 时必须带 `Authorization: Bearer <token>`；`/` 不要求 Token，使浏览器可以先加载 UI shell；绑定非 loopback host 时必须配置 Token。
-

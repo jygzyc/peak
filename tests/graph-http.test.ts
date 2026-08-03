@@ -4,9 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { DatabaseSync } from "node:sqlite";
+import { customProfileDigest } from "../dist/config/custom-profile.js";
 import { GraphClient, GraphClientError } from "../dist/graph/graph-client.js";
 import { GraphHttpServer } from "../dist/graph/http-server.js";
 import { ProjectStoreRegistry } from "../dist/graph/project-store-registry.js";
+import { leafFacts } from "../dist/graph/types.js";
 import { serveDashboard } from "../dist/ui/dashboard.js";
 
 test("the optional UI composes without becoming a Graph Server dependency", async () => {
@@ -17,7 +19,10 @@ test("the optional UI composes without becoming a Graph Server dependency", asyn
   try {
     const response = await fetch(server.baseUrl);
     assert.equal(response.status, 200);
-    assert.match(await response.text(), /id="hint-form"/);
+    const html = await response.text();
+    assert.match(html, /id="hint-form"/);
+    assert.match(html, /Custom profile/);
+    assert.doesNotMatch(html, /kind-filter|Prompt kind/);
   } finally {
     await server.stop();
     registry.close();
@@ -46,6 +51,11 @@ test("HTTP is the complete persistent Graph protocol", async () => {
       (error: unknown) => error instanceof GraphClientError && error.status === 400 && /4 KiB/.test(error.message),
     );
     const a = await graph.createProject({ title: "A", target: "origin A", goal: "goal A", scope: "shared" });
+    const reserved = await graph.getProject(a.id);
+    assert.match(reserved.project.createdAt, /^\d{8}T\d{6}\.\d{3}$/);
+    assert.ok(reserved.facts.every((fact) => /^\d{8}T\d{6}\.\d{3}$/.test(fact.createdAt)));
+    assert.ok(reserved.facts.every((fact) => fact.artifact === null));
+    assert.ok(reserved.facts.every((fact) => !("kind" in fact) && !("customProfile" in fact)));
     const b = await graph.createProject({ title: "B", target: "origin B", goal: "goal B", scope: "shared" });
     const c = await graph.createProject({ title: "C", target: "origin C", goal: "goal C", scope: "other" });
     const d = await graph.createProject({ title: "D", target: "origin D", goal: "goal D" });
@@ -58,7 +68,6 @@ test("HTTP is the complete persistent Graph protocol", async () => {
     assert.equal(hint.creator, "human:web");
     assert.equal((await graph.getProject(a.id)).hints[0]?.content, "Verify the web entry point");
     const report = join(root, "report.md");
-    const downloaded = join(root, "downloaded.md");
     writeFileSync(report, "full result\n");
     const artifact = await graph.uploadArtifact(a.id, report, "text/markdown");
     await assert.rejects(
@@ -67,18 +76,40 @@ test("HTTP is the complete persistent Graph protocol", async () => {
       }),
       (error: unknown) => error instanceof GraphClientError && error.status === 400 && /2 KiB/.test(error.message),
     );
+    const profile = { description: "Use for primary-source research.", prompt: "Collect primary evidence." };
     const intent = await graph.createIntent(a.id, {
-      from: [{ projectId: a.id, factId: "origin", description: "origin A" }], description: "Produce result", createdBy: "test",
+      from: [{ projectId: a.id, factId: "origin", description: "origin A" }],
+      customProfile: profile.description,
+      customProfileDigest: customProfileDigest(profile),
+      hintIds: [hint.id], description: "Produce result", createdBy: "test",
     });
+    assert.equal(intent.customProfile, profile.description);
+    assert.equal(intent.customProfileDigest, customProfileDigest(profile));
+    assert.deepEqual(intent.hintIds, [hint.id]);
+    assert.equal((await graph.getProject(a.id)).hints[0]?.consumedByIntentId, intent.id);
     await assert.rejects(
       graph.conclude(a.id, intent.id, { description: "安".repeat(342), artifact, concludedBy: "test" }),
       (error: unknown) => error instanceof GraphClientError && error.status === 400 && /1 KiB/.test(error.message),
     );
     const concluded = await graph.conclude(a.id, intent.id, { description: "Result summary", artifact, concludedBy: "test" });
-    await graph.downloadArtifact(a.id, artifact.sha256, downloaded);
-    assert.equal(readFileSync(downloaded, "utf8"), "full result\n");
+    assert.ok(!("kind" in concluded.fact) && !("customProfile" in concluded.fact));
     const resultRef = { projectId: a.id, factId: concluded.fact.id, description: concluded.fact.description };
-    assert.equal((await graph.resolveFactRefs(b.id, [resultRef]))[0]?.fact.description, "Result summary");
+    await assert.rejects(
+      graph.createIntent(a.id, {
+        from: [{ projectId: a.id, factId: "origin", description: "origin A" }], description: "Use historical source", createdBy: "test",
+      }),
+      (error: unknown) => error instanceof GraphClientError && error.status === 409 && /not a current leaf/.test(error.message),
+    );
+    await assert.rejects(
+      graph.complete(a.id, {
+        from: [{ projectId: a.id, factId: "origin", description: "origin A" }], description: "Complete from history", completedBy: "test",
+      }),
+      (error: unknown) => error instanceof GraphClientError && error.status === 409 && /not a current leaf/.test(error.message),
+    );
+    const [resolved] = await graph.resolveFactRefs(b.id, [resultRef]);
+    assert.equal(resolved?.fact.description, "Result summary");
+    assert.equal(resolved?.fact.artifact?.readOnly, true);
+    assert.equal(readFileSync(resolved!.fact.artifact!.inputPath, "utf8"), "full result\n");
     await assert.rejects(
       graph.resolveFactRefs(b.id, [{ ...resultRef, description: "tampered" }]),
       (error: unknown) => error instanceof GraphClientError && error.status === 400 && /description mismatch/.test(error.message),
@@ -90,10 +121,25 @@ test("HTTP is the complete persistent Graph protocol", async () => {
     const unscopedIntent = await graph.createIntent(d.id, {
       from: [{ projectId: d.id, factId: "origin", description: "origin D" }], description: "Produce reusable Board evidence", createdBy: "test",
     });
-    const unscopedFact = await graph.conclude(d.id, unscopedIntent.id, { description: "Reusable evidence", concludedBy: "test" });
+    const unscopedFact = await graph.conclude(d.id, unscopedIntent.id, { description: "Reusable evidence", artifact: null, concludedBy: "test" });
+    assert.equal(unscopedFact.fact.artifact, null);
+    const [resolvedWithoutArtifact] = await graph.resolveFactRefs(e.id, [{
+      projectId: d.id, factId: unscopedFact.fact.id, description: "Reusable evidence",
+    }]);
+    assert.equal(resolvedWithoutArtifact?.fact.artifact, null);
     await graph.createIntent(e.id, {
       from: [{ projectId: d.id, factId: unscopedFact.fact.id, description: "Reusable evidence" }], description: "Reuse sibling evidence", createdBy: "test",
     });
+    const updateIntent = await graph.createIntent(d.id, {
+      from: [{ projectId: d.id, factId: unscopedFact.fact.id, description: "Reusable evidence" }], description: "Advance reusable evidence", createdBy: "test",
+    });
+    await graph.conclude(d.id, updateIntent.id, { description: "Updated reusable evidence", artifact: null, concludedBy: "test" });
+    await assert.rejects(
+      graph.createIntent(e.id, {
+        from: [{ projectId: d.id, factId: unscopedFact.fact.id, description: "Reusable evidence" }], description: "Use stale external evidence", createdBy: "test",
+      }),
+      (error: unknown) => error instanceof GraphClientError && error.status === 409 && /not a current leaf/.test(error.message),
+    );
     await assert.rejects(
       graph.createIntent(c.id, { from: [resultRef], description: "bad scope", createdBy: "test" }),
       (error: unknown) => error instanceof GraphClientError && error.status === 400,
@@ -105,12 +151,36 @@ test("HTTP is the complete persistent Graph protocol", async () => {
     await graph.complete(b.id, { from: [resultRef], description: "Goal proven", completedBy: "test" });
     assert.equal((await graph.getProject(b.id)).project.status, "completed");
     const open = (await graph.getProject(b.id)).intents.find((item) => item.to === null)!;
+    const latePath = join(root, "late.md");
+    writeFileSync(latePath, "late\n");
+    const lateArtifact = await graph.uploadArtifact(b.id, latePath, "text/markdown");
     await assert.rejects(
-      graph.conclude(b.id, open.id, { description: "late", concludedBy: "test" }),
+      graph.conclude(b.id, open.id, { description: "late", artifact: lateArtifact, concludedBy: "test" }),
       (error: unknown) => error instanceof GraphClientError && error.status === 409,
     );
     await assert.rejects(graph.deleteProject(a.id), (error: unknown) => error instanceof GraphClientError && error.status === 409);
-    assert.match(readFileSync(join(root, a.id, "logs", "main.log"), "utf8"), /intent_concluded/);
+
+    const reopenProject = await graph.createProject({ title: "reopen", target: "reopen origin", goal: "reopen goal" });
+    const beforeFeedback = await graph.createIntent(reopenProject.id, {
+      from: [{ projectId: reopenProject.id, factId: "origin", description: "reopen origin" }], description: "Establish current state", createdBy: "test",
+    });
+    const beforeFeedbackFact = await graph.conclude(reopenProject.id, beforeFeedback.id, {
+      description: "Current state before feedback", artifact: null, concludedBy: "test",
+    });
+    await graph.complete(reopenProject.id, {
+      from: [{ projectId: reopenProject.id, factId: beforeFeedbackFact.fact.id, description: beforeFeedbackFact.fact.description }],
+      description: "Initial goal proof", completedBy: "test",
+    });
+    const reopened = await graph.reopen(reopenProject.id, { description: "External correction", creator: "human:test" });
+    const feedbackIntent = reopened.intents.find((item) => item.description === "External feedback")!;
+    assert.deepEqual(feedbackIntent.from, [{
+      projectId: reopenProject.id, factId: beforeFeedbackFact.fact.id, description: beforeFeedbackFact.fact.description,
+    }]);
+    assert.deepEqual(leafFacts(reopened).map((fact) => fact.description), ["External correction"]);
+    const operations = readFileSync(join(root, a.id, "logs", "main.log"), "utf8").trim().split(/\r?\n/)
+      .map((line) => JSON.parse(line) as { at: string; type: string });
+    assert.ok(operations.some((event) => event.type === "intent_concluded"));
+    assert.ok(operations.every((event) => /^\d{8}T\d{6}\.\d{3}$/.test(event.at)));
     const exported = JSON.parse(await graph.exportProject(a.id)) as { project: { id: string } };
     assert.equal(exported.project.id, a.id);
     assert.ok(Array.isArray(JSON.parse(await graph.exportProject(a.id, "timeline"))));
@@ -122,9 +192,17 @@ test("HTTP is the complete persistent Graph protocol", async () => {
     const database = new DatabaseSync(join(root, a.id, "analysis.db"), { readOnly: true });
     const tables = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map((row) => row.name);
     const sourceColumns = database.prepare("PRAGMA table_info(intent_sources)").all().map((row) => row.name);
+    const factColumns = database.prepare("PRAGMA table_info(facts)").all().map((row) => row.name);
+    const intentColumns = database.prepare("PRAGMA table_info(intents)").all().map((row) => row.name);
+    const hintColumns = database.prepare("PRAGMA table_info(hints)").all().map((row) => row.name);
     database.close();
     assert.deepEqual(tables, ["artifacts", "counters", "facts", "hints", "intent_sources", "intents", "project"]);
     assert.ok(sourceColumns.includes("source_description"));
+    assert.equal(factColumns.includes("kind"), false);
+    assert.ok(intentColumns.includes("custom_profile"));
+    assert.ok(intentColumns.includes("custom_profile_digest"));
+    assert.equal(intentColumns.includes("prompt_kind"), false);
+    assert.equal(hintColumns.includes("kind"), false);
   } finally {
     await server.stop();
     registry.close();

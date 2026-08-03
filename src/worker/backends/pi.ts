@@ -65,20 +65,32 @@ export class PiDriver implements WorkerDriver {
     let timedOut = false;
     let cancelled = false;
     const stopSession = (): void => { void session.abort().catch(() => undefined); };
-    const abort = (): void => {
-      cancelled = true;
-      stopSession();
-    };
+    // Gates that always resolve so a hung provider call can never block a
+    // Worker slot forever: the prompt races the timeout and the abort signal.
+    let resolveTimeout!: () => void;
+    const timedOutGate = new Promise<void>((resolve) => { resolveTimeout = resolve; });
+    let resolveAbort!: () => void;
+    const abortedGate = new Promise<void>((resolve) => { resolveAbort = resolve; });
     const timer = setTimeout(() => {
       timedOut = true;
+      resolveTimeout();
       stopSession();
     }, timeoutMs);
     timer.unref?.();
+    const abort = (): void => {
+      cancelled = true;
+      resolveAbort();
+      stopSession();
+    };
     signal?.addEventListener("abort", abort, { once: true });
 
     let error = "";
     try {
-      await session.prompt(prompt, { expandPromptTemplates: false, source: "rpc" });
+      await Promise.race([
+        session.prompt(prompt, { expandPromptTemplates: false, source: "rpc" }),
+        timedOutGate.then(() => Promise.reject(new Error("request timed out"))),
+        abortedGate.then(() => Promise.reject(new Error("cancelled"))),
+      ]);
       error = session.agent.state.errorMessage ?? "";
     } catch (cause) {
       error = errorMessage(cause);

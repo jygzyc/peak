@@ -25,6 +25,7 @@ export class AgentRuntime {
   private projectsDir?: string;
   private firstProjectId?: string;
   private readonly projectIds = new Map<number, string>();
+  private readonly executors = new Map<string, TaskExecutor>();
   private readonly federation = new FederationBus();
   private readonly executions = new ExecutionRegistry();
   private readonly workerResources = new WorkerResources();
@@ -144,6 +145,7 @@ export class AgentRuntime {
       projectDir,
       () => this.executions.cancelProject(project.id),
     );
+    this.executors.set(project.id, executor);
     this.scheduler.add(new ProjectLoop(
       project.id,
       this.config,
@@ -156,11 +158,13 @@ export class AgentRuntime {
     return project;
   }
 
-  async wait(projectId = this.firstProjectId): Promise<ProjectMeta> {
+  async wait(projectId = this.firstProjectId): Promise<ProjectMeta & { deliverables: string[] }> {
     if (!this.client || !projectId) throw new Error("runtime not started");
     while (true) {
       const project = (await this.client.getProject(projectId)).project;
-      if (project.status !== "active") return project;
+      if (project.status !== "active") {
+        return { ...project, deliverables: this.executors.get(projectId)?.deliverables ?? [] };
+      }
       await new Promise((resolveWait) => setTimeout(resolveWait, this.config.scheduler.intervalMs));
     }
   }
@@ -179,6 +183,7 @@ export class AgentRuntime {
     this.projectsDir = undefined;
     this.firstProjectId = undefined;
     this.projectIds.clear();
+    this.executors.clear();
   }
 
   get webUrl(): string {

@@ -27,7 +27,12 @@ examples/**/*.db-wal
 
 # Binary test samples (large; fetch separately)
 examples/*.apk
+.peak*
 
 # Code intelligence cache
 .codegraph/
 .zcode
+.agents/
+
+# Test root created by scripts/run-example.mjs
+.peak_test/

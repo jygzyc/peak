@@ -1,6 +1,7 @@
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { initializeProjectLogsDirectory } from "../config/paths.js";
+import { localTimestamp } from "./api.js";
 import type { FactRef } from "./types.js";
 
 export type FederationReference = FactRef;
@@ -95,7 +96,7 @@ export class FederationBus {
   }
   private log(projectDir: string, event: Record<string, unknown>): void {
     const dir = initializeProjectLogsDirectory(projectDir);
-    appendFileSync(join(dir, "main.log"), `${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`);
+    appendFileSync(join(dir, "main.log"), `${JSON.stringify({ at: localTimestamp(), ...event })}\n`);
   }
   private events(projectDir: string): Array<Record<string, unknown>> {
     const path = join(projectDir, "logs", "main.log");

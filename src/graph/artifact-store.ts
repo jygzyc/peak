@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, createWriteStream, existsSync, lstatSync, renameSync, rmSync } from "node:fs";
+import { chmodSync, createReadStream, createWriteStream, existsSync, lstatSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { once } from "node:events";
 import { join, resolve } from "node:path";
 import type { Readable } from "node:stream";
@@ -13,7 +13,21 @@ export class ArtifactStore {
     this.dir = initializeArtifactDirectory(projectDir);
   }
 
-  async save(input: Readable, mediaType: string, maxBytes: number): Promise<ArtifactRef> {
+  saveBuffer(input: string | Buffer, mediaType: string, filename: string | null = null): ArtifactRef {
+    const buffer = Buffer.isBuffer(input) ? input : Buffer.from(input, "utf8");
+    const sha256 = createHash("sha256").update(buffer).digest("hex");
+    const target = join(this.dir, sha256);
+    if (existsSync(target)) {
+      const existing = lstatSync(target);
+      if (!existing.isFile() || existing.isSymbolicLink()) throw new Error("invalid artifact target");
+    } else {
+      writeFileSync(target, buffer, { flag: "wx" });
+    }
+    chmodSync(target, 0o444);
+    return { path: `artifacts/${sha256}`, sha256, mediaType, sizeBytes: buffer.length, filename };
+  }
+
+  async save(input: Readable, mediaType: string, maxBytes: number, filename: string | null = null): Promise<ArtifactRef> {
     const temporary = join(this.dir, `.${randomUUID()}.tmp`);
     const output = createWriteStream(temporary, { flags: "wx" });
     const hash = createHash("sha256");
@@ -37,7 +51,8 @@ export class ArtifactStore {
       } else {
         renameSync(temporary, target);
       }
-      return { path: `artifacts/${sha256}`, sha256, mediaType, sizeBytes };
+      chmodSync(target, 0o444);
+      return { path: `artifacts/${sha256}`, sha256, mediaType, sizeBytes, filename };
     } catch (error) {
       output.destroy();
       if (!output.closed) await once(output, "close");
@@ -52,9 +67,14 @@ export class ArtifactStore {
     if (!existsSync(path)) throw new Error("artifact not found");
     const stat = lstatSync(path);
     if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("artifact not found");
+    chmodSync(path, 0o444);
     return path;
   }
 
   stream(sha256: string): Readable { return createReadStream(this.path(sha256)); }
-  remove(sha256: string): void { rmSync(join(this.dir, sha256), { force: true }); }
+  remove(sha256: string): void {
+    const path = join(this.dir, sha256);
+    if (existsSync(path)) chmodSync(path, 0o644);
+    rmSync(path, { force: true });
+  }
 }

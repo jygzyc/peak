@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -18,6 +18,8 @@ test("FederationBus delivers unscoped Board references", () => {
     assert.deepEqual(bus.pendingFor("b"), [
       { projectId: "a", factId: "f001", description: "shared Board evidence" },
     ]);
+    const event = JSON.parse(readFileSync(join(a, "logs", "main.log"), "utf8").trim()) as { at: string };
+    assert.match(event.at, /^\d{8}T\d{6}\.\d{3}$/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

@@ -20,7 +20,7 @@ test("config owns configured paths and Board directory initialization", () => {
     assert.ok(existsSync(task.configPath));
     assert.equal(existsSync(join(task.taskDir, "skills")), false);
     const initialized = loadTaskConfig(task.taskDir);
-    assert.equal(initialized.board.workspace, task.taskDir);
+    assert.equal(initialized.taskDir, task.taskDir);
     assert.deepEqual(initialized.board.skills, []);
     assert.deepEqual(initialized.board.projects, [
       { id: undefined, name: "Main", goal: "Describe what this Project must prove" },
@@ -45,7 +45,6 @@ test("config is strict and initializes Board skills", () => {
     writeFileSync(join(agents, "installed", "SKILL.md"), "# Installed\n");
     writeFileSync(join(root, "task.json"), JSON.stringify({
       board: {
-        workspace: ".",
         skills: ["review", "installed"],
         projects: [
           { id: "", name: "Research", goal: "collect research" },
@@ -58,7 +57,7 @@ test("config is strict and initializes Board skills", () => {
       ],
     }));
     const config = loadTaskConfig(root);
-    assert.equal(config.board.workspace, root);
+    assert.equal(config.taskDir, root);
     assert.deepEqual(config.board.projects.map((project) => project.name), ["Research", "Delivery"]);
     assert.equal(config.board.projects[0]?.id, undefined);
     assert.equal(config.board.projects[1]?.id, "123e4567-e89b-42d3-a456-426614174000");
@@ -117,5 +116,33 @@ test("config is strict and initializes Board skills", () => {
       workers: [{ type: "pi", taskTypes: ["supervise"] }],
     }));
     assert.throws(() => loadTaskConfig(badIdDir), /must be empty or a UUID/);
+
+    const promptsDir = join(root, "custom-prompts");
+    mkdirSync(promptsDir);
+    const promptTask = {
+      board: { projects: [{ name: "Main", goal: "done" }] },
+      workers: [{ type: "pi", taskTypes: ["supervise"] }],
+      phase: {
+        plan: { customProfile: { description: "Use for security planning.", prompt: "Plan every proof edge." } },
+        supervise: { customProfile: { description: "Use for proof review.", prompt: "Check every proof edge." } },
+        execute: { customProfiles: [{ description: "Use for primary research.", prompt: "Collect primary evidence." }] },
+      },
+    };
+    writeFileSync(join(promptsDir, "task.json"), JSON.stringify(promptTask));
+    const promptConfig = loadTaskConfig(promptsDir);
+    assert.deepEqual(promptConfig.phase.plan, {
+      maxIntents: 3,
+      customProfile: { description: "Use for security planning.", prompt: "Plan every proof edge." },
+    });
+    assert.deepEqual(promptConfig.phase.supervise, {
+      intervalMs: 60_000,
+      customProfile: { description: "Use for proof review.", prompt: "Check every proof edge." },
+    });
+    assert.deepEqual(promptConfig.phase.execute.customProfiles, [
+      { description: "Use for primary research.", prompt: "Collect primary evidence." },
+    ]);
+    (promptTask.phase.supervise.customProfile as { description: string; prompt?: string }).prompt = undefined;
+    writeFileSync(join(promptsDir, "task.json"), JSON.stringify(promptTask));
+    assert.throws(() => loadTaskConfig(promptsDir), /customProfile\.prompt is required/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

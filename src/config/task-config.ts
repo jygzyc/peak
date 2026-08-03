@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { DEFAULT_PHASE, DEFAULT_SCHEDULER } from "./defaults.js";
-import { resolveTaskConfigPaths, resolveTaskWorkspace } from "./paths.js";
-import type { ProjectConfig, ResolvedTaskConfig, TaskType, WorkerConfig, WorkerType } from "./types.js";
+import { resolveTaskConfigPaths } from "./paths.js";
+import type { CustomProfileDefinition, ProjectConfig, ResolvedTaskConfig, TaskType, WorkerConfig, WorkerType } from "./types.js";
 
 const WORKER_TYPES: WorkerType[] = ["opencode", "codex", "pi", "claude-code"];
 const TASK_TYPES: TaskType[] = ["plan", "supervise", "execute"];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const MAX_PROFILE_DESCRIPTION_BYTES = 1024;
+const MAX_CUSTOM_PROMPT_BYTES = 8 * 1024;
 
 export function persistProjectId(config: ResolvedTaskConfig, index: number, projectId: string): void {
   if (!UUID.test(projectId)) throw new Error(`invalid Project UUID: ${projectId}`);
@@ -43,7 +45,6 @@ export function loadTaskConfig(directory = "."): ResolvedTaskConfig {
     taskDir,
     board: {
       name: optionalString(board.name, "board.name"),
-      workspace: resolveTaskWorkspace(taskDir, optionalString(board.workspace, "board.workspace")),
       skills: strings(board.skills, "board.skills") ?? [],
       projects: parseProjects(board.projects),
     },
@@ -119,18 +120,21 @@ function parsePhase(value: unknown): ResolvedTaskConfig["phase"] {
   if (value === undefined) return structuredClone(DEFAULT_PHASE);
   const input = object(value, "phase");
   keys(input, ["plan", "supervise", "execute"], "phase");
-  const plan = section(input.plan, "phase.plan", ["maxIntents"]);
-  const supervise = section(input.supervise, "phase.supervise", ["intervalMs"]);
-  const execute = section(input.execute, "phase.execute", ["maxArtifactBytes"]);
+  const plan = section(input.plan, "phase.plan", ["maxIntents", "customProfile"]);
+  const supervise = section(input.supervise, "phase.supervise", ["intervalMs", "customProfile"]);
+  const execute = section(input.execute, "phase.execute", ["maxArtifactBytes", "customProfiles"]);
   return {
     plan: {
       maxIntents: integer(plan.maxIntents, "phase.plan.maxIntents") ?? DEFAULT_PHASE.plan.maxIntents,
+      ...optionalCustomProfile(plan.customProfile, "phase.plan.customProfile"),
     },
     supervise: {
       intervalMs: integer(supervise.intervalMs, "phase.supervise.intervalMs") ?? DEFAULT_PHASE.supervise.intervalMs,
+      ...optionalCustomProfile(supervise.customProfile, "phase.supervise.customProfile"),
     },
     execute: {
       maxArtifactBytes: integer(execute.maxArtifactBytes, "phase.execute.maxArtifactBytes") ?? DEFAULT_PHASE.execute.maxArtifactBytes,
+      customProfiles: customProfiles(execute.customProfiles, "phase.execute.customProfiles"),
     },
   };
 }
@@ -172,6 +176,40 @@ function optionalString(value: unknown, label: string): string | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "string" || value.trim() === "") throw new Error(`${label} must be a non-empty string`);
   return value.trim();
+}
+
+function optionalPrompt(value: unknown, label: string): string | undefined {
+  if (value === undefined) return undefined;
+  const result = requiredString(value, label);
+  if (Buffer.byteLength(result, "utf8") > MAX_CUSTOM_PROMPT_BYTES) throw new Error(`${label} exceeds 8 KiB`);
+  return result;
+}
+
+function optionalCustomProfile(value: unknown, label: string): { customProfile?: CustomProfileDefinition } {
+  return value === undefined ? {} : { customProfile: customProfile(value, label) };
+}
+
+function customProfile(value: unknown, label: string): CustomProfileDefinition {
+  const item = object(value, label);
+  keys(item, ["description", "prompt"], label);
+  const description = requiredString(item.description, `${label}.description`);
+  if (Buffer.byteLength(description, "utf8") > MAX_PROFILE_DESCRIPTION_BYTES) throw new Error(`${label}.description exceeds 1 KiB`);
+  const prompt = optionalPrompt(item.prompt, `${label}.prompt`);
+  if (!prompt) throw new Error(`${label}.prompt is required`);
+  return { description, prompt };
+}
+
+function customProfiles(value: unknown, label: string): CustomProfileDefinition[] {
+  if (value === undefined) return [];
+  const items = array(value, label);
+  const seen = new Set<string>();
+  return items.map((value, index) => {
+    const itemLabel = `${label}[${index}]`;
+    const profile = customProfile(value, itemLabel);
+    if (seen.has(profile.description)) throw new Error(`duplicate Execute custom profile description: ${profile.description}`);
+    seen.add(profile.description);
+    return profile;
+  });
 }
 
 function optionalModel(value: unknown, label: string): string | undefined {

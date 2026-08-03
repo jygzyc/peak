@@ -2,10 +2,10 @@ import { existsSync, readdirSync, rmSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import { initializeProjectsDirectory } from "../config/paths.js";
-import { ApiError, requireUuid } from "./api.js";
+import { ApiError, localTimestamp, requireUuid } from "./api.js";
 import { ArtifactStore } from "./artifact-store.js";
 import { SqliteStore } from "./sqlite-store.js";
-import type { CreateProjectInput, FactRef, ProjectMeta } from "./types.js";
+import { leafFacts, type CreateProjectInput, type FactRef, type ProjectGraph, type ProjectMeta, type ReopenInput } from "./types.js";
 
 export interface ProjectStores { graph: SqliteStore; artifacts: ArtifactStore; dir: string }
 
@@ -22,6 +22,11 @@ export class ProjectStoreRegistry {
     const id = randomUUID();
     const stores = this.open(id);
     return stores.graph.initialize(id, input);
+  }
+
+  reopen(projectId: string, input: ReopenInput): ProjectGraph {
+    const stores = this.get(projectId);
+    return stores.graph.reopen(input);
   }
 
   list(): ProjectMeta[] {
@@ -55,6 +60,19 @@ export class ProjectStoreRegistry {
     }
   }
 
+  validateLeafRefs(targetProjectId: string, refs: FactRef[]): void {
+    this.validateRefs(targetProjectId, refs);
+    const leavesByProject = new Map<string, Set<string>>();
+    for (const ref of refs) {
+      let leaves = leavesByProject.get(ref.projectId);
+      if (!leaves) {
+        leaves = new Set(leafFacts(this.get(ref.projectId).graph.graph()).map((fact) => fact.id));
+        leavesByProject.set(ref.projectId, leaves);
+      }
+      if (!leaves.has(ref.factId)) throw new ApiError(409, `FactRef is not a current leaf: ${ref.projectId}/${ref.factId}`);
+    }
+  }
+
   remove(projectId: string): void {
     const target = this.get(projectId);
     for (const [id, stores] of this.stores) {
@@ -68,7 +86,7 @@ export class ProjectStoreRegistry {
   }
 
   gcArtifacts(maxAgeMs = 24 * 60 * 60 * 1000): void {
-    const before = new Date(Date.now() - maxAgeMs).toISOString();
+    const before = localTimestamp(new Date(Date.now() - maxAgeMs));
     for (const stores of this.stores.values()) {
       for (const sha256 of stores.graph.orphanArtifacts(before)) {
         stores.artifacts.remove(sha256);

@@ -1,110 +1,106 @@
 # Peak
 
-Peak is a configured distributed Graph agent runtime. Each Project owns a UUID directory and SQLite Graph shard. The runtime exposes eligible cross-Project Facts as immutable `FactRef` hyperlink nodes containing `projectId`, `factId`, and the canonical Fact `description`; the AI decides whether they are relevant to the current Project Goal. The Graph is bound to the HTTP server, whose API is the only Graph protocol. The Web UI is an optional presentation client, not a Graph dependency.
+Peak is an HTTP-native distributed Graph agent runtime. Each **Project** owns an independent UUID Graph shard (SQLite + content-addressed Artifacts); Projects compose proofs through immutable **`FactRef`** hyperlink nodes containing `projectId`, `factId`, and the canonical Fact `description`. The Graph is bound to the HTTP server, whose API is the only live Graph protocol. The bundled Web UI is an optional presentation client, not a Graph dependency.
 
-## Run
+Runtime requirements: Node.js `>=22.19.0` (ESM).
+
+## Key concepts
+
+- **Board** — a directory with `task.json`: a Project collection and shared run configuration. It has no Goal, Graph, or completion state of its own.
+- **Project** — one persisted Graph (`origin` and `goal` Facts plus the proof DAG of Facts/Intents/Hints). Facts are immutable; a proof grows as a **multi-level DAG** — Plan prefers deepening established current leaves, with no fixed depth limit.
+- **Plan / Supervise / Execute / Finalize** — the fixed runtime units. Plan decides next Intents (or completion); Supervise audits and may add one Hint per round; Execute performs one atomic Intent and returns exactly one Fact; Finalize resumes a failed Execute once.
+- **Artifacts** — Workers never write files and are never allocated a workspace. When a Fact needs detailed evidence, Execute returns the file content inline (`filename`, `mediaType`, `content`); the Runtime stores it as a content-addressed Artifact in the Project shard's `artifacts/`. On completion, Artifacts carrying a content-based `filename` are materialized next to `task.json` — the final Goal deliverables.
+- **Federation** — registered Projects in the same scope exchange current leaf `FactRef`s; targets persist only the hyperlink node, never the source Fact entity or Artifact.
+
+## Quick start
 
 ```bash
 npm install
 npm run build
-peak init ./my-board
-peak run ./my-board              # starts every configured Project
+
+peak init ./my-board            # scaffold a Board with an empty task.json
+peak run ./my-board             # create/attach Projects and run Plan/Supervise/Execute
+peak serve                      # serve the persisted Graph API + Web UI, no workers
 ```
 
-Board directory arguments point to a directory containing `task.json` and default to the current directory. `peak run` prints the bundled Web UI URL. This optional UI renders the live Fact/Intent DAG and provides a convenient client for submitting Hints through the API; it may be omitted or replaced without changing Graph behavior. The runtime and Graph HTTP server remain available after a Project stops or completes; press `Ctrl+C` to shut them down. To browse persisted Projects without starting workers, run `peak serve`.
+`peak run` prints every Project and the Web URL. The runtime and HTTP server remain available after a Project stops or completes; press `Ctrl+C` for a graceful shutdown. `peak resume <project-uuid> [board]` attaches one persisted Project and validates its Goal.
 
-Configure and authenticate one of `opencode`, `codex`, `pi`, or `claude-code` before running. Pi workers run in-process through the Pi Agent SDK and use the normal `~/.pi/agent` settings, models, and credentials.
+Configure and authenticate one of `opencode`, `codex`, `pi`, or `claude-code` before running. Pi workers run in-process through the Pi Agent SDK.
 
-## Board
+## One-click real run
+
+```bash
+node scripts/run-example.mjs    # no arguments
+```
+
+Creates `.peak_test/` in the current directory as an isolated test root, copies the Chinese example (`examples/ai_agent_safety_zh`) into it, and launches the installed `peak` directly.
+
+## Board configuration (`task.json`)
 
 ```json
 {
   "board": {
-    "name": "ai-agent-safety",
-    "workspace": ".",
+    "name": "my-board",
+    "skills": ["my-skill"],
     "projects": [
-      { "id": "", "name": "Latest AI Safety Intelligence", "goal": "Collect and analyze current AI safety evidence." },
-      { "id": "", "name": "AI Agent Guardrail Design", "goal": "Produce an actionable AI Agent guardrail construction plan." }
+      { "id": "", "name": "Main", "goal": "Describe what this Project must prove." }
     ]
   },
   "workers": [
-    {
-      "type": "pi",
-      "model": "zai-coding-cn/glm-5.2",
-      "taskTypes": ["plan", "supervise"],
-      "maxRunning": 1,
-      "priority": 1,
-      "args": []
-    },
-    {
-      "type": "opencode",
-      "model": "minimax/MiniMax-M3",
-      "taskTypes": ["execute"],
-      "maxRunning": 2,
-      "priority": 2,
-      "args": []
-    }
+    { "type": "pi", "model": "deepseek-v4-flash", "taskTypes": ["plan", "supervise"], "maxRunning": 1, "priority": 1, "args": [] },
+    { "type": "pi", "model": "deepseek-v4-flash", "taskTypes": ["execute"], "maxRunning": 2, "priority": 1, "args": [] }
   ],
   "phase": {
-    "plan": { "maxIntents": 3 },
-    "supervise": { "intervalMs": 60000 },
-    "execute": { "maxArtifactBytes": 104857600 }
+    "plan": { "maxIntents": 10 },
+    "supervise": { "intervalMs": 90000 },
+    "execute": { "maxArtifactBytes": 10485760, "customProfiles": [] }
   }
 }
 ```
 
-A Board has no Goal or Graph. `board.projects` is a non-empty array of `{id, name, goal}` Projects, each with independent persistence and completion. On first run, an empty `id` causes Peak to create the Project and atomically write its UUID back to `task.json`. Later runs attach that UUID and reuse its Facts and Artifacts. The same UUID may be referenced by another Board when intentionally sharing a Project; do not schedule one active Project from multiple Runtime processes concurrently.
+- Top-level fields are exactly `board`, `workers`, optional `scheduler`, optional `phase`; unknown fields are rejected recursively.
+- `board` has optional `name`, optional Skill names, and a non-empty `projects` array — there is **no workspace**.
+- Project `id` starts empty; the first `run` atomically writes the generated UUID back to `task.json`. A non-empty id (UUID) attaches and reuses the persisted Graph.
+- At least one Worker must support `supervise`. Empty `model` means the Agent tool default.
+- Phase timeouts are fixed runtime policy: Plan/Supervise 45s, Execute 10 min, Finalize 2 min.
 
-Projects registered in the same running Board expose eligible immutable proof only as candidate `FactRef` values. Each FactRef is an independently understandable hyperlink node `{projectId, factId, description}` whose description must exactly match the referenced immutable Fact. Federation is frontier-based: every newly concluded Fact is broadcast while it is a leaf, replaces its consumed local source FactRefs in unhandled target queues, and only current ordinary leaf Facts from attached Projects are broadcast at startup. Earlier Facts that already produced later local Facts are omitted because the downstream Facts represent the more credible current proof state. Source Fact entities and Artifacts are never copied; the immutable summary is part of the FactRef. Use `--project <name>` to run only one configured Project.
-
-`workers` is an ordered array. Peak generates internal Worker identities, filters by `taskTypes`, then selects by ascending `priority`, current load, and identity. An empty `model` selects the Agent tool's own default model. Optional `phase` settings cover Plan intent count, Supervise interval, and Execute Artifact size; `scheduler` may still override global scheduling limits.
-
-`board.skills` is optional. For each configured Worker, Peak first checks that Worker's global discovery directory (`~/.agents/skills/<name>` or `~/.claude/skills/<name>`). An existing global Skill is used directly. If it is absent, Peak links Board-local `skills/<name>/SKILL.md` into that directory for the Board Runtime lifetime, then removes only that temporary link when the Board Runtime shuts down. Individual Project stop/completion does not change the Skill installation. `peak init` does not create a `skills/` directory. Plan, Supervise, Execute, and Finalize timeouts are runtime policy and are not configurable in the Board JSON.
-
-For a Pi worker, `model` accepts Pi's model reference syntax, including an optional thinking level such as `openai-codex/gpt-5.4:high`. Pi SDK workers do not accept CLI `args`; use an empty array or omit the field.
-
-## Protocol
-
-- **Plan** reads only the current proof frontier—leaf Facts, open Intents, Hints, and pending Federation leaf FactRefs—then selects complete `{projectId, factId, description}` references to create Intents, prove the Goal, or make no change. A leaf Fact may be correct while still requiring additional prerequisites.
-- **Supervise** periodically reviews the Graph and may add one Hint.
-- **Execute** resolves one Intent into exactly one immutable Fact.
-- **Finalize** is a same-session recovery phase for a failed, timed-out, or malformed Execute result.
-
-Workers receive a path to an immutable Graph JSON snapshot and return one strict JSON object. They never receive Graph, SQLite, HTTP credentials, or Federation access.
-
-The optional bundled Web UI is served at `/` as a packaging convenience and uses the same HTTP API as any other client. API routes remain bearer-token protected when `--token` is configured; the UI asks for that token and keeps it in browser session storage.
-
-## State
+## CLI
 
 ```text
-~/.peak/projects/<uuid>/
-├── analysis.db
-├── artifacts/<sha256>
-└── logs/
-    ├── main.log
-    └── graph-<timestamp>-<phase>.json
+peak init [board-directory]          Scaffold a Board
+peak run [board-directory]           Create/attach Projects and run until Ctrl+C
+peak resume <project-uuid> [board]   Attach one persisted Project
+peak serve [--port 8000]             Serve Graph API + Web UI, no workers
+peak workers                         List supported Worker/task types
 ```
 
-An ordinary Fact description is a concise, independently understandable summary limited to 1 KiB UTF-8. Detailed analysis, evidence, tables, and reports belong in content-addressed Artifacts. Intent descriptions are limited to 2 KiB; Hint content and persisted short labels to 1 KiB. The reserved `origin` and `goal` descriptions use the maximum 4 KiB UTF-8 limit.
+Common options: `--host` (non-loopback requires `--token`), `--port` (`0` = ephemeral), `--token`, `--peak-home`, `--no-install-skills`. On completion, `run` prints `[peak] deliverable: <path>` for each final Goal deliverable materialized next to `task.json`.
 
-## Commands
+## Web UI
 
-```bash
-peak init [board-directory]
-peak run [board-directory] [--project <configured-name>] [--host <host>] [--port <port>] [--token <token>]
-peak resume <project-uuid> [board-directory] [--project <configured-name>]
-peak serve [--host <host>] [--port <port>] [--token <token>] [--peak-home <directory>]
-peak workers
-```
+The dashboard is a self-contained HTML/CSS/JS client served at `GET /` (no Bearer required for the shell; all `/api/*` routes require the token). It polls Project state, renders Facts as nodes, Intents as directed edges, and Hints as independent nodes, and supports stop/resume, explicit reopen, adding Hints, pan/zoom/fit, and JSON snapshot export.
 
-## Validation
+## Examples
+
+- [`examples/ai_agent_safety`](examples/ai_agent_safety/README.md) — English: AI safety intelligence brief + Agent guardrail blueprint.
+- [`examples/ai_agent_safety_zh`](examples/ai_agent_safety_zh/README.md) — 中文版（结构一致）.
+
+## Build, test, release
 
 ```bash
 npm run typecheck
-npm test
-npm run smoke
-npm run pack
+npm run build        # modular dist + scripts/*.mjs syntax & consistency checks
+npm test             # builds first, runs tests against dist/
+npm run smoke        # CLI smoke: init/workers/--version
+npm run pack         # esbuild single-file bundle + npm pack + manifest
 ```
 
-Architecture and design principles: [`docs/architecture.md`](docs/architecture.md).
-Interface definitions and data flow: [`docs/interfaces.md`](docs/interfaces.md).
+- Version is read from the root `version` file (synced into `package.json` at pack time; drift is caught by `check-scripts`).
+- Release notes: [`RELEASE.md`](RELEASE.md).
+- CI (`.github/workflows/ci.yml`) runs typecheck/build/test/smoke/pack on Linux + Windows; tags `v*` trigger a GitHub Release with the packed tarball (`.github/workflows/release.yml`).
+
+## Documentation
+
+- [`docs/architecture.md`](docs/architecture.md) — architecture: design goals, module responsibilities, Graph model, runtime phases, scheduling, workers, federation, CLI, Web UI, security.
+- [`docs/data-flow.md`](docs/data-flow.md) — data flow: data model and invariants, persistence layout, HTTP API, task-protocol JSON contracts, Board config schema, end-to-end flows.
+- [`AGENTS.md`](AGENTS.md) — source layout and non-negotiable boundaries for contributors.
