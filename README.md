@@ -2,6 +2,8 @@
 
 Peak is an HTTP-native distributed Graph agent runtime. Each **Project** owns an independent UUID Graph shard (SQLite + content-addressed Artifacts); Projects compose proofs through immutable **`FactRef`** hyperlink nodes containing `projectId`, `factId`, and the canonical Fact `description`. The Graph is bound to the HTTP server, whose API is the only live Graph protocol. The bundled Web UI is an optional presentation client, not a Graph dependency.
 
+![Peak result](docs/assets/result.png)
+
 Runtime requirements: Node.js `>=22.19.0` (ESM).
 
 ## Key concepts

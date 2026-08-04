@@ -2,6 +2,8 @@
 
 Peak 是 HTTP 原生的分布式图（Graph）Agent 运行时。每个 **Project** 拥有一个独立的 UUID Graph 分片（SQLite + 内容寻址 Artifact）；Project 之间通过不可变 **`FactRef`** 超链接节点组成证明链，每个节点包含 `projectId`、`factId` 与源 Fact 的规范 `description`。Graph 与 HTTP Server 绑定，其 API 是唯一在线 Graph 协议。内置 Web UI 是可选的展示客户端，不是 Graph 依赖。
 
+![Peak 运行效果](docs/assets/result.png)
+
 运行时要求：Node.js `>=22.19.0`（ESM）。
 
 ## 核心概念
