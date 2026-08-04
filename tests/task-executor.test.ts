@@ -431,6 +431,18 @@ test("Plan and Supervise retry transient worker and malformed-output failures", 
     assert.equal(planCalls.length, 2);
     assert.equal(planCalls[1]!.prompt, planCalls[0]!.prompt, "retry reuses the same rendered prompt");
     assert.equal((await graph.getProject(project.id)).intents.length, 1);
+
+    // Every retry is recorded in the Project's main.log alongside Graph events.
+    const log = readFileSync(join(projects, project.id, "logs", "main.log"), "utf8");
+    const retries = log.split(/\r?\n/).filter((line) => line.includes('"phase_retry"'));
+    assert.ok(retries.length >= 3, `phase_retry events recorded in main.log, got ${retries.length}`);
+    for (const line of retries) {
+      const event = JSON.parse(line) as { projectId: string; phase: string; attempt: number; message: string };
+      assert.equal(event.projectId, project.id);
+      assert.ok(["plan", "supervise"].includes(event.phase));
+      assert.ok(event.attempt >= 1);
+      assert.ok(event.message.length > 0);
+    }
   } finally {
     await server.stop();
     registry.close();

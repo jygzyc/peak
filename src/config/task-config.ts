@@ -35,7 +35,7 @@ export function loadTaskConfig(directory = "."): ResolvedTaskConfig {
   const root = object(parseJson(readFileSync(configPath, "utf8")), "task config");
   keys(root, ["board", "workers", "scheduler", "phase"], "task config");
   const board = object(root.board, "board");
-  keys(board, ["name", "workspace", "skills", "projects"], "board");
+  keys(board, ["name", "skills", "projects"], "board");
   const workers = parseWorkers(root.workers);
   if (!Object.values(workers).some((worker) => worker.taskTypes.includes("supervise"))) {
     throw new Error("at least one worker must support supervise");

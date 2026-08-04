@@ -14,7 +14,7 @@ import { join, resolve } from "node:path";
 
 const cwd = process.cwd();
 const testRoot = join(cwd, ".peak_test");
-const exampleDir = resolve(import.meta.dirname, "..", "examples", "ai_agent_zh");
+const exampleDir = resolve(import.meta.dirname);
 
 if (!existsSync(exampleDir)) {
   process.stderr.write(`[peak-launcher] 找不到示例项目: ${exampleDir}\n`);

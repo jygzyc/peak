@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * 构建期脚本校验：对 scripts/*.mjs 逐个执行 `node --check`，
- * 并检查启动器等脚本引用的静态资源存在（打包一致性）。
+ * 并检查打包所需的静态资源存在（打包一致性）。
  * 由 build.mjs 与 pack.mjs 调用；语法/引用问题在打包时失败，而不是运行期才暴露。
  */
 import { spawnSync } from "node:child_process";
@@ -23,9 +23,8 @@ for (const name of readdirSync(join(root, "scripts")).filter((entry) => entry.en
   }
 }
 
-// run-example.mjs 引用的静态资源必须在打包时存在
+// 打包所需的静态资源必须存在
 const required = [
-  ["scripts/run-example.mjs 引用的中文示例", join(root, "examples", "ai_agent_zh", "task.json")],
   ["版本文件", join(root, "version")],
   ["发布日志", join(root, "RELEASE.md")],
 ];

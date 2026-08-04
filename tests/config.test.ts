@@ -183,6 +183,14 @@ test("config parses worker env and rejects removed scheduler/args fields", () =>
     }));
     assert.throws(() => loadTaskConfig(schedulerDir), /unknown field "maxConcurrent"/);
 
+    const workspaceDir = join(root, "workspace");
+    mkdirSync(workspaceDir);
+    writeFileSync(join(workspaceDir, "task.json"), JSON.stringify({
+      board: { workspace: "./work", projects: [{ source: "Main", goal: "done" }] },
+      workers: [{ type: "pi", taskTypes: ["plan", "supervise", "execute"] }],
+    }));
+    assert.throws(() => loadTaskConfig(workspaceDir), /unknown field "workspace"/);
+
     const planDir = join(root, "plan");
     mkdirSync(planDir);
     writeFileSync(join(planDir, "task.json"), JSON.stringify({

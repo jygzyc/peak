@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { TaskType } from "../config/types.js";
+import { localTimestamp } from "../graph/api.js";
 
 export interface ActiveExecution {
   executionId: string;
@@ -62,8 +63,8 @@ export class ExecutionRegistry {
         intentId: item.intentId ?? null,
         workerName: item.workerName ?? null,
         processId: item.processId ?? null,
-        startedAt: toLocalTimestamp(item.startedAt),
-        deadlineAt: item.deadlineAt !== undefined ? toLocalTimestamp(item.deadlineAt) : null,
+        startedAt: localTimestamp(new Date(item.startedAt)),
+        deadlineAt: item.deadlineAt !== undefined ? localTimestamp(new Date(item.deadlineAt)) : null,
       }));
   }
   cancelProject(projectId: string): void {
@@ -78,22 +79,4 @@ export class ExecutionRegistry {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
   }
-}
-
-/**
- * Formats an epoch millisecond timestamp as the local wall-clock format
- * `YYYYMMDDTHHMMSS.XXX` used by Peak's persisted timestamps, so the snapshot
- * is presentable to the UI without leaking internal numeric state.
- */
-function toLocalTimestamp(epochMs: number): string {
-  const date = new Date(epochMs);
-  const pad = (value: number, width = 2): string => String(value).padStart(width, "0");
-  const yyyy = date.getFullYear();
-  const mm = pad(date.getMonth() + 1);
-  const dd = pad(date.getDate());
-  const hh = pad(date.getHours());
-  const mi = pad(date.getMinutes());
-  const ss = pad(date.getSeconds());
-  const ms = pad(date.getMilliseconds(), 3);
-  return `${yyyy}${mm}${dd}T${hh}${mi}${ss}.${ms}`;
 }

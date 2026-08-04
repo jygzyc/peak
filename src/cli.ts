@@ -147,6 +147,15 @@ async function runForeground(
     peakHome: options.peakHome,
     installSkills: options.installSkills,
   });
+  // Record process-level crashes in every Project's main.log, then keep the
+  // default crash behavior (message + stack on stderr, non-zero exit).
+  const crash = (kind: "uncaughtException" | "unhandledRejection") => (error: unknown): void => {
+    runtime.logCrash(kind, error);
+    process.stderr.write(`[peak] ${kind}: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+    process.exit(1);
+  };
+  process.once("uncaughtException", crash("uncaughtException"));
+  process.once("unhandledRejection", crash("unhandledRejection"));
   let monitorError: unknown;
   try {
     const projects = await runtime.start(options.project, projectId);

@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
-import { createReadStream, lstatSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, createReadStream, lstatSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { customProfileDigest } from "../config/custom-profile.js";
+import { initializeProjectLogsDirectory } from "../config/paths.js";
 import { executeCapacity } from "../config/task-config.js";
 import type { CustomProfileDefinition, ResolvedTaskConfig, TaskProjectConfig, TaskType } from "../config/types.js";
 import { localTimestamp } from "../graph/api.js";
@@ -56,7 +57,7 @@ interface ProfileValue { description: string; prompt: string; digest: string }
 export const GRAPH_VIEW_MAX_BYTES = 256 * 1024;
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
-const PHASE_TIMEOUT_MS = { plan: 300_000, supervise: 300_000, execute: 600_000, finalize: 120_000 } as const;
+export const PHASE_TIMEOUT_MS = { plan: 300_000, supervise: 300_000, execute: 600_000, finalize: 120_000 } as const;
 // Fixed runtime policy (like phase timeouts, not Board-configurable): bounded
 // retries absorb transient provider failures, timeouts, and malformed JSON
 // output from a single worker round-trip.
@@ -74,11 +75,16 @@ export class TaskExecutor {
     private readonly graph: GraphClient,
     private readonly workers: TaskWorkers,
     private readonly federation: FederationBus,
-    private readonly projectDir: string,
+    readonly projectDir: string,
     private readonly onComplete: () => void = () => undefined,
     private readonly sessionDir?: string,
     private readonly reportSpawn?: (executionId: string, pid: number) => void,
   ) { validatePromptTemplates(); }
+
+  /** Appends a runtime event to this Project's logs/main.log (e.g. retries, failures, crashes). */
+  logEvent(type: string, data: Record<string, unknown>): void {
+    writeProjectLog(this.projectDir, type, data);
+  }
 
   reserveWorker(taskType: TaskType): string | undefined {
     return this.workers.pick(taskType);
@@ -126,7 +132,7 @@ export class TaskExecutor {
           handedOff = true;
           requireSuccess(result, "plan");
           return phaseParse(() => parsePlan(result.text, executeCapacity(this.config), executeProfiles.map((profile) => profile.description)));
-        }, signal);
+        }, signal, (attempt, attempts, message) => this.logEvent("phase_retry", { projectId, phase: "plan", executionId, attempt, attempts, message }));
         // Re-read immediately before writing so a source leaf consumed by a
         // concurrent Execute is caught under the latest leaf frontier, not the
         // snapshot the worker reasoned over.
@@ -161,7 +167,9 @@ export class TaskExecutor {
           return;
         } catch (error) {
           if (!isStaleLeafConflict(error) || attempt === PLAN_DISPATCH_ATTEMPTS || signal?.aborted) throw error;
-          process.stderr.write(`[peak] plan retrying: a source leaf was consumed during planning (${(error as Error).message})\n`);
+          const message = (error as Error).message;
+          process.stderr.write(`[peak] plan retrying: a source leaf was consumed during planning (${message})\n`);
+          this.logEvent("plan_retry", { projectId, executionId, message });
           await sleep(PHASE_RETRY_DELAY_MS, signal);
         }
       }
@@ -188,9 +196,9 @@ export class TaskExecutor {
         handedOff = true;
         requireSuccess(result, "supervise");
         return phaseParse(() => parseSupervise(result.text));
-      }, signal);
+      }, signal, (attempt, attempts, message) => this.logEvent("phase_retry", { projectId, phase: "supervise", executionId, attempt, attempts, message }));
       if (output.kind === "noop" || project.hints.some((hint) => hint.content.trim() === output.content.trim())) return;
-    try {
+      try {
         await this.graph.addHint(projectId, { content: output.content, creator: `supervise:${executionId}` });
       } catch (error) {
         if (!(error instanceof GraphClientError) || error.status !== 409) throw error;
@@ -220,7 +228,7 @@ export class TaskExecutor {
       const first = await running;
       let output: ReturnType<typeof parseExecute>;
       let finalized = false;
-    try {
+      try {
         if (first.returncode !== 0) throw new Error(`execute worker failed: ${preview(first.stderr)}`);
         output = parseExecute(first.text);
       } catch (error) {
@@ -466,6 +474,7 @@ async function withPhaseRetries<T>(
   attempts: number,
   run: () => Promise<T>,
   signal?: AbortSignal,
+  onRetry?: (attempt: number, attempts: number, message: string) => void,
 ): Promise<T> {
   let last: unknown;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -474,7 +483,9 @@ async function withPhaseRetries<T>(
     } catch (error) {
       last = error;
       if (!retryable(error, signal) || attempt === attempts) throw error;
-      process.stderr.write(`[peak] ${phase} attempt ${attempt}/${attempts} failed, retrying: ${(error as Error).message}\n`);
+      const message = (error as Error).message;
+      process.stderr.write(`[peak] ${phase} attempt ${attempt}/${attempts} failed, retrying: ${message}\n`);
+      onRetry?.(attempt, attempts, message);
       await sleep(PHASE_RETRY_DELAY_MS, signal);
     }
   }
@@ -496,6 +507,12 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 function preview(value: string): string { return value.replace(/\s+/g, " ").slice(0, 1_200); }
+
+/** Appends one JSON line to a Project's logs/main.log in the same format as Graph events. */
+function writeProjectLog(projectDir: string, type: string, data: Record<string, unknown>): void {
+  const logs = initializeProjectLogsDirectory(projectDir);
+  appendFileSync(join(logs, "main.log"), `${JSON.stringify({ at: localTimestamp(), type, ...data })}\n`);
+}
 function visibleRefs(projectId: string, facts: Array<{ id: string; description: string }>, pending: FederationReference[]): Map<string, string> {
   return new Map([
     ...facts.map((fact): [string, string] => [`${projectId}/${fact.id}`, fact.description]),
@@ -536,4 +553,4 @@ const planContract = (maxIntents: number, hasProfiles: boolean): string => [
   'Copy FactRefs exactly. Use no undeclared fields. Each Intent is one atomic transition to one Fact.',
 ].join("\n");
 const SUPERVISE_CONTRACT = '{"kind":"hint","content":"..."} or {"kind":"noop"}; no undeclared fields.';
-const EXECUTE_CONTRACT = '{"kind":"fact","description":"...","artifact":null} or {"kind":"fact","description":"...","artifact":{"filename":"...","mediaType":"...","content":"..."}}; one optional file, inline content, no undeclared fields.';
+const EXECUTE_CONTRACT = 'Return exactly one JSON object with nothing before or after it (no prose, no code fences). {"kind":"fact","description":"<trimmed standalone summary, at most 1 KiB UTF-8>","artifact":null} or {"kind":"fact","description":"...","artifact":{"filename":"...","mediaType":"...","content":"<full file content, inline>"}}. Use only these fields; extra fields are rejected. If the result is longer than 1 KiB, keep description short and put the detail in the artifact content.';

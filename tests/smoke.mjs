@@ -1,3 +1,4 @@
+/** Distribution-level CLI smoke verification. */
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";

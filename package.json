@@ -5,6 +5,7 @@
   "type": "module",
   "files": [
     "dist",
+    "docs",
     "version",
     "RELEASE.md",
     "README.md",
@@ -21,7 +22,7 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test \"tests/**/*.test.ts\"",
     "test:example": "npm run build && node --test \"examples/**/*.test.ts\"",
-    "smoke": "node scripts/smoke.mjs",
+    "smoke": "node tests/smoke.mjs",
     "pack": "node scripts/pack.mjs archive",
     "prepack": "node scripts/pack.mjs prepare"
   },

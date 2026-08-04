@@ -1,13 +1,13 @@
+import { executeCapacity } from "../config/task-config.js";
 import type { ResolvedTaskConfig, TaskType } from "../config/types.js";
 import { GraphClient } from "../graph/graph-client.js";
 import type { ProjectGraph } from "../graph/types.js";
 import { ExecutionRegistry } from "../runtime/execution-registry.js";
-import { TaskExecutor } from "../runtime/task-executor.js";
+import { PHASE_TIMEOUT_MS, TaskExecutor } from "../runtime/task-executor.js";
 import { GraphSupervisor } from "./graph-supervisor.js";
 
 interface Checkpoint { facts: number; hints: number; open: number; federation: number }
 
-const PHASE_TIMEOUT_MS = { plan: 300_000, supervise: 300_000, execute: 600_000 } as const;
 
 export class ProjectLoop {
   private checkpoint?: Checkpoint;
@@ -15,7 +15,7 @@ export class ProjectLoop {
 
   constructor(
     readonly projectId: string,
-    config: ResolvedTaskConfig,
+    private readonly config: ResolvedTaskConfig,
     private readonly graph: GraphClient,
     private readonly executor: TaskExecutor,
     private readonly executions: ExecutionRegistry,
@@ -25,11 +25,13 @@ export class ProjectLoop {
   }
 
   /**
-   * One scheduler tick. `executeSlots` is the global Execute-concurrency
-   * budget; Plan and Supervise run on their own channels and never consume
-   * it. Returns the number of Execute executions started this tick.
+   * One scheduler tick. Execute capacity is a per-Project budget: this Project
+   * may run up to `executeCapacity` Execute executions in parallel, computed
+   * from its own in-flight count, and never shares or consumes the budget of
+   * other Projects. Plan and Supervise run on their own channels and never
+   * consume it. Returns the number of Execute executions started this tick.
    */
-  async tick(executeSlots: number): Promise<number> {
+  async tick(): Promise<number> {
     const project = await this.graph.getProject(this.projectId);
     if (project.project.status !== "active") {
       this.executions.cancelProject(this.projectId);
@@ -53,10 +55,11 @@ export class ProjectLoop {
         this.dispatch("plan", worker, (signal, executionId) => this.executor.plan(this.projectId, executionId, signal, worker), () => { this.checkpoint = undefined; });
       }
     }
-    // Execute channel: consumes the global Execute budget. One Execute per
-    // open Intent that is not already running and whose Worker can be reserved.
+    // Execute channel: consumes this Project's own Execute budget. One Execute
+    // per open Intent that is not already running and whose Worker can be
+    // reserved.
     let started = 0;
-    let slots = executeSlots;
+    let slots = executeCapacity(this.config) - this.executions.count(this.projectId, "execute");
     for (const intent of project.intents.filter((item) => item.to === null)) {
       if (slots <= 0) break;
       if (this.executions.has(this.projectId, "execute", intent.id)) continue;
@@ -96,7 +99,9 @@ export class ProjectLoop {
     });
     void run(controller.signal, executionId).catch((error) => {
       failed?.();
-      process.stderr.write(`[peak] ${kind} failed project=${this.projectId}: ${(error as Error).message}\n`);
+      const message = (error as Error).message;
+      process.stderr.write(`[peak] ${kind} failed project=${this.projectId}: ${message}\n`);
+      this.executor.logEvent("phase_failed", { projectId: this.projectId, kind, executionId, intentId: intentId ?? null, message });
     }).finally(() => this.executions.remove(executionId));
   }
 }

@@ -194,6 +194,19 @@ export class AgentRuntime {
     this.executors.clear();
   }
 
+  /**
+   * Records a process-level crash (uncaughtException / unhandledRejection) in
+   * every registered Project's logs/main.log so failures stay auditable even
+   * when the server process dies. Synchronous append, safe during teardown.
+   */
+  logCrash(kind: "uncaughtException" | "unhandledRejection", error: unknown): void {
+    const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+    const stack = error instanceof Error ? (error.stack ?? "") : "";
+    for (const executor of this.executors.values()) {
+      executor.logEvent("process_crash", { kind, message, stack });
+    }
+  }
+
   get webUrl(): string {
     if (!this.server) throw new Error("runtime not started");
     return this.server.baseUrl;

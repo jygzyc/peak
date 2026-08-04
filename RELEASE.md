@@ -32,7 +32,7 @@ The version source of truth is the `version` file at the repo root. For each rel
 
 - `npm run build` / `npm test` / `npm run smoke` / `npm run pack`（esbuild 单文件 bundle + manifest）；
 - 构建期校验 `scripts/*.mjs` 语法与引用一致性（`scripts/check-scripts.mjs`），版本一致性（`version` ↔ `package.json`）；
-- `scripts/run-example.mjs` 一键真实启动：当前目录 `.peak_test` 测试根，复制中文示例，运行安装版 `peak`；
+- `examples/ai_agent_zh/run.mjs` 一键真实启动：当前目录 `.peak_test` 测试根，复制中文示例，运行安装版 `peak`；
 - GitHub Actions：PR/主分支 CI（typecheck/build/test/smoke/pack，Linux + Windows），tag 触发 Release（打包并上传 tarball）。
 
 **已知问题**
@@ -64,7 +64,7 @@ First runnable release: an HTTP-native distributed proof-Graph agent runtime.
 
 - `npm run build` / `npm test` / `npm run smoke` / `npm run pack` (esbuild single-file bundle + manifest).
 - Build-time validation of `scripts/*.mjs` syntax and referenced assets (`scripts/check-scripts.mjs`), plus version consistency (`version` file ↔ `package.json`).
-- `scripts/run-example.mjs` one-click real launch: creates `.peak_test/` in the current directory, copies the Chinese example, and runs the installed `peak`.
+- `examples/ai_agent_zh/run.mjs` one-click real launch: creates `.peak_test/` in the current directory, copies the Chinese example, and runs the installed `peak`.
 - GitHub Actions: PR/main CI (typecheck/build/test/smoke/pack on Linux + Windows); `v*` tags trigger a Release uploading the packed tarball.
 
 **Known issues**

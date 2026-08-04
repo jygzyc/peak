@@ -1,4 +1,3 @@
-import { executeCapacity } from "../config/task-config.js";
 import type { ResolvedTaskConfig } from "../config/types.js";
 import { ProjectLoop } from "../project/project-loop.js";
 import { ExecutionRegistry } from "./execution-registry.js";
@@ -18,8 +17,15 @@ export class RuntimeScheduler {
 
   start(): void {
     if (this.timer) return;
-    void this.tick();
-    this.timer = setInterval(() => void this.tick(), this.config.scheduler.intervalMs);
+    // Absorb per-tick failures (e.g. a tick racing shutdown against a closed
+    // Graph server) so they cannot surface as unhandled rejections.
+    const safeTick = (): void => {
+      void this.tick().catch((error: unknown) => {
+        process.stderr.write(`[peak] scheduler tick failed: ${(error as Error).message}\n`);
+      });
+    };
+    safeTick();
+    this.timer = setInterval(safeTick, this.config.scheduler.intervalMs);
     this.timer.unref?.();
   }
 
@@ -34,15 +40,13 @@ export class RuntimeScheduler {
     if (this.ticking) return;
     this.ticking = true;
     try {
-      // Execute capacity is the single global Execute-concurrency budget; Plan
-      // and Supervise run on their own channels and do not consume it.
-      const capacity = executeCapacity(this.config);
-      let slots = Math.max(0, capacity - this.executions.count(undefined, "execute"));
       const all = [...this.loops.values()];
       if (all.length === 0) return;
       const loops = [...all.slice(this.cursor), ...all.slice(0, this.cursor)].slice(0, this.config.scheduler.maxRunningProjects);
       this.cursor = (this.cursor + loops.length) % all.length;
-      for (const loop of loops) slots -= await loop.tick(slots);
+      // Execute capacity is enforced per Project by each ProjectLoop against its
+      // own in-flight count; Projects never share or consume each other's budget.
+      for (const loop of loops) await loop.tick();
     } finally { this.ticking = false; }
   }
 }
