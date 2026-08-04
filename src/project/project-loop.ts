@@ -7,13 +7,15 @@ import { GraphSupervisor } from "./graph-supervisor.js";
 
 interface Checkpoint { facts: number; hints: number; open: number; federation: number }
 
+const PHASE_TIMEOUT_MS = { plan: 300_000, supervise: 300_000, execute: 600_000 } as const;
+
 export class ProjectLoop {
   private checkpoint?: Checkpoint;
   private readonly supervisor: GraphSupervisor;
 
   constructor(
     readonly projectId: string,
-    private readonly config: ResolvedTaskConfig,
+    config: ResolvedTaskConfig,
     private readonly graph: GraphClient,
     private readonly executor: TaskExecutor,
     private readonly executions: ExecutionRegistry,
@@ -22,38 +24,47 @@ export class ProjectLoop {
     this.supervisor = new GraphSupervisor(config.phase.supervise.intervalMs);
   }
 
-  async tick(globalSlots: number): Promise<number> {
+  /**
+   * One scheduler tick. `executeSlots` is the global Execute-concurrency
+   * budget; Plan and Supervise run on their own channels and never consume
+   * it. Returns the number of Execute executions started this tick.
+   */
+  async tick(executeSlots: number): Promise<number> {
     const project = await this.graph.getProject(this.projectId);
     if (project.project.status !== "active") {
       this.executions.cancelProject(this.projectId);
       return 0;
     }
-    let started = 0;
-    const projectSlots = Math.max(0, this.config.scheduler.maxProjectConcurrent - this.executions.count(this.projectId));
-    let available = Math.min(globalSlots, projectSlots, this.config.scheduler.refillPerTick);
-    if (available > 0 && this.supervisor.due() && !this.executions.has(this.projectId, "supervise")) {
+    // Supervise channel (independent of Execute capacity): at most one active
+    // supervise per Project, gated only by its interval and Worker availability.
+    if (this.supervisor.due() && !this.executions.has(this.projectId, "supervise")) {
       const worker = this.executor.reserveWorker("supervise");
       if (worker) {
         this.supervisor.mark();
-        this.dispatch("supervise", (signal, executionId) => this.executor.supervise(this.projectId, executionId, signal, worker));
-        available--; started++;
+        this.dispatch("supervise", worker, (signal, executionId) => this.executor.supervise(this.projectId, executionId, signal, worker));
       }
     }
-    if (available > 0 && this.planNeeded(project) && !this.executions.has(this.projectId, "plan")) {
+    // Plan channel (independent of Execute capacity): at most one active plan
+    // per Project, gated only by whether Plan is needed and Worker availability.
+    if (this.planNeeded(project) && !this.executions.has(this.projectId, "plan")) {
       const worker = this.executor.reserveWorker("plan");
       if (worker) {
         this.checkpoint = checkpoint(project, this.pendingCount());
-        this.dispatch("plan", (signal, executionId) => this.executor.plan(this.projectId, executionId, signal, worker), () => { this.checkpoint = undefined; });
-        available--; started++;
+        this.dispatch("plan", worker, (signal, executionId) => this.executor.plan(this.projectId, executionId, signal, worker), () => { this.checkpoint = undefined; });
       }
     }
+    // Execute channel: consumes the global Execute budget. One Execute per
+    // open Intent that is not already running and whose Worker can be reserved.
+    let started = 0;
+    let slots = executeSlots;
     for (const intent of project.intents.filter((item) => item.to === null)) {
-      if (available === 0) break;
+      if (slots <= 0) break;
       if (this.executions.has(this.projectId, "execute", intent.id)) continue;
       const worker = this.executor.reserveWorker("execute");
       if (!worker) break;
-      this.dispatch("execute", (signal, executionId) => this.executor.execute(this.projectId, intent, executionId, signal, worker), undefined, intent.id);
-      available--; started++;
+      this.dispatch("execute", worker, (signal, executionId) => this.executor.execute(this.projectId, intent, executionId, signal, worker), undefined, intent.id);
+      slots -= 1;
+      started += 1;
     }
     return started;
   }
@@ -69,10 +80,20 @@ export class ProjectLoop {
       || (this.checkpoint.open > 0 && current.open === 0) || current.federation !== this.checkpoint.federation;
   }
 
-  private dispatch(kind: TaskType, run: (signal: AbortSignal, executionId: string) => Promise<void>, failed?: () => void, intentId?: string): void {
+  private dispatch(
+    kind: TaskType,
+    workerName: string,
+    run: (signal: AbortSignal, executionId: string) => Promise<void>,
+    failed?: () => void,
+    intentId?: string,
+  ): void {
     const executionId = this.executions.createId();
     const controller = new AbortController();
-    this.executions.add({ executionId, projectId: this.projectId, kind, intentId, controller });
+    const timeoutMs = PHASE_TIMEOUT_MS[kind];
+    this.executions.add({
+      executionId, projectId: this.projectId, kind, intentId, workerName,
+      controller, startedAt: Date.now(), deadlineAt: Date.now() + timeoutMs,
+    });
     void run(controller.signal, executionId).catch((error) => {
       failed?.();
       process.stderr.write(`[peak] ${kind} failed project=${this.projectId}: ${(error as Error).message}\n`);

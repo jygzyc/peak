@@ -53,8 +53,8 @@ if (!new Set(["all", "prepare", "archive"]).has(mode)) {
 }
 
 const EXTERNAL = [
-  "@earendil-works/pi-coding-agent",
   "commander",
+  "tar",
 ];
 
 try {
@@ -192,6 +192,11 @@ try {
     const packedFiles = new Set(
       (entry.files ?? []).map((file) => String(file.path).replaceAll("\\", "/")),
     );
+    const packedExample = [...packedFiles].find((path) => path === "examples" || path.startsWith("examples/"));
+    if (packedExample) {
+      process.stderr.write(`npm package must not contain examples: ${packedExample}\n`);
+      process.exit(1);
+    }
     if (!packedFiles.has(distEntryRelative)) {
       process.stderr.write(`npm package does not contain declared binary ${distEntryRelative}\n`);
       process.exit(1);

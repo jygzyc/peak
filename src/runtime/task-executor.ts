@@ -3,6 +3,7 @@ import { createReadStream, lstatSync, mkdirSync, readFileSync, statSync, writeFi
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { customProfileDigest } from "../config/custom-profile.js";
+import { executeCapacity } from "../config/task-config.js";
 import type { CustomProfileDefinition, ResolvedTaskConfig, TaskProjectConfig, TaskType } from "../config/types.js";
 import { localTimestamp } from "../graph/api.js";
 import { FederationBus, type FederationReference } from "../graph/federation-bus.js";
@@ -25,6 +26,7 @@ export interface TaskWorkers {
     cwd: string,
     signal?: AbortSignal,
     session?: SessionRef,
+    options?: { sessionDir?: string; onSpawn?: (pid: number) => void },
   ): Promise<WorkerResult>;
 }
 
@@ -54,7 +56,14 @@ interface ProfileValue { description: string; prompt: string; digest: string }
 export const GRAPH_VIEW_MAX_BYTES = 256 * 1024;
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
-const PHASE_TIMEOUT_MS = { plan: 300_000, supervise: 300_000, execute: 600_000, finalize: 120_000 } as const;  // TEMP: relaxed for E2E run
+const PHASE_TIMEOUT_MS = { plan: 300_000, supervise: 300_000, execute: 600_000, finalize: 120_000 } as const;
+// Fixed runtime policy (like phase timeouts, not Board-configurable): bounded
+// retries absorb transient provider failures, timeouts, and malformed JSON
+// output from a single worker round-trip.
+const MAX_PHASE_ATTEMPTS = 3;
+const PHASE_RETRY_DELAY_MS = 2_000;
+/** Max Plan dispatches when a source leaf is consumed by a concurrent Execute. */
+const PLAN_DISPATCH_ATTEMPTS = 2;
 
 export class TaskExecutor {
   readonly deliverables: string[] = [];
@@ -67,6 +76,8 @@ export class TaskExecutor {
     private readonly federation: FederationBus,
     private readonly projectDir: string,
     private readonly onComplete: () => void = () => undefined,
+    private readonly sessionDir?: string,
+    private readonly reportSpawn?: (executionId: string, pid: number) => void,
   ) { validatePromptTemplates(); }
 
   reserveWorker(taskType: TaskType): string | undefined {
@@ -77,61 +88,83 @@ export class TaskExecutor {
     const worker = reservedWorker ?? this.requireWorker("plan");
     let handedOff = false;
     try {
-      const project = await this.graph.getProject(projectId);
-      const pending = this.federation.pendingFor(projectId);
-      const facts = leafFacts(project);
-      const source = project.facts.find((fact) => fact.id === "origin");
-      const goal = project.facts.find((fact) => fact.id === "goal");
-      if (!source || !goal) throw new Error("Project source or goal Fact is missing");
-      const graph: PlanGraphView = completeGraphView({
-        project: project.project,
-        source,
-        goal,
-        leafFacts: facts,
-        openIntents: project.intents.filter((intent) => intent.to === null),
-        unconsumedHints: project.hints.filter((hint) => hint.consumedByIntentId === null),
-        pendingFactRefs: pending,
-      }, ["leafFacts", "openIntents", "unconsumedHints", "pendingFactRefs"]);
-      const planProfile = profileValue(this.config.phase.plan.customProfile);
-      const executeProfiles = this.config.phase.execute.customProfiles.map(profileValueRequired);
-      const rendered = renderPrompt("plan", {
-        customProfile: json(planProfile), skills: json(this.config.board.skills),
-        source: json(graph.source), goal: json(graph.goal),
-        graph: json(planCurrentState(graph)), executeCustomProfiles: json(executeProfiles),
-        maxIntents: String(this.config.phase.plan.maxIntents),
-        contract: planContract(this.config.phase.plan.maxIntents, executeProfiles.length > 0),
-      });
-      this.snapshot("plan", executionId, graph, planProfile, rendered);
-      const running = this.workers.execute(worker, "plan", rendered.text, PHASE_TIMEOUT_MS.plan, this.config.taskDir, signal);
-      handedOff = true;
-      const result = await running;
-      requireSuccess(result, "plan");
-      const output = parsePlan(result.text, this.config.phase.plan.maxIntents, executeProfiles.map((profile) => profile.description));
-      const visible = visibleRefs(projectId, graph.leafFacts, graph.pendingFactRefs);
-      if (output.kind === "complete") {
-        validateVisible(output.from, visible);
-        validateHints(output.hintIds, graph.unconsumedHints);
-        await this.graph.complete(projectId, {
-          from: output.from, hintIds: output.hintIds, description: output.description, completedBy: `plan:${executionId}`,
+      // Plan reads a Graph view, asks the worker for the next Intents, then
+      // writes them. A concurrent Execute can conclude an Intent while the
+      // worker is thinking, consuming a source leaf the Plan reasoned over.
+      // Rather than discard the round, the write is validated against a freshly
+      // re-read Graph and the whole dispatch (re-read, re-plan, write) retries
+      // when a source has been superseded.
+      for (let attempt = 1; attempt <= PLAN_DISPATCH_ATTEMPTS; attempt += 1) {
+        const project = await this.graph.getProject(projectId);
+        const pending = this.federation.pendingFor(projectId);
+        const facts = leafFacts(project);
+        const source = project.facts.find((fact) => fact.id === "origin");
+        const goal = project.facts.find((fact) => fact.id === "goal");
+        if (!source || !goal) throw new Error("Project source or goal Fact is missing");
+        const graph: PlanGraphView = completeGraphView({
+          project: project.project,
+          source,
+          goal,
+          leafFacts: facts,
+          openIntents: project.intents.filter((intent) => intent.to === null),
+          unconsumedHints: project.hints.filter((hint) => hint.consumedByIntentId === null),
+          pendingFactRefs: pending,
+        }, ["leafFacts", "openIntents", "unconsumedHints", "pendingFactRefs"]);
+        const planProfile = profileValue(this.config.phase.plan.customProfile);
+        const executeProfiles = this.config.phase.execute.customProfiles.map(profileValueRequired);
+        const capacity = executeCapacity(this.config);
+        const rendered = renderPrompt("plan", {
+          customProfile: json(planProfile), skills: json(this.config.board.skills),
+          source: json(graph.source), goal: json(graph.goal),
+          graph: json(planCurrentState(graph)), executeCustomProfiles: json(executeProfiles),
+          maxIntents: String(capacity),
+          contract: planContract(capacity, executeProfiles.length > 0),
         });
-        await this.materializeDeliverables(projectId, output.from);
-        this.onComplete();
-      } else if (output.kind === "intents") {
-        for (const intent of output.intents) {
-          validateVisible(intent.from, visible);
-          validateHints(intent.hintIds, graph.unconsumedHints);
-          const selected = intent.customProfile === null ? undefined
-            : this.config.phase.execute.customProfiles.find((profile) => profile.description === intent.customProfile);
-          if (intent.customProfile !== null && !selected) throw new Error(`unknown customProfile: ${intent.customProfile}`);
-          await this.graph.createIntent(projectId, {
-            from: intent.from, hintIds: intent.hintIds, description: intent.description,
-            customProfile: selected?.description ?? null,
-            customProfileDigest: selected ? customProfileDigest(selected) : null,
-            createdBy: `plan:${executionId}`,
-          });
+        this.snapshot("plan", executionId, graph, planProfile, rendered);
+        const output = await withPhaseRetries("plan", MAX_PHASE_ATTEMPTS, async () => {
+          const result = await this.workers.execute(worker, "plan", rendered.text, PHASE_TIMEOUT_MS.plan, this.config.taskDir, signal, undefined, this.workerOptions(executionId));
+          handedOff = true;
+          requireSuccess(result, "plan");
+          return phaseParse(() => parsePlan(result.text, executeCapacity(this.config), executeProfiles.map((profile) => profile.description)));
+        }, signal);
+        // Re-read immediately before writing so a source leaf consumed by a
+        // concurrent Execute is caught under the latest leaf frontier, not the
+        // snapshot the worker reasoned over.
+        const latest = await this.graph.getProject(projectId);
+        const visible = visibleRefs(projectId, leafFacts(latest), this.federation.pendingFor(projectId));
+        const unconsumedHints = latest.hints.filter((hint) => hint.consumedByIntentId === null);
+        try {
+          if (output.kind === "complete") {
+            validateVisible(output.from, visible);
+            validateHints(output.hintIds, unconsumedHints);
+            await this.graph.complete(projectId, {
+              from: output.from, hintIds: output.hintIds, description: output.description, completedBy: `plan:${executionId}`,
+            });
+            await this.materializeDeliverables(projectId, output.from);
+            this.onComplete();
+          } else if (output.kind === "intents") {
+            for (const intent of output.intents) {
+              validateVisible(intent.from, visible);
+              validateHints(intent.hintIds, unconsumedHints);
+              const selected = intent.customProfile === null ? undefined
+                : this.config.phase.execute.customProfiles.find((profile) => profile.description === intent.customProfile);
+              if (intent.customProfile !== null && !selected) throw new Error(`unknown customProfile: ${intent.customProfile}`);
+              await this.graph.createIntent(projectId, {
+                from: intent.from, hintIds: intent.hintIds, description: intent.description,
+                customProfile: selected?.description ?? null,
+                customProfileDigest: selected ? customProfileDigest(selected) : null,
+                createdBy: `plan:${executionId}`,
+              });
+            }
+          }
+          if (pending.length) this.federation.markHandled(projectId, pending);
+          return;
+        } catch (error) {
+          if (!isStaleLeafConflict(error) || attempt === PLAN_DISPATCH_ATTEMPTS || signal?.aborted) throw error;
+          process.stderr.write(`[peak] plan retrying: a source leaf was consumed during planning (${(error as Error).message})\n`);
+          await sleep(PHASE_RETRY_DELAY_MS, signal);
         }
       }
-      if (graph.pendingFactRefs.length) this.federation.markHandled(projectId, graph.pendingFactRefs);
     } finally {
       if (!handedOff) this.workers.release(worker);
     }
@@ -150,11 +183,12 @@ export class TaskExecutor {
         customProfile: json(selected), graph: json(graph), contract: SUPERVISE_CONTRACT,
       });
       this.snapshot("supervise", executionId, graph, selected, rendered);
-      const running = this.workers.execute(worker, "supervise", rendered.text, PHASE_TIMEOUT_MS.supervise, this.config.taskDir, signal);
-      handedOff = true;
-      const result = await running;
-      requireSuccess(result, "supervise");
-      const output = parseSupervise(result.text);
+      const output = await withPhaseRetries("supervise", MAX_PHASE_ATTEMPTS, async () => {
+        const result = await this.workers.execute(worker, "supervise", rendered.text, PHASE_TIMEOUT_MS.supervise, this.config.taskDir, signal, undefined, this.workerOptions(executionId));
+        handedOff = true;
+        requireSuccess(result, "supervise");
+        return phaseParse(() => parseSupervise(result.text));
+      }, signal);
       if (output.kind === "noop" || project.hints.some((hint) => hint.content.trim() === output.content.trim())) return;
     try {
         await this.graph.addHint(projectId, { content: output.content, creator: `supervise:${executionId}` });
@@ -181,7 +215,7 @@ export class TaskExecutor {
         customProfile: json(selected), skills: json(this.config.board.skills), graph: json(graph), contract: EXECUTE_CONTRACT,
       });
       const executeSnapshot = this.snapshot("execute", executionId, graph, selected, rendered);
-      const running = this.workers.execute(worker, "execute", rendered.text, PHASE_TIMEOUT_MS.execute, this.config.taskDir, signal);
+      const running = this.workers.execute(worker, "execute", rendered.text, PHASE_TIMEOUT_MS.execute, this.config.taskDir, signal, undefined, this.workerOptions(executionId));
       handedOff = true;
       const first = await running;
       let output: ReturnType<typeof parseExecute>;
@@ -228,7 +262,7 @@ export class TaskExecutor {
       boundExecution: json(boundExecution), contract: EXECUTE_CONTRACT,
     });
     this.snapshot("finalize", executionId, graph, selected, rendered, executionId);
-    const result = await this.workers.execute(worker, "execute", rendered.text, PHASE_TIMEOUT_MS.finalize, this.config.taskDir, signal, session);
+    const result = await this.workers.execute(worker, "execute", rendered.text, PHASE_TIMEOUT_MS.finalize, this.config.taskDir, signal, session, this.workerOptions(executionId));
     requireSuccess(result, `finalize ${projectId}`);
     return parseExecute(result.text);
   }
@@ -289,6 +323,20 @@ export class TaskExecutor {
     const worker = this.workers.pick(taskType);
     if (!worker) throw new Error(`no worker available for ${taskType}`);
     return worker;
+  }
+
+  /**
+   * Per-execute options shared by every phase dispatch: the Project-scoped
+   * session directory (used by resumable CLI protocols such as Pi) and a
+   * spawn callback that lets the Runtime record the child PID in its
+   * ExecutionRegistry snapshot. Finalize reuses the Execute execution id so
+   * the same PID slot is updated.
+   */
+  private workerOptions(executionId: string): { sessionDir?: string; onSpawn?: (pid: number) => void } {
+    const options: { sessionDir?: string; onSpawn?: (pid: number) => void } = {};
+    if (this.sessionDir) options.sessionDir = this.sessionDir;
+    if (this.reportSpawn) options.onSpawn = (pid: number) => this.reportSpawn!(executionId, pid);
+    return options;
   }
 }
 
@@ -389,7 +437,63 @@ function completeGraphView<T extends Record<string, unknown>>(
 function json(value: unknown): string { return JSON.stringify(value, null, 2); }
 function sha256(value: string): string { return createHash("sha256").update(value, "utf8").digest("hex"); }
 function requireSuccess(result: WorkerResult, phase: string): void {
-  if (result.returncode !== 0) throw new Error(`${phase} worker failed: ${preview(result.stderr)}`);
+  if (result.returncode !== 0) throw new PhaseAttemptError(`${phase} worker failed: ${preview(result.stderr)}`, result);
+}
+
+/** A single worker round-trip (run + strict contract parse) that failed. */
+class PhaseAttemptError extends Error {
+  constructor(message: string, readonly result: WorkerResult | null = null) {
+    super(message);
+    this.name = "PhaseAttemptError";
+  }
+}
+
+/** Marks malformed worker output as a retryable attempt failure. */
+function phaseParse<T>(parse: () => T): T {
+  try { return parse(); }
+  catch (error) { throw new PhaseAttemptError((error as Error).message); }
+}
+
+/**
+ * Bounded retry for idempotent read-only phases (Plan, Supervise): a single
+ * model round-trip can fail transiently (provider error, timeout, malformed
+ * JSON). Re-running the same prompt absorbs the flake before the dispatch is
+ * reported failed. Only attempts that started and were not externally
+ * cancelled are retried — the same predicate Execute uses for Finalize.
+ */
+async function withPhaseRetries<T>(
+  phase: string,
+  attempts: number,
+  run: () => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  let last: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await run();
+    } catch (error) {
+      last = error;
+      if (!retryable(error, signal) || attempt === attempts) throw error;
+      process.stderr.write(`[peak] ${phase} attempt ${attempt}/${attempts} failed, retrying: ${(error as Error).message}\n`);
+      await sleep(PHASE_RETRY_DELAY_MS, signal);
+    }
+  }
+  throw last;
+}
+
+function retryable(error: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return false;
+  if (!(error instanceof PhaseAttemptError)) return false;
+  const result = error.result;
+  return result === null || (result.started && !result.cancelled);
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(new Error("cancelled")); return; }
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("cancelled")); }, { once: true });
+  });
 }
 function preview(value: string): string { return value.replace(/\s+/g, " ").slice(0, 1_200); }
 function visibleRefs(projectId: string, facts: Array<{ id: string; description: string }>, pending: FederationReference[]): Map<string, string> {
@@ -405,15 +509,31 @@ function validateVisible(refs: FactRef[], visible: Map<string, string>): void {
     if (visible.get(key) !== ref.description) throw new Error(`FactRef description mismatch: ${key}`);
   }
 }
+
+/**
+ * True when a Plan write failed only because a source leaf was consumed by a
+ * concurrent Execute while the worker was thinking: either the freshly re-read
+ * Graph no longer lists it as a leaf (validateVisible), or the store rejected
+ * the Intent/Completion with a 409 in the tiny window between re-read and
+ * write. Such conflicts are transient and warrant re-planning from the latest
+ * frontier instead of discarding the round.
+ */
+function isStaleLeafConflict(error: unknown): boolean {
+  if (error instanceof GraphClientError && error.status === 409) {
+    return /is not a current leaf/i.test(error.message);
+  }
+  return error instanceof Error && error.message.startsWith("FactRef is not visible:");
+}
 function validateHints(ids: string[], hints: Array<{ id: string }>): void {
   const visible = new Set(hints.map((hint) => hint.id));
   for (const id of ids) if (!visible.has(id)) throw new Error(`Hint is not available: ${id}`);
 }
 
-const planContract = (maxIntents: number, hasProfiles: boolean): string => `Output one JSON object. Use only the fields shown — no extra fields.
-- {"kind":"intents","intents":[{"from":[{"projectId":"<id>","factId":"<existing fact id>","description":"<exact immutable Fact description>"}],"hintIds":["<unconsumed hint id>"]${hasProfiles ? ',"customProfile":"<exact configured profile description or null>"' : ""},"description":"<verifiable target of one atomic task, UTF-8 at most 2 KiB>"}]}  (1 to ${maxIntents} atomic intents; hintIds may be empty; output noop if no new task is needed)
-- {"kind":"complete","from":[{"projectId":"<id>","factId":"<id>","description":"<exact immutable Fact description>"}],"hintIds":["<unconsumed hint id>"],"description":"<concise proof summary, UTF-8 at most 2 KiB>"}
-- {"kind":"noop"}
-Each Intent must define one atomic, goal-directed state transition from one or more current leaf Facts or pending external leaf FactRefs to exactly one new Fact. It may branch from one leaf, update one leaf, or merge multiple leaves. Do not bundle unrelated transitions, a survey, a matrix, multiple incidents, or multiple files. A merge or synthesis must only transform existing leaf Facts into one bounded result and must not perform new evidence collection. Prefer deepening an established current leaf into the next level of its line of inquiry over starting a new branch from Source: grow a multi-level DAG by continuing the most advanced relevant leaf, and keep each round to 1-3 focused Intents. There is no fixed depth limit — deepen a line for as many levels as needed. Fan out from Source only when no current leaf can be advanced.`;
-const SUPERVISE_CONTRACT = 'Output {"kind":"hint","content":"<concise hint, UTF-8 at most 1 KiB>"} or {"kind":"noop"}. Use only these fields — no extra fields.';
-const EXECUTE_CONTRACT = 'Output {"kind":"fact","description":"<required self-contained conclusion, UTF-8 at most 1 KiB>","artifact":null} when the Fact description fully carries the result, or {"kind":"fact","description":"<required self-contained conclusion, UTF-8 at most 1 KiB>","artifact":{"filename":"<content-based output file name, e.g. report.md, never a graph node id like i001/f001>","mediaType":"<media type>","content":"<full file content>"}} when detailed evidence needs one file. Return the file content inline in the contract; never write files yourself. Use only these fields — no extra fields. Never return a directory or multiple files. The Fact description must remain understandable without opening the optional Artifact. Do not mention internal graph node ids (i001, f001, intent ids, fact ids) in the filename or content.';
+const planContract = (maxIntents: number, hasProfiles: boolean): string => [
+  `intents: {"kind":"intents","intents":[{"from":[{"projectId":"...","factId":"...","description":"..."}],"hintIds":[]${hasProfiles ? ',"customProfile":null' : ""},"description":"..."}]} (1-${maxIntents})`,
+  'complete: {"kind":"complete","from":[{"projectId":"...","factId":"...","description":"..."}],"hintIds":[],"description":"..."}',
+  'noop: {"kind":"noop"}',
+  'Copy FactRefs exactly. Use no undeclared fields. Each Intent is one atomic transition to one Fact.',
+].join("\n");
+const SUPERVISE_CONTRACT = '{"kind":"hint","content":"..."} or {"kind":"noop"}; no undeclared fields.';
+const EXECUTE_CONTRACT = '{"kind":"fact","description":"...","artifact":null} or {"kind":"fact","description":"...","artifact":{"filename":"...","mediaType":"...","content":"..."}}; one optional file, inline content, no undeclared fields.';

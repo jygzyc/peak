@@ -7,7 +7,8 @@ export interface WorkerConfig {
   taskTypes: TaskType[];
   maxRunning: number;
   priority: number;
-  args: string[];
+  /** Per-worker environment variables merged into the CLI subprocess env. */
+  env: Record<string, string>;
 }
 
 export interface CustomProfileDefinition {
@@ -16,22 +17,18 @@ export interface CustomProfileDefinition {
 }
 
 export interface SchedulerConfig {
-  maxConcurrent: number;
   maxRunningProjects: number;
-  maxProjectConcurrent: number;
-  refillPerTick: number;
   intervalMs: number;
 }
 
 export interface ProjectConfig {
   id?: string;
-  name: string;
+  source: string;
   goal: string;
 }
 
 export interface TaskProjectConfig extends ProjectConfig {
   key: string;
-  origin: string;
 }
 
 export interface ResolvedTaskConfig {
@@ -45,7 +42,7 @@ export interface ResolvedTaskConfig {
   workers: Record<string, WorkerConfig>;
   scheduler: SchedulerConfig;
   phase: {
-    plan: { maxIntents: number; customProfile?: CustomProfileDefinition };
+    plan: { customProfile?: CustomProfileDefinition };
     supervise: { intervalMs: number; customProfile?: CustomProfileDefinition };
     execute: { maxArtifactBytes: number; customProfiles: CustomProfileDefinition[] };
   };

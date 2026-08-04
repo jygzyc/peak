@@ -17,7 +17,7 @@ export function initializeTaskDirectory(directory = "."): InitializedTaskPaths {
       projects: [
         {
           id: "",
-          name: "Main",
+          source: "Describe the source material or starting state",
           goal: "Describe what this Project must prove",
         },
       ],
@@ -28,7 +28,6 @@ export function initializeTaskDirectory(directory = "."): InitializedTaskPaths {
         taskTypes: ["plan", "supervise", "execute"],
         maxRunning: 2,
         priority: 1,
-        args: [],
       },
     ],
   }, null, 2)}\n`);

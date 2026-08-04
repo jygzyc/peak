@@ -4,11 +4,22 @@ import type { ProcessResult, ProcessSpec } from "./types.js";
 const MAX_OUTPUT = 10 * 1024 * 1024;
 
 export class ProcessRunner {
-  run(spec: ProcessSpec, cwd: string, timeoutMs: number, signal?: AbortSignal): Promise<ProcessResult> {
+  run(
+    spec: ProcessSpec,
+    cwd: string,
+    timeoutMs: number,
+    signal?: AbortSignal,
+    env?: Record<string, string>,
+    onSpawn?: (pid: number) => void,
+  ): Promise<ProcessResult> {
     if (signal?.aborted) return Promise.resolve(result(false, "", "cancelled", 1, false, true));
     return new Promise((resolve) => {
+      // Worker env wins over the parent env so per-Worker configuration
+      // (PI_MODEL, ANTHROPIC_API_KEY, ...) overrides the host default; spec.env
+      // (protocol-specific) sits between them, and PEAK_AGENT_ACTIVE always set.
+      const childEnv = { ...process.env, ...spec.env, ...(env ?? {}), PEAK_AGENT_ACTIVE: "1" };
       const child = spawn(...launchTarget(spec.argv), {
-        cwd, env: { ...process.env, ...spec.env, PEAK_AGENT_ACTIVE: "1" },
+        cwd, env: childEnv,
         stdio: [spec.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
         detached: process.platform !== "win32", windowsHide: true,
       });
@@ -41,18 +52,48 @@ export class ProcessRunner {
       const timer = setTimeout(() => { timedOut = true; kill(); }, timeoutMs);
       timer.unref?.();
       signal?.addEventListener("abort", abort, { once: true });
-      child.once("spawn", () => { started = true; });
+      child.once("spawn", () => {
+        started = true;
+        if (child.pid !== undefined && onSpawn) onSpawn(child.pid);
+      });
       child.once("error", (error) => { stderr.push(Buffer.from(error.message)); finish(127); });
+      const stdoutFilter = spec.stdoutFilter;
+      let lineBuf = "";
+      const pushLine = (line: string): void => {
+        if (stdoutFilter && !stdoutFilter(line)) return;
+        stdoutBytes += Buffer.byteLength(line, "utf8") + 1;
+        if (stdoutBytes > MAX_OUTPUT) { outputExceeded = true; kill(); return; }
+        stdout.push(Buffer.from(line + "\n", "utf8"));
+      };
       child.stdout?.on("data", (chunk: Buffer) => {
-        stdoutBytes += chunk.length;
-        if (stdoutBytes > MAX_OUTPUT) { outputExceeded = true; kill(); }
-        else stdout.push(chunk);
+        // Without a filter the raw byte stream is captured as before. With a
+        // filter, stdout is split into lines and only retained lines count
+        // toward the bounded budget, so disposable streaming events never
+        // trip the cap.
+        if (!stdoutFilter) {
+          stdoutBytes += chunk.length;
+          if (stdoutBytes > MAX_OUTPUT) { outputExceeded = true; kill(); }
+          else stdout.push(chunk);
+          return;
+        }
+        lineBuf += chunk.toString("utf8");
+        let newline: number;
+        while (!outputExceeded && (newline = lineBuf.indexOf("\n")) >= 0) {
+          const line = lineBuf.slice(0, newline);
+          lineBuf = lineBuf.slice(newline + 1);
+          pushLine(line);
+        }
       });
       child.stderr?.on("data", (chunk: Buffer) => {
         stderrBytes += chunk.length;
         if (stderrBytes <= MAX_OUTPUT) stderr.push(chunk);
       });
-      child.once("close", (code) => finish(timedOut || cancelled || outputExceeded ? 1 : code ?? 1));
+      child.once("close", (code) => {
+        // Flush a trailing partial line so the final event is not lost when the
+        // process exits without a terminal newline.
+        if (stdoutFilter && !outputExceeded && !timedOut && !cancelled && lineBuf) pushLine(lineBuf);
+        finish(timedOut || cancelled || outputExceeded ? 1 : code ?? 1);
+      });
       if (spec.input !== undefined) child.stdin?.end(spec.input);
     });
   }

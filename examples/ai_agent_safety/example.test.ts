@@ -3,16 +3,16 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } fro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { loadTaskConfig } from "../dist/config/task-config.js";
-import { initializeTaskSkills } from "../dist/config/task-skill-installer.js";
-import { FederationBus } from "../dist/graph/federation-bus.js";
-import { GraphClient } from "../dist/graph/graph-client.js";
-import { GraphHttpServer } from "../dist/graph/http-server.js";
-import { ProjectStoreRegistry } from "../dist/graph/project-store-registry.js";
-import { leafFacts } from "../dist/graph/types.js";
-import { TaskExecutor, type TaskWorkers } from "../dist/runtime/task-executor.js";
-import type { TaskType } from "../dist/config/types.js";
-import type { SessionRef, WorkerResult } from "../dist/worker/types.js";
+import { loadTaskConfig } from "../../dist/config/task-config.js";
+import { initializeTaskSkills } from "../../dist/config/task-skill-installer.js";
+import { FederationBus } from "../../dist/graph/federation-bus.js";
+import { GraphClient } from "../../dist/graph/graph-client.js";
+import { GraphHttpServer } from "../../dist/graph/http-server.js";
+import { ProjectStoreRegistry } from "../../dist/graph/project-store-registry.js";
+import { leafFacts } from "../../dist/graph/types.js";
+import { TaskExecutor, type TaskWorkers } from "../../dist/runtime/task-executor.js";
+import type { TaskType } from "../../dist/config/types.js";
+import type { SessionRef, WorkerResult } from "../../dist/worker/types.js";
 
 interface Scripted { type: TaskType; text: string }
 
@@ -44,9 +44,9 @@ test("ai_agent_safety example: depth-first DAG lifecycle through HTTP + TaskExec
   const graph = new GraphClient(server.baseUrl);
   try {
     const configured = config.board.projects[0]!;
-    const origin = `Project "${configured.name}" is open and has not yet proven its goal.`;
+    const origin = configured.source;
     const project = await graph.createProject({
-      title: configured.name,
+      title: configured.source,
       target: origin,
       goal: configured.goal,
     });
@@ -54,9 +54,8 @@ test("ai_agent_safety example: depth-first DAG lifecycle through HTTP + TaskExec
     const federation = new FederationBus();
     federation.register(project.id, projectDir, project.scope);
 
-    const scopingDescription = "Use for defining the bounded deliverable contract and evidence rules for this Project.";
-    const researchDescription = "Use for collecting and assessing one current primary research or standards source.";
-    const incidentDescription = "Use for analyzing one concrete AI or Agent safety incident.";
+    const researchDescription = "Use when assessing one AI safety research paper, official standard, or regulator publication.";
+    const incidentDescription = "Use when investigating one documented AI or Agent safety incident.";
     const briefContent = "# AI safety intelligence brief\nFive atomic findings and three cross-cutting trends.\n";
     const scoping = "The brief contract fixes five finding slots (two research/standards, one incident, one policy, one engineering practice), each requiring a primary URL, date, finding, uncertainty, and implication.";
     const findings = [
@@ -71,15 +70,19 @@ test("ai_agent_safety example: depth-first DAG lifecycle through HTTP + TaskExec
     const worker = new ScriptedWorker([
       // 范围：只有第一个 Intent 从 origin 出发。
       { type: "plan", text: JSON.stringify({ kind: "intents", intents: [
-        { from: [findingRef("origin", origin)], customProfile: scopingDescription, description: "Fix the bounded brief contract: five finding slots and evidence rules" },
+        { from: [findingRef("origin", origin)], description: "Define the decision audience, evidence window, and acceptance rules for the intelligence brief" },
       ] }) },
       { type: "execute", text: JSON.stringify({ kind: "fact", description: scoping, artifact: null }) },
-      // 深挖：五项发现全部从范围叶 f001 出发，绝不从 origin。
+      // 深挖：executeCapacity = sum(execute Worker maxRunning) = 2，五项发现分三轮、每轮 ≤ 2 个 Intent 从范围叶 f001 创建。
       { type: "plan", text: JSON.stringify({ kind: "intents", intents: [
         { from: [findingRef("f001", scoping)], customProfile: researchDescription, description: "Assess the current NIST AI RMF profile as one standards source" },
         { from: [findingRef("f001", scoping)], customProfile: researchDescription, description: "Assess one current primary paper about Agent sandboxing" },
+      ] }) },
+      { type: "plan", text: JSON.stringify({ kind: "intents", intents: [
         { from: [findingRef("f001", scoping)], customProfile: incidentDescription, description: "Analyze one documented Agent tool-confusion incident" },
         { from: [findingRef("f001", scoping)], description: "Assess one current AI deployment policy source" },
+      ] }) },
+      { type: "plan", text: JSON.stringify({ kind: "intents", intents: [
         { from: [findingRef("f001", scoping)], description: "Assess one current tool-authorization engineering-practice source" },
       ] }) },
       ...findings.map((description): Scripted => ({
@@ -96,7 +99,7 @@ test("ai_agent_safety example: depth-first DAG lifecycle through HTTP + TaskExec
 
     const executor = new TaskExecutor(
       config,
-      { key: "project-1", origin, ...configured },
+      { key: "project-1", ...configured },
       graph,
       worker,
       federation,
@@ -108,12 +111,14 @@ test("ai_agent_safety example: depth-first DAG lifecycle through HTTP + TaskExec
     let intents = (await graph.getProject(project.id)).intents;
     assert.equal(intents.length, 1);
     assert.deepEqual(intents[0]!.from.map((ref) => ref.factId), ["origin"]);
-    assert.equal(intents[0]!.customProfile, scopingDescription);
+    assert.equal(intents[0]!.customProfile, null);
     await executor.execute(project.id, intents[0]!, "e1");
     assert.deepEqual(leafFacts(await graph.getProject(project.id)).map((fact) => fact.id), ["f001"]);
 
-    // 深挖：五项发现全部从范围叶 f001 出发。
+    // 深挖：五项发现分三轮、全部从范围叶 f001 出发（executeCapacity = 2，每轮 ≤ 2 个 Intent）。
     await executor.plan(project.id, "p2");
+    await executor.plan(project.id, "p3");
+    await executor.plan(project.id, "p4");
     intents = (await graph.getProject(project.id)).intents;
     const findingsIntents = intents.filter((intent) => intent.to === null);
     assert.equal(findingsIntents.length, 5);
@@ -123,14 +128,14 @@ test("ai_agent_safety example: depth-first DAG lifecycle through HTTP + TaskExec
 
     // 汇总：只合并已建立的叶。
     await executor.supervise(project.id, "s1");
-    await executor.plan(project.id, "p3");
+    await executor.plan(project.id, "p5");
     intents = (await graph.getProject(project.id)).intents;
     const synthesis = intents.find((intent) => intent.to === null)!;
     assert.ok(synthesis, "synthesis intent should be open");
     assert.equal(synthesis.from.length, 5);
     assert.deepEqual(synthesis.from.map((ref) => ref.factId), ["f002", "f003", "f004", "f005", "f006"]);
     await executor.execute(project.id, synthesis, "e7");
-    await executor.plan(project.id, "p4");
+    await executor.plan(project.id, "p6");
 
     const result = await graph.getProject(project.id);
     assert.equal(result.project.status, "completed");
@@ -141,10 +146,11 @@ test("ai_agent_safety example: depth-first DAG lifecycle through HTTP + TaskExec
     assert.ok(result.facts.filter((fact) => /^f00[2-6]$/.test(fact.id)).every((fact) => fact.artifact === null));
     assert.equal(result.facts.find((fact) => fact.id === "f007")?.artifact?.mediaType, "text/markdown");
     assert.equal("customProfile" in result.facts.find((fact) => fact.id === "f001")!, false);
-    assert.equal(result.intents[0]?.customProfile, scopingDescription);
+    assert.equal(result.intents[0]?.customProfile, null);
     assert.equal(result.intents[1]?.customProfile, researchDescription);
     assert.equal(result.intents[3]?.customProfile, incidentDescription);
-    assert.match(result.intents[0]!.customProfileDigest!, /^[0-9a-f]{16}$/);
+    assert.equal(result.intents[0]?.customProfileDigest, null);
+    assert.match(result.intents[1]!.customProfileDigest!, /^[0-9a-f]{16}$/);
     assert.equal(result.hints.length, 0);
     const completion = result.intents.find((intent) => intent.to?.factId === "goal");
     assert.ok(completion && completion.concludedBy, "completion intent must exist and be concluded");

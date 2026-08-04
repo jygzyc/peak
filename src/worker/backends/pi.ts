@@ -1,167 +1,134 @@
-import {
-  type AgentSession,
-  createAgentSession,
-  ModelRuntime,
-  resolveCliModel,
-  SessionManager,
-} from "@earendil-works/pi-coding-agent";
-import type { SessionRef, WorkerDriver, WorkerRequest, WorkerResult } from "../types.js";
+import { randomBytes } from "node:crypto";
+import { mkdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { ProcessResult, ProcessSpec, SessionRef, WorkerCall, WorkerProtocol, WorkerType } from "../types.js";
+import { jsonLines } from "./shared.js";
 
-const SESSION_TTL_MS = 10 * 60_000;
+const TYPE: WorkerType = "pi";
+const PI_PACKAGE = "@earendil-works/pi-coding-agent";
 
-interface RetainedSession {
-  session: AgentSession;
-  timer: NodeJS.Timeout;
+/**
+ * Resolves the Pi CLI entry from the installed dependency, then launches it
+ * through `process.execPath` so Peak never depends on `pi` being on PATH.
+ *
+ * pi-coding-agent seals its subpaths behind a package "exports" map, so the
+ * CLI entry cannot be resolved as a bare subpath (`.../dist/cli.js`). Resolve
+ * the package main instead, walk back to its root, and read the published
+ * "bin.pi" target. Throws a clear error if Pi is not installed.
+ */
+function piCliTarget(): [string, string[]] {
+  let entry: string;
+  try {
+    const mainPath = fileURLToPath(import.meta.resolve(PI_PACKAGE));
+    const pkgRoot = dirname(dirname(mainPath));
+    const pkg = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf8")) as {
+      bin?: Record<string, string>;
+    };
+    const binTarget = pkg.bin?.pi;
+    if (!binTarget) throw new Error("missing bin.pi");
+    entry = join(pkgRoot, binTarget);
+  } catch {
+    throw new Error(`pi CLI entry not found; install ${PI_PACKAGE}`);
+  }
+  return [process.execPath, [entry]];
 }
 
-export class PiDriver implements WorkerDriver {
-  readonly type = "pi";
-  readonly canResume = true;
-  private readonly sessions = new Map<string, RetainedSession>();
-  private modelRuntime?: Promise<ModelRuntime>;
-
-  async execute(request: WorkerRequest): Promise<WorkerResult> {
-    const { config, taskType, prompt, timeoutMs, cwd, signal, session: currentSession } = request;
-    if (signal?.aborted) return failure("cancelled", false, false, true);
-    if (config.args.length) return failure("pi worker args are not supported by the Pi Agent SDK", false);
-
-    let session: AgentSession | undefined;
-    let warning = "";
-    try {
-      if (currentSession) {
-        const retained = this.sessions.get(currentSession.value);
-        if (!retained) return failure(`pi session is no longer available: ${currentSession.value}`, false);
-        clearTimeout(retained.timer);
-        this.sessions.delete(currentSession.value);
-        session = retained.session;
-      } else {
-        const modelRuntime = await this.getModelRuntime();
-        const selected = config.model
-          ? resolveCliModel({ cliModel: config.model, modelRuntime })
-          : undefined;
-        if (selected?.error) return failure(selected.error, false);
-        warning = selected?.warning ?? "";
-        ({ session } = await createAgentSession({
-          cwd,
-          model: selected?.model,
-          thinkingLevel: selected?.thinkingLevel,
-          modelRuntime,
-          sessionManager: SessionManager.inMemory(cwd),
-        }));
-      }
-    } catch (error) {
-      return failure(errorMessage(error), false);
-    }
-
-    let text = "";
-    let streamed = "";
-    const unsubscribe = session.subscribe((event) => {
-      if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-        streamed += event.assistantMessageEvent.delta;
-      } else if (event.type === "agent_end") {
-        text = assistantText(event.messages) || text;
-      }
-    });
-    let timedOut = false;
-    let cancelled = false;
-    const stopSession = (): void => { void session.abort().catch(() => undefined); };
-    // Gates that always resolve so a hung provider call can never block a
-    // Worker slot forever: the prompt races the timeout and the abort signal.
-    let resolveTimeout!: () => void;
-    const timedOutGate = new Promise<void>((resolve) => { resolveTimeout = resolve; });
-    let resolveAbort!: () => void;
-    const abortedGate = new Promise<void>((resolve) => { resolveAbort = resolve; });
-    const timer = setTimeout(() => {
-      timedOut = true;
-      resolveTimeout();
-      stopSession();
-    }, timeoutMs);
-    timer.unref?.();
-    const abort = (): void => {
-      cancelled = true;
-      resolveAbort();
-      stopSession();
-    };
-    signal?.addEventListener("abort", abort, { once: true });
-
-    let error = "";
-    try {
-      await Promise.race([
-        session.prompt(prompt, { expandPromptTemplates: false, source: "rpc" }),
-        timedOutGate.then(() => Promise.reject(new Error("request timed out"))),
-        abortedGate.then(() => Promise.reject(new Error("cancelled"))),
-      ]);
-      error = session.agent.state.errorMessage ?? "";
-    } catch (cause) {
-      error = errorMessage(cause);
-    } finally {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", abort);
-      unsubscribe();
-    }
-
-    text ||= streamed.trim();
-    const resumable = taskType === "execute" && !currentSession && !cancelled;
-    const sessionRef = resumable ? this.retain(session) : undefined;
-    if (!resumable) session.dispose();
-    const stderr = [warning, error].filter(Boolean).join("\n");
-    return {
-      text,
-      stdout: text,
-      stderr,
-      returncode: timedOut || cancelled || error ? 1 : 0,
-      timedOut,
-      cancelled,
-      started: true,
-      session: sessionRef,
-    };
-  }
-
-  dispose(): void {
-    for (const retained of this.sessions.values()) {
-      clearTimeout(retained.timer);
-      retained.session.dispose();
-    }
-    this.sessions.clear();
-  }
-
-  private retain(session: AgentSession): SessionRef {
-    const id = session.sessionId;
-    const timer = setTimeout(() => {
-      const retained = this.sessions.get(id);
-      if (retained?.session !== session) return;
-      this.sessions.delete(id);
-      session.dispose();
-    }, SESSION_TTL_MS);
-    timer.unref?.();
-    this.sessions.set(id, { session, timer });
-    return { workerType: "pi", value: id };
-  }
-
-  private getModelRuntime(): Promise<ModelRuntime> {
-    return this.modelRuntime ??= ModelRuntime.create();
-  }
+/**
+ * Builds the Pi CLI argv from a resolved `[command, commandArgs]` target.
+ * Pure and testable: the target is produced by {@link piCliTarget} in
+ * production but can be stubbed in tests without Pi installed.
+ */
+export function buildPiArgv(
+  call: WorkerCall,
+  session: SessionRef | undefined,
+  target: [string, string[]],
+): { argv: string[]; input: string; sessionDir: string } {
+  const sessionDir = call.sessionDir ?? fallbackSessionDir();
+  mkdirSync(sessionDir, { recursive: true });
+  const [command, commandArgs] = target;
+  const argv = [command, ...commandArgs, "--mode", "json", "--session-dir", sessionDir];
+  if (session) argv.push("--session", session.value);
+  if (call.config.model) argv.push("--model", call.config.model);
+  argv.push("-p");
+  return { argv, input: call.prompt, sessionDir };
 }
 
-function assistantText(messages: unknown): string {
-  if (!Array.isArray(messages)) return "";
-  for (const message of [...messages].reverse()) {
-    if (!message || typeof message !== "object" || (message as { role?: unknown }).role !== "assistant") continue;
-    const content = (message as { content?: unknown }).content;
-    if (!Array.isArray(content)) continue;
-    return content.flatMap((part) => {
-      if (!part || typeof part !== "object") return [];
-      const value = part as { type?: unknown; text?: unknown };
-      return value.type === "text" && typeof value.text === "string" ? [value.text] : [];
-    }).join("\n").trim();
+/**
+ * Pi CLI protocol. Runs `pi --mode json` so the agent session streams as
+ * newline-delimited events; the prompt is piped via stdin (`-p`). Session
+ * files live under an isolated `--session-dir` so they never pollute the
+ * Board directory; Finalize resume passes the captured session id back with
+ * `--session`. Pi itself owns provider auth, model catalogs, and session
+ * persistence.
+ */
+export const piProtocol: WorkerProtocol = {
+  type: TYPE,
+  canResume: true,
+  build(call: WorkerCall, session: SessionRef | undefined): ProcessSpec {
+    const { argv, input } = buildPiArgv(call, session, piCliTarget());
+    // `pi --mode json` streams one event per token/thinking delta; only the
+    // session header and the final agent_end carry what Peak needs. Filtering
+    // the rest on the fly keeps a long streaming run well under the bounded
+    // stdout capture instead of being misread as runaway output.
+    return { argv, input, stdoutFilter: keepPiEvent };
+  },
+  parse(result: ProcessResult): { text: string; session?: SessionRef } {
+    const events = jsonLines(result.stdout);
+    const sessionId = events.find((event) => event.type === "session")?.id;
+    const sessionRef = typeof sessionId === "string" && sessionId ? { workerType: TYPE, value: sessionId } : undefined;
+    return { text: assistantText(events) || result.stdout.trim(), session: sessionRef };
+  },
+};
+
+/**
+ * Extracts the final assistant text from the last `agent_end` event's
+ * messages. Mirrors the SDK-era extraction: walk messages in reverse, join the
+ * text parts of the last assistant message.
+ */
+function assistantText(events: Array<Record<string, unknown>>): string {
+  for (const event of [...events].reverse()) {
+    if (event.type !== "agent_end") continue;
+    const messages = (event as { messages?: unknown }).messages;
+    if (!Array.isArray(messages)) continue;
+    for (const message of [...messages].reverse()) {
+      if (!message || typeof message !== "object" || (message as { role?: unknown }).role !== "assistant") continue;
+      const content = (message as { content?: unknown }).content;
+      if (!Array.isArray(content)) continue;
+      const text = content.flatMap((part) => {
+        if (!part || typeof part !== "object") return [];
+        const value = part as { type?: unknown; text?: unknown };
+        return value.type === "text" && typeof value.text === "string" ? [value.text] : [];
+      }).join("\n").trim();
+      if (text) return text;
+    }
   }
   return "";
 }
 
-function failure(stderr: string, started: boolean, timedOut = false, cancelled = false): WorkerResult {
-  return { text: "", stdout: "", stderr, returncode: 1, timedOut, cancelled, started };
+/**
+ * Retains only the JSONL events pi.parse consumes: the session header (for the
+ * resumable id) and agent_end (for the final assistant text). Every streaming
+ * delta, tool-progress, and lifecycle event in between is dropped before it
+ * reaches the capture buffer.
+ */
+function keepPiEvent(line: string): boolean {
+  try {
+    const value = JSON.parse(line) as unknown;
+    if (!value || typeof value !== "object") return false;
+    const type = (value as { type?: unknown }).type;
+    return type === "session" || type === "agent_end";
+  } catch {
+    return false;
+  }
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+/**
+ * Defensive fallback session dir (never used in production, where Runtime
+ * injects a Project-scoped dir) so a direct protocol call does not write into
+ * an arbitrary cwd-derived location.
+ */
+function fallbackSessionDir(): string {
+  const token = randomBytes(8).toString("hex");
+  return join(process.cwd(), ".peak-pi-sessions", token);
 }

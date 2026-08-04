@@ -28,6 +28,7 @@ examples/**/*.db-wal
 # Binary test samples (large; fetch separately)
 examples/*.apk
 .peak*
+.pi-probe*/
 
 # Code intelligence cache
 .codegraph/

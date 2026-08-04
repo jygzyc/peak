@@ -40,6 +40,9 @@ export function loadTaskConfig(directory = "."): ResolvedTaskConfig {
   if (!Object.values(workers).some((worker) => worker.taskTypes.includes("supervise"))) {
     throw new Error("at least one worker must support supervise");
   }
+  if (!Object.values(workers).some((worker) => worker.taskTypes.includes("execute"))) {
+    throw new Error("at least one worker must support execute");
+  }
   return deepFreeze({
     configPath,
     taskDir,
@@ -65,19 +68,19 @@ function deepFreeze<T>(value: T): T {
 function parseProjects(value: unknown): ProjectConfig[] {
   const input = array(value, "board.projects");
   if (input.length === 0) throw new Error("board.projects must not be empty");
-  const names = new Set<string>();
+  const sources = new Set<string>();
   const ids = new Set<string>();
   return input.map((raw, index) => {
     const label = `board.projects[${index}]`;
     const project = object(raw, label);
-    keys(project, ["id", "name", "goal"], label);
+    keys(project, ["id", "source", "goal"], label);
     const id = optionalUuid(project.id, `${label}.id`);
-    const name = requiredString(project.name, `${label}.name`);
-    if (names.has(name)) throw new Error(`duplicate Project name: ${name}`);
+    const source = projectDescription(project.source, `${label}.source`);
+    if (sources.has(source)) throw new Error(`duplicate Project source: ${source}`);
     if (id && ids.has(id)) throw new Error(`duplicate Project id: ${id}`);
-    names.add(name);
+    sources.add(source);
     if (id) ids.add(id);
-    return { id, name, goal: requiredString(project.goal, `${label}.goal`) };
+    return { id, source, goal: projectDescription(project.goal, `${label}.goal`) };
   });
 }
 
@@ -89,7 +92,7 @@ function parseWorkers(value: unknown): Record<string, WorkerConfig> {
     const name = `worker-${index + 1}`;
     const label = `workers[${index}]`;
     const worker = object(raw, label);
-    keys(worker, ["type", "model", "taskTypes", "maxRunning", "priority", "args"], label);
+    keys(worker, ["type", "model", "taskTypes", "maxRunning", "priority", "env"], label);
     const type = enumeration(worker.type, WORKER_TYPES, `${label}.type`);
     output[name] = {
       type,
@@ -97,7 +100,7 @@ function parseWorkers(value: unknown): Record<string, WorkerConfig> {
       taskTypes: enumerations(worker.taskTypes, TASK_TYPES, `${label}.taskTypes`) ?? [...TASK_TYPES],
       maxRunning: integer(worker.maxRunning, `${label}.maxRunning`) ?? 1,
       priority: integer(worker.priority, `${label}.priority`, 0) ?? 1,
-      args: strings(worker.args, `${label}.args`) ?? [],
+      env: stringRecord(worker.env, `${label}.env`),
     };
   });
   return output;
@@ -108,10 +111,7 @@ function parseScheduler(value: unknown): ResolvedTaskConfig["scheduler"] {
   const input = object(value, "scheduler");
   keys(input, Object.keys(DEFAULT_SCHEDULER), "scheduler");
   return {
-    maxConcurrent: integer(input.maxConcurrent, "scheduler.maxConcurrent") ?? DEFAULT_SCHEDULER.maxConcurrent,
     maxRunningProjects: integer(input.maxRunningProjects, "scheduler.maxRunningProjects") ?? DEFAULT_SCHEDULER.maxRunningProjects,
-    maxProjectConcurrent: integer(input.maxProjectConcurrent, "scheduler.maxProjectConcurrent") ?? DEFAULT_SCHEDULER.maxProjectConcurrent,
-    refillPerTick: integer(input.refillPerTick, "scheduler.refillPerTick") ?? DEFAULT_SCHEDULER.refillPerTick,
     intervalMs: integer(input.intervalMs, "scheduler.intervalMs") ?? DEFAULT_SCHEDULER.intervalMs,
   };
 }
@@ -120,12 +120,11 @@ function parsePhase(value: unknown): ResolvedTaskConfig["phase"] {
   if (value === undefined) return structuredClone(DEFAULT_PHASE);
   const input = object(value, "phase");
   keys(input, ["plan", "supervise", "execute"], "phase");
-  const plan = section(input.plan, "phase.plan", ["maxIntents", "customProfile"]);
+  const plan = section(input.plan, "phase.plan", ["customProfile"]);
   const supervise = section(input.supervise, "phase.supervise", ["intervalMs", "customProfile"]);
   const execute = section(input.execute, "phase.execute", ["maxArtifactBytes", "customProfiles"]);
   return {
     plan: {
-      maxIntents: integer(plan.maxIntents, "phase.plan.maxIntents") ?? DEFAULT_PHASE.plan.maxIntents,
       ...optionalCustomProfile(plan.customProfile, "phase.plan.customProfile"),
     },
     supervise: {
@@ -178,6 +177,12 @@ function optionalString(value: unknown, label: string): string | undefined {
   return value.trim();
 }
 
+function projectDescription(value: unknown, label: string): string {
+  const result = requiredString(value, label);
+  if (Buffer.byteLength(result, "utf8") > 4 * 1024) throw new Error(`${label} exceeds 4 KiB`);
+  return result;
+}
+
 function optionalPrompt(value: unknown, label: string): string | undefined {
   if (value === undefined) return undefined;
   const result = requiredString(value, label);
@@ -228,6 +233,32 @@ function strings(value: unknown, label: string): string[] | undefined {
   if (value === undefined) return undefined;
   if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
   return [...new Set(value.map((item) => requiredString(item, label)))];
+}
+
+function stringRecord(value: unknown, label: string): Record<string, string> {
+  if (value === undefined) return {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
+  const output: Record<string, string> = {};
+  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+    const entryLabel = `${label}.${key}`;
+    const trimmedKey = optionalString(key, entryLabel);
+    if (!trimmedKey) throw new Error(`${entryLabel} has an empty key`);
+    if (typeof raw !== "string" || raw === "") throw new Error(`${entryLabel} must be a non-empty string`);
+    output[trimmedKey] = raw;
+  }
+  return output;
+}
+
+/**
+ * The single source of Intent-generation and Execute-concurrency capacity:
+ * the sum of `maxRunning` over every Worker whose `taskTypes` includes
+ * `execute`. Plan may create at most this many Intents in one round, and the
+ * Runtime may run at most this many Executes concurrently.
+ */
+export function executeCapacity(config: ResolvedTaskConfig): number {
+  return Object.values(config.workers)
+    .filter((worker) => worker.taskTypes.includes("execute"))
+    .reduce((sum, worker) => sum + worker.maxRunning, 0);
 }
 
 function integer(value: unknown, label: string, minimum = 1): number | undefined {

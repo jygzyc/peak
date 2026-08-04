@@ -23,7 +23,7 @@ test("config owns configured paths and Board directory initialization", () => {
     assert.equal(initialized.taskDir, task.taskDir);
     assert.deepEqual(initialized.board.skills, []);
     assert.deepEqual(initialized.board.projects, [
-      { id: undefined, name: "Main", goal: "Describe what this Project must prove" },
+      { id: undefined, source: "Describe the source material or starting state", goal: "Describe what this Project must prove" },
     ]);
     assert.deepEqual(initializeTaskSkills(initialized, {
       agentsDir: join(root, "unused-agents"),
@@ -47,8 +47,8 @@ test("config is strict and initializes Board skills", () => {
       board: {
         skills: ["review", "installed"],
         projects: [
-          { id: "", name: "Research", goal: "collect research" },
-          { id: "123e4567-e89b-42d3-a456-426614174000", name: "Delivery", goal: "prepare delivery" },
+          { id: "", source: "Research inputs", goal: "collect research" },
+          { id: "123e4567-e89b-42d3-a456-426614174000", source: "Delivery inputs", goal: "prepare delivery" },
         ],
       },
       workers: [
@@ -58,13 +58,15 @@ test("config is strict and initializes Board skills", () => {
     }));
     const config = loadTaskConfig(root);
     assert.equal(config.taskDir, root);
-    assert.deepEqual(config.board.projects.map((project) => project.name), ["Research", "Delivery"]);
+    assert.deepEqual(config.board.projects.map((project) => project.source), ["Research inputs", "Delivery inputs"]);
     assert.equal(config.board.projects[0]?.id, undefined);
     assert.equal(config.board.projects[1]?.id, "123e4567-e89b-42d3-a456-426614174000");
     assert.equal(Object.isFrozen(config.board.projects[0]), true);
     assert.equal(config.workers["worker-2"]?.model, undefined, "empty model selects the Agent tool default");
-    assert.deepEqual(config.phase.plan, { maxIntents: 3 });
+    assert.deepEqual(config.phase.plan, {});
     assert.equal(config.phase.supervise.intervalMs, 60_000);
+    assert.equal(config.phase.execute.maxArtifactBytes, 10 * 1024 * 1024);
+    assert.deepEqual(config.workers["worker-1"]?.env, {}, "workers default to an empty env map");
     const first = initializeTaskSkills(config, { agentsDir: agents, claudeDir: join(root, "claude-skills") });
     const second = initializeTaskSkills(config, { agentsDir: agents, claudeDir: join(root, "claude-skills") });
     assert.ok(existsSync(join(agents, "review", "SKILL.md")));
@@ -79,16 +81,16 @@ test("config is strict and initializes Board skills", () => {
     const badDir = join(root, "bad");
     mkdirSync(badDir);
     writeFileSync(join(badDir, "task.json"), JSON.stringify({
-      board: { projects: [{ name: "Main", goal: "start" }], unknown: true },
-      workers: [{ type: "pi", taskTypes: ["supervise"] }],
+      board: { projects: [{ source: "Main", goal: "start" }], unknown: true },
+      workers: [{ type: "pi", taskTypes: ["supervise", "execute"] }],
     }));
     assert.throws(() => loadTaskConfig(badDir), /unknown field/);
 
     const phaseTimeoutDir = join(root, "phase-timeout");
     mkdirSync(phaseTimeoutDir);
     writeFileSync(join(phaseTimeoutDir, "task.json"), JSON.stringify({
-      board: { projects: [{ name: "Main", goal: "start" }] },
-      workers: [{ type: "pi", taskTypes: ["supervise"] }],
+      board: { projects: [{ source: "Main", goal: "start" }] },
+      workers: [{ type: "pi", taskTypes: ["supervise", "execute"] }],
       phase: { plan: { timeoutMs: 1_000 } },
     }));
     assert.throws(() => loadTaskConfig(phaseTimeoutDir), /phase\.plan contains unknown field "timeoutMs"/);
@@ -97,41 +99,40 @@ test("config is strict and initializes Board skills", () => {
     mkdirSync(noProjectsDir);
     writeFileSync(join(noProjectsDir, "task.json"), JSON.stringify({
       board: { projects: [] },
-      workers: [{ type: "pi", taskTypes: ["supervise"] }],
+      workers: [{ type: "pi", taskTypes: ["supervise", "execute"] }],
     }));
     assert.throws(() => loadTaskConfig(noProjectsDir), /board\.projects must not be empty/);
 
     const duplicateDir = join(root, "duplicate-project");
     mkdirSync(duplicateDir);
     writeFileSync(join(duplicateDir, "task.json"), JSON.stringify({
-      board: { projects: [{ name: "Same", goal: "one" }, { name: "Same", goal: "two" }] },
-      workers: [{ type: "pi", taskTypes: ["supervise"] }],
+      board: { projects: [{ source: "Same", goal: "one" }, { source: "Same", goal: "two" }] },
+      workers: [{ type: "pi", taskTypes: ["supervise", "execute"] }],
     }));
-    assert.throws(() => loadTaskConfig(duplicateDir), /duplicate Project name/);
+    assert.throws(() => loadTaskConfig(duplicateDir), /duplicate Project source/);
 
     const badIdDir = join(root, "bad-project-id");
     mkdirSync(badIdDir);
     writeFileSync(join(badIdDir, "task.json"), JSON.stringify({
-      board: { projects: [{ id: "not-a-uuid", name: "Main", goal: "done" }] },
-      workers: [{ type: "pi", taskTypes: ["supervise"] }],
+      board: { projects: [{ id: "not-a-uuid", source: "Main", goal: "done" }] },
+      workers: [{ type: "pi", taskTypes: ["supervise", "execute"] }],
     }));
     assert.throws(() => loadTaskConfig(badIdDir), /must be empty or a UUID/);
 
     const promptsDir = join(root, "custom-prompts");
     mkdirSync(promptsDir);
     const promptTask = {
-      board: { projects: [{ name: "Main", goal: "done" }] },
-      workers: [{ type: "pi", taskTypes: ["supervise"] }],
+      board: { projects: [{ source: "Main", goal: "done" }] },
+      workers: [{ type: "pi", taskTypes: ["supervise", "execute"] }],
       phase: {
         plan: { customProfile: { description: "Use for security planning.", prompt: "Plan every proof edge." } },
         supervise: { customProfile: { description: "Use for proof review.", prompt: "Check every proof edge." } },
-        execute: { customProfiles: [{ description: "Use for primary research.", prompt: "Collect primary evidence." }] },
+        execute: { maxArtifactBytes: 2_048, customProfiles: [{ description: "Use for primary research.", prompt: "Collect primary evidence." }] },
       },
     };
     writeFileSync(join(promptsDir, "task.json"), JSON.stringify(promptTask));
     const promptConfig = loadTaskConfig(promptsDir);
     assert.deepEqual(promptConfig.phase.plan, {
-      maxIntents: 3,
       customProfile: { description: "Use for security planning.", prompt: "Plan every proof edge." },
     });
     assert.deepEqual(promptConfig.phase.supervise, {
@@ -141,8 +142,62 @@ test("config is strict and initializes Board skills", () => {
     assert.deepEqual(promptConfig.phase.execute.customProfiles, [
       { description: "Use for primary research.", prompt: "Collect primary evidence." },
     ]);
+    assert.equal(promptConfig.phase.execute.maxArtifactBytes, 2_048);
     (promptTask.phase.supervise.customProfile as { description: string; prompt?: string }).prompt = undefined;
     writeFileSync(join(promptsDir, "task.json"), JSON.stringify(promptTask));
     assert.throws(() => loadTaskConfig(promptsDir), /customProfile\.prompt is required/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("config parses worker env and rejects removed scheduler/args fields", () => {
+  const root = mkdtempSync(join(tmpdir(), "peak-env-"));
+  try {
+    mkdirSync(join(root, "skills"), { recursive: true });
+    writeFileSync(join(root, "task.json"), JSON.stringify({
+      board: { projects: [{ source: "Main", goal: "done" }] },
+      workers: [
+        { type: "pi", taskTypes: ["plan", "supervise"], env: { PI_MODEL: "deepseek/v4", ANTHROPIC_API_KEY: "sk-test" } },
+        { type: "codex", taskTypes: ["execute"], maxRunning: 2, env: { CODEX_MODEL: "gpt-5" } },
+      ],
+    }));
+    const config = loadTaskConfig(root);
+    assert.deepEqual(config.workers["worker-1"]?.env, { PI_MODEL: "deepseek/v4", ANTHROPIC_API_KEY: "sk-test" });
+    assert.deepEqual(config.workers["worker-2"]?.env, { CODEX_MODEL: "gpt-5" });
+    assert.equal(config.scheduler.maxRunningProjects, 4);
+    assert.equal(config.scheduler.intervalMs, 3_000);
+
+    const argsDir = join(root, "args");
+    mkdirSync(argsDir);
+    writeFileSync(join(argsDir, "task.json"), JSON.stringify({
+      board: { projects: [{ source: "Main", goal: "done" }] },
+      workers: [{ type: "pi", taskTypes: ["plan", "supervise", "execute"], args: ["--thinking", "high"] }],
+    }));
+    assert.throws(() => loadTaskConfig(argsDir), /unknown field "args"/);
+
+    const schedulerDir = join(root, "scheduler");
+    mkdirSync(schedulerDir);
+    writeFileSync(join(schedulerDir, "task.json"), JSON.stringify({
+      board: { projects: [{ source: "Main", goal: "done" }] },
+      workers: [{ type: "pi", taskTypes: ["plan", "supervise", "execute"] }],
+      scheduler: { maxConcurrent: 4 },
+    }));
+    assert.throws(() => loadTaskConfig(schedulerDir), /unknown field "maxConcurrent"/);
+
+    const planDir = join(root, "plan");
+    mkdirSync(planDir);
+    writeFileSync(join(planDir, "task.json"), JSON.stringify({
+      board: { projects: [{ source: "Main", goal: "done" }] },
+      workers: [{ type: "pi", taskTypes: ["plan", "supervise", "execute"] }],
+      phase: { plan: { maxIntents: 4 } },
+    }));
+    assert.throws(() => loadTaskConfig(planDir), /phase\.plan contains unknown field "maxIntents"/);
+
+    const noExecuteDir = join(root, "no-execute");
+    mkdirSync(noExecuteDir);
+    writeFileSync(join(noExecuteDir, "task.json"), JSON.stringify({
+      board: { projects: [{ source: "Main", goal: "done" }] },
+      workers: [{ type: "pi", taskTypes: ["plan", "supervise"] }],
+    }));
+    assert.throws(() => loadTaskConfig(noExecuteDir), /at least one worker must support execute/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

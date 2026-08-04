@@ -1,4 +1,5 @@
-import type { SchedulerConfig } from "../config/types.js";
+import { executeCapacity } from "../config/task-config.js";
+import type { ResolvedTaskConfig } from "../config/types.js";
 import { ProjectLoop } from "../project/project-loop.js";
 import { ExecutionRegistry } from "./execution-registry.js";
 
@@ -8,7 +9,7 @@ export class RuntimeScheduler {
   private ticking = false;
   private cursor = 0;
 
-  constructor(private readonly config: SchedulerConfig, readonly executions: ExecutionRegistry) {}
+  constructor(private readonly config: ResolvedTaskConfig, readonly executions: ExecutionRegistry) {}
   add(loop: ProjectLoop): void { this.loops.set(loop.projectId, loop); }
   remove(projectId: string): void {
     this.loops.get(projectId)?.dispose();
@@ -18,7 +19,7 @@ export class RuntimeScheduler {
   start(): void {
     if (this.timer) return;
     void this.tick();
-    this.timer = setInterval(() => void this.tick(), this.config.intervalMs);
+    this.timer = setInterval(() => void this.tick(), this.config.scheduler.intervalMs);
     this.timer.unref?.();
   }
 
@@ -33,10 +34,13 @@ export class RuntimeScheduler {
     if (this.ticking) return;
     this.ticking = true;
     try {
-      let slots = Math.max(0, this.config.maxConcurrent - this.executions.count());
+      // Execute capacity is the single global Execute-concurrency budget; Plan
+      // and Supervise run on their own channels and do not consume it.
+      const capacity = executeCapacity(this.config);
+      let slots = Math.max(0, capacity - this.executions.count(undefined, "execute"));
       const all = [...this.loops.values()];
       if (all.length === 0) return;
-      const loops = [...all.slice(this.cursor), ...all.slice(0, this.cursor)].slice(0, this.config.maxRunningProjects);
+      const loops = [...all.slice(this.cursor), ...all.slice(0, this.cursor)].slice(0, this.config.scheduler.maxRunningProjects);
       this.cursor = (this.cursor + loops.length) % all.length;
       for (const loop of loops) slots -= await loop.tick(slots);
     } finally { this.ticking = false; }

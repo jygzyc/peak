@@ -27,13 +27,15 @@ flowchart TB
 
   subgraph server["GraphHttpServer"]
     direction TB
-    API["HTTP API"] --> SSR["ProjectStoreRegistry"]
+    API["Graph HTTP API"] --> SSR["ProjectStoreRegistry"]
+    Ext["authenticated apiExtensions<br/>/api/runtime/*"] -.-> API
     SSR --> Stores[("per-Project<br/>SQLite + Artifact stores")]
   end
 
   subgraph runtime["AgentRuntime"]
     direction TB
-    Sched["RuntimeScheduler"] --> PL["ProjectLoop"]
+    AR["composition root"] --> Sched["RuntimeScheduler"]
+    Sched --> PL["ProjectLoop"]
     PL --> Exec["TaskExecutor"]
     GC["GraphClient"]
     Exec --> GC
@@ -42,13 +44,14 @@ flowchart TB
 
   subgraph worker["WorkerRuntime"]
     direction TB
-    WD["WorkerDriver.execute"] --> Pi["Pi Agent SDK"]
-    WD --> Cli["CliWorkerDriver → ProcessRunner → Agent CLI"]
+    WR["WorkerRuntime"] --> PR["ProcessRunner"]
+    PR --> CLI["pi | opencode | codex | claude CLI"]
   end
 
   Client -->|"HTTP API"| API
   GC -.->|"loopback HTTP"| API
-  Exec -->|"Plan / Supervise / Execute / Finalize"| WD
+  Exec -->|"Plan / Supervise / Execute / Finalize"| WR
+  AR -.->|"inject read-only Runtime extensions"| Ext
   Fed -.-> PL
 ```
 
@@ -67,12 +70,12 @@ flowchart TB
 | 模块 | 职责 |
 | --- | --- |
 | `src/config/` | 严格解析 Board、解析路径、初始化 Board、原子回写 Project UUID、解析并临时安装 Skill |
-| `src/graph/` | Graph 类型、HTTP API/Client、私有 SQLite/Artifact store、Federation、导出 |
+| `src/graph/` | Graph 类型、HTTP API/Client、私有 SQLite/Artifact store、Federation、Project 归档导入导出 |
 | `src/project/` | ProjectManager、ProjectLoop、Supervise 定时控制 |
 | `src/runtime/` | Runtime 组装、调度、执行注册表、阶段合同、Graph context、内置 Prompt |
-| `src/worker/` | Worker 选择、Pi Agent SDK、Agent CLI Driver、ProcessRunner |
+| `src/worker/` | 无状态 CLI 协议（Pi/OpenCode/Codex/Claude Code）、Worker 选择、ProcessRunner |
 | `src/ui/` | 可选的自包含 Dashboard 资源 |
-| `src/cli.ts` | `run`、`resume`、`serve`、`init`、`workers` 与信号生命周期 |
+| `src/cli.ts` | `run`、`resume`、`serve`、`stop`、`export`、`import`、`init`、`workers` 与进程/信号生命周期 |
 
 `sqlite-store.ts` 和 `artifact-store.ts` 是 Graph Server 私有实现，仅由 `graph/project-store-registry.ts` import；`graph/http-server.ts` 通过 `ProjectStoreRegistry` 间接访问 store，二者均不从 `index.ts` 导出。`graph/` 不得 import `ui/`；Runtime/CLI 组合层可向 `GraphHttpServer` 注入可选根路由。
 
@@ -84,7 +87,7 @@ flowchart TB
 
 创建 Project 时在同一 Project shard 中创建两个保留 Fact：
 
-- `origin`：新建时 Runtime 根据当前 `board.projects[]` 的 `name` 生成稳定的未完成描述；按 id 复用时保持原值；
+- `origin`：新建时直接使用当前 `board.projects[].source`；按 id 复用时保持原值；
 - `goal`：描述来自当前 `board.projects[].goal`。
 
 Board 自身没有 description、Goal、Graph 或完成状态。每个 Project 独立完成，Project 定义不声明彼此依赖或预设应使用哪些其他 Project 结果。Runtime 只把符合范围的跨 Project `FactRef` 作为候选证据提供给 AI，由 AI 根据当前 Goal 判断是否采用。FactRef 是可独立展示、可追溯到源 Project/Fact 的超链接节点，完整包含 `projectId`、`factId` 和源 Fact 的不可变 `description`；Server 必须验证三者一致。
@@ -131,21 +134,21 @@ flowchart LR
   end
 ```
 
-内置英文 Prompt 位于 `src/runtime/prompts/`，Board 不能覆盖其阶段合同和安全边界。`task.json` 可为 Plan、Supervise 各配置一个可选 `customProfile`，并为 Execute 配置多个可选 `customProfiles`。每项都是 `{description,prompt}`：description 向 AI 解释何时应该注入该 prompt；定制内容只作为阶段附加指令。Plan 选中的 Execute profile 只在 Intent 上持久化 description 和 `SHA-256(description + "#" + prompt)` 的前 16 位十六进制签名；Fact、Hint、FactRef 不保存 profile。
+内置英文 Prompt 位于 `src/runtime/prompts/`，只提供上下文、不可变边界和严格合同，把执行选择与判断交给 AI；Board 不能覆盖其阶段合同和安全边界。`task.json` 可为 Plan、Supervise 各配置一个可选 `customProfile`，并为 Execute 配置多个可选 `customProfiles`。每项都是 `{description,prompt}`：description 向 AI 解释何时应该注入该 prompt；定制内容只作为阶段附加指令。Plan 选中的 Execute profile 只在 Intent 上持久化 description 和 `SHA-256(description + "#" + prompt)` 的前 16 位十六进制签名；Fact、Hint、FactRef 不保存 profile。
 
 ### 5.1 Plan
 
-Plan 不读取完整历史 Graph，而由 Runtime 通过 `GraphClient` 组装只读 `PlanGraphView`：完整 Source Fact、Goal Fact，以及当前 Project、全部本地 Leaf Facts、全部 open Intents、全部未消费 Hints、全部 pending Federation 叶 FactRefs。这个规划视图不做 256 KiB 裁剪；Plan 不得在缺少部分当前状态时规划。每个新 Intent 必须从一个或多个当前 Leaf 出发，通过分叉、无状态更新或合并产出恰好一个更接近 Goal 的 Fact，并避开 open Intent 已覆盖的转换。HTTP Server 再次校验 source 仍是当前 Leaf；`complete` 同样只能从当前 Leaf 原子完成 Project。
+Plan 不读取完整历史 Graph，而由 Runtime 通过 `GraphClient` 组装只读 `PlanGraphView`：Source Fact、Goal Fact，以及当前 Project、本地 Leaf Facts、open Intents、未消费 Hints 和 pending Federation 叶 FactRefs。所有阶段视图都遵守固定 256 KiB UTF-8 预算，并以稳定顺序报告 `truncated` 与各列表的 `omitted` 数量；Plan 必须据此判断当前前沿是否足以规划。每个新 Intent 必须从一个或多个当前 Leaf 出发，通过分叉、无状态更新或合并产出恰好一个更接近 Goal 的 Fact，并避开 open Intent 已覆盖的转换。写入前 Runtime 重读当前前沿，HTTP Server 再次校验 source 仍是当前 Leaf；若并发 Execute 恰好消费了 source，Plan 从新前沿重新 dispatch，最多两轮。`complete` 同样只能从当前 Leaf 原子完成 Project。
 
-Plan 的目标是把证明长成**多层级 DAG**：优先从最相关的现有当前叶继续深挖（把既有研究线推向下一层），同一轮只创建少量（通常 1–3 个）聚焦的深化型 Intent，让前沿逐层前进；**深度不限**——一条线可以延伸到 Goal 所需任意层级。只有不存在可延伸的现有叶时才从 `origin` 开新分支，避免一轮从 `origin` 全面铺开成单层星型树。
+Plan AI 自主判断何时分支、深化、合并或完成。Runtime 只强制 current-source、原子单 Fact 转换、严格合同和 `executeCapacity` 上限，不用内置 Prompt 规定领域分析方法或固定推理策略。
 
 ### 5.2 Supervise
 
-Supervise 是固定控制协议。Runtime 通过 `GraphClient` 组装包含当前 Project、Facts、Intents 和 Hints 的只读 `SuperviseGraphView`；每轮最多通过 Hint endpoint 提交一个 Hint，也可以 noop。Supervise 不能创建 Fact/Intent、不能完成或 reopen Project、也不能使用工具执行任务。与已有 Hint 内容重复时不重复写入。新 Hint 进入 Graph 后触发下一轮 Plan。stopped/completed Project 不再监督。
+Supervise 是固定控制协议。Runtime 通过 `GraphClient` 组装包含当前 Project、Facts、Intents、Hints 以及统一 `truncated/omitted` 元数据的只读 `SuperviseGraphView`；每轮最多通过 Hint endpoint 提交一个 Hint，也可以 noop。Supervise 不能创建 Fact/Intent、不能完成或 reopen Project、也不能使用工具执行任务。与已有 Hint 内容重复时不重复写入。新 Hint 进入 Graph 后触发下一轮 Plan。stopped/completed Project 不再监督。
 
 ### 5.3 Execute
 
-Execute 针对一个 `to: null` 的原子 Intent。Runtime 通过 `GraphClient` 解析全部 FactRef，并组装包含当前 Project、Intent 和 resolved sources 的只读 `ExecuteGraphView`。没有 Artifact 的 source 直接以 `artifact: null` 表示；已有 source Artifact 不下载、不复制，Graph Server 返回规范本地 `inputPath` 与 `readOnly: true`，Runtime 在 worker 执行前后校验文件类型、大小和 SHA-256。Intent 的 profile description 和 digest 必须仍与当前配置匹配，随后才注入对应 prompt。**Worker 不被分配 workspace、不写任何文件**：结果需要文件时在合同内联返回 `{filename, mediaType, content}`（filename 是基于内容的输出名，绝不使用 i001/f001 等图节点编号），Runtime 把内容上传到 Project 的 `artifacts/`（内容寻址），并把该 Artifact 绑定到结果 Fact。执行成功产出恰好一个本地不可变 Fact，并可选择绑定零或一个单文件 Artifact；Fact 不携带 profile。失败不会创建伪 Fact或持久化失败记录，Intent 保持 open，后续 tick 可以重试。
+Execute 针对一个 `to: null` 的原子 Intent。Runtime 通过 `GraphClient` 解析 FactRef，并组装包含当前 Project、Intent、resolved sources 以及统一 `truncated/omitted` 元数据的只读 `ExecuteGraphView`。没有 Artifact 的 source 直接以 `artifact: null` 表示；已有 source Artifact 不下载、不复制，Graph Server 返回规范本地 `inputPath` 与 `readOnly: true`，Runtime 在 worker 执行前后校验文件类型、大小和 SHA-256。Intent 的 profile description 和 digest 必须仍与当前配置匹配，随后才注入对应 prompt。**Worker 不被分配 workspace、不写任何文件**：结果需要文件时在合同内联返回 `{filename, mediaType, content}`（filename 是基于内容的输出名，绝不使用 i001/f001 等图节点编号），Runtime 把内容上传到 Project 的 `artifacts/`（内容寻址），并把该 Artifact 绑定到结果 Fact。执行成功产出恰好一个本地不可变 Fact，并可选择绑定零或一个单文件 Artifact；Fact 不携带 profile。失败不会创建伪 Fact或持久化失败记录，Intent 保持 open，后续 tick 可以重试。
 
 ### 5.4 Finalize
 
@@ -157,12 +160,12 @@ Finalize 复用 Execute 的 execution ID、Agent session、Graph view、selected
 
 | 阶段 | Timeout |
 | --- | ---: |
-| Plan | 45 秒 |
-| Supervise | 45 秒 |
+| Plan | 5 分钟 |
+| Supervise | 5 分钟 |
 | Execute | 10 分钟 |
 | Finalize | 2 分钟 |
 
-这些 timeout 是固定 Runtime policy，不是 Board 配置字段。
+这些 timeout 是固定 Runtime policy，不是 Board 配置字段。Plan 和 Supervise 每次 dispatch 最多尝试 3 次，间隔 2 秒；只有已经启动且非外部取消的 provider failure、timeout 或 malformed output 才重试。Execute 不做普通重试，只保留一次 Finalize resume；Finalize 本身不重试。
 
 ## 6. 调度设计
 
@@ -172,36 +175,35 @@ Finalize 复用 Execute 的 execution ID、Agent session、Graph view、selected
 2. Graph checkpoint 显示需要重新 Plan 时的 Plan；
 3. 尚未有对应活动 execution 的 open Intent Execute。
 
-Plan checkpoint 关注 Fact 数、Hint 数、open Intent 从有到无的变化和 pending Federation 数。首次 tick 必须 Plan。Supervise 使用内存计时器（`GraphSupervisor.nextAt`）按 `phase.supervise.intervalMs` 轮询，不写 Graph cursor；Runtime 重启后 active Project 可立即监督。Supervise 与其他任务共享全局和 Project 并发配额。
+Plan checkpoint 关注 Fact 数、Hint 数、open Intent 从有到无的变化和 pending Federation 数。首次 tick 必须 Plan。Supervise 使用内存计时器（`GraphSupervisor.nextAt`）按 `phase.supervise.intervalMs` 轮询，不写 Graph cursor；Runtime 重启后 active Project 可立即监督。Supervise 与 Plan 走独立控制通道，不占 Execute 容量。
 
-全局调度由以下配置限制（均可选，未配置时使用默认值）：
+容量唯一来源是 Execute Worker 的 `maxRunning` 合计：
 
-- `maxConcurrent`（默认 4）：全局活动 execution 上限；
-- `maxRunningProjects`（默认 4）：每 tick 参与调度的 Project 上限；
-- `maxProjectConcurrent`（默认 2）：单 Project 活动 execution 上限；
-- `refillPerTick`（默认 4）：单 Project 每 tick 最多补充数量；
-- `intervalMs`（默认 3000）：scheduler tick 周期。
+- `executeCapacity = sum(maxRunning for workers whose taskTypes contains "execute")`：同时表示 Plan 单次最多创建的 Intent 数和 Runtime 同时可运行的 Execute 总数。
+- `scheduler.maxRunningProjects`（默认 4）：每 tick 参与调度的 Project 上限；
+- `scheduler.intervalMs`（默认 3000）：scheduler tick 周期。
+- 不再有 `maxConcurrent`、`maxProjectConcurrent`、`refillPerTick` 或 `phase.plan.maxIntents` 字段。
 
-Project 间使用轮转 cursor。Graph 中不持久化 claim；防止同一阶段或 Intent 被同一 Runtime 重复调度依赖内存 `ExecutionRegistry`。Project 进入 stopped/completed 后取消其活动 execution。Runtime 重启后 open Intent 重新可调度。
+Project 间使用轮转 cursor。Graph 中不持久化 claim；防止同一阶段或 Intent 被同一 Runtime 重复调度依赖内存 `ExecutionRegistry`（每 Project 至多一个 Plan、一个 Supervise，由 `has(projectId, kind)` 强制）。Project 进入 stopped/completed 后取消其活动 execution。Runtime 重启后 open Intent 重新可调度。
 
 ## 7. Worker 层设计
 
 ### 7.1 选择与冷却
 
-Worker 先过滤：支持目标 `taskType`、当前 load 小于 `maxRunning`、不在失败冷却期。然后依次按 `priority`（数值越小越优先）、当前 load、名称排序。Reservation 在 execution 真正开始前占位，避免并发 tick 过度选择。同一 Worker 非零退出后进入 30 秒内存冷却。
+Worker 先过滤：支持目标 `taskType`、不在失败冷却期；仅当 `taskType === "execute"` 时还要求当前 Execute load 小于 `maxRunning`。然后依次按 `priority`（数值越小越优先）、当前 Execute load、名称排序。Execute 的 reservation 在 execution 真正开始前占位，避免并发 tick 过度选择；Plan/Supervise 的 pick 不占 `maxRunning`。同一 Worker 非零退出后进入 30 秒内存冷却（适用于所有阶段）。
 
-### 7.2 Driver 统一合同
+### 7.2 WorkerProtocol 统一合同
 
-SDK 和 CLI backend 必须实现同一个 `WorkerDriver` 合同。`WorkerRuntime` 只构造一次 `WorkerRequest` 并调用 `driver.execute()`，不得按 SDK/CLI 类型分支或使用类型探测。CLI backend 继承 `CliWorkerDriver`，由它统一完成 `ProcessRunner` 调用、输出解析结果组装和 session 延续；Pi backend 在相同接口后封装 Pi Agent SDK。所有 backend 也通过同一 `dispose()` 生命周期释放资源。
+每个 backend 是一个无状态 `WorkerProtocol`（`build`/`prepareSession?`/`parse`），只描述 CLI argv 构造、会话延续和输出解析。`WorkerRuntime` 构造 `WorkerCall`，调用 `protocol.build`，再交给共享的 `ProcessRunner` 调起子进程，最后用 `protocol.parse` 组装结果。`WorkerRuntime` 不按 backend 类型分支，也没有 `dispose()` 生命周期（Runtime shutdown 直接取消活动 execution，进程树由 `ProcessRunner` 终止）。
 
-Driver 只处理对应工具的调用和输出/session 差异，不读 Graph、不选择任务阶段、不解析阶段 JSON 合同。`SessionRef` 只包含 Worker type 和不透明值，只能交回相同 type 且 `canResume` 的 Driver，不进入 Graph、Board 配置、JSON checkpoint 或 Project 恢复状态。Pi 的可恢复 Execute session 仅在内存保留 10 分钟，Runtime shutdown 时统一 dispose。Pi backend 走进程内 Agent SDK，因此在执行时拒绝非空 CLI `args`；OpenCode、Codex、Claude Code 把 `args` 透传给对应 CLI。
+Protocol 只处理对应工具的调用和输出/session 差异，不读 Graph、不选择任务阶段、不解析阶段 JSON 合同。`SessionRef` 只包含 Worker type 和不透明值，只能交回相同 type 且 `canResume` 的 protocol，不进入 Graph、Board 配置、JSON checkpoint 或 Project 恢复状态。Pi CLI 自己负责持久化会话文件；Peak 只在内存保留 session id 字符串，Finalize 复用 Execute 的 execution id 并把 session id 作为 `--session` 重新拉起子进程。Worker 级 Provider/模型配置通过 `config.env` 合并进子进程环境，不再有 `args` 字段。
 
 | Type | 执行方式 | Resume |
 | --- | --- | --- |
-| `opencode` | `opencode run --format json` | 否 |
-| `codex` | `codex exec --json` | thread id |
-| `pi` | 进程内 Pi Agent SDK | 内存 AgentSession |
-| `claude-code` | `claude -p --output-format json` | 显式 session id |
+| `opencode` | `opencode run --format json`（stdin） | 否 |
+| `codex` | `codex exec --json`（stdin） | thread id |
+| `pi` | `node <pi cli> --mode json --session-dir <shard> [--session id] [--model m] -p`（stdin） | session id（来自 `session` 头事件） |
+| `claude-code` | `claude -p --output-format json`（stdin） | 显式 session id |
 
 ### 7.3 ProcessRunner
 
@@ -209,13 +211,28 @@ CLI Worker 通过 `ProcessRunner`：
 
 - 参数使用 argv 数组，Prompt 通过 stdin；
 - cwd 固定为 Board 目录（`task.json` 所在目录）；Worker 不被分配 workspace，也不写文件；
-- 环境继承当前进程并增加 `PEAK_AGENT_ACTIVE=1`；
+- 环境合并顺序为 `process.env → spec.env（协议级） → worker.config.env（Worker 级，优先级最高） → PEAK_AGENT_ACTIVE=1`，使 `PI_MODEL`、`ANTHROPIC_API_KEY` 等 Worker 配置覆盖宿主默认；
 - 每次调用启动一个独立进程；
 - timeout/cancellation 终止整个进程树（Windows 使用 `taskkill /T /F`，POSIX 使用 detached process group）；
 - stdout、stderr 各自最多捕获 10 MiB；
 - 返回 `started`、`returncode`、`timedOut`、`cancelled` 等结构化状态。
 
-认证、Provider、模型凭据和 Agent CLI 自身配置始终由对应工具管理。Peak 不提供 Provider credential 字段，也不直接调用模型 API。Pi Agent SDK 是唯一进程内 Agent 集成。
+### 7.4 Runtime 运行态与 Intent 状态
+
+运行态只存在于 Runtime 内存，不进入 SQLite、Graph、Artifact 或 export。`RuntimeStatus` 用固定 `setInterval` 持续更新 `heartbeatAt`（epoch ms）和递增 `sequence`，通过 `GET /api/runtime/status` 暴露；UI 用 `heartbeatAt` 与固定窗口（`heartbeatWindowMs`，默认 15s）判定 Runtime online/offline。`ExecutionRegistry` 是纯内存组件，活动 execution 的不可变快照字段恰好为 `{executionId, projectId, kind, intentId, workerName, processId, startedAt, deadlineAt}`，通过 `GET /api/runtime/projects/{id}/executions` 暴露，不暴露 `AbortController`、prompt、输出、argv、env 或 session。
+
+Intent 在 UI 上只有三种状态加一个页面级 Runtime 状态：
+
+| 条件 | UI 状态 | 含义 |
+| --- | --- | --- |
+| `intent.to` 非空 | concluded | Graph 已产生目标 Fact |
+| `intent.to` 为空且存在活动 Execute | running | Runtime 正在处理该 Intent |
+| `intent.to` 为空且无活动 Execute | open | 等待调度或重新执行 |
+| Runtime 心跳过期 | runtime offline | 页面级状态，清除 execution overlay，未结论 Intent 回退为 open |
+
+`peak serve` 不注入 Runtime extensions，因此 `/api/runtime/*` 缺省返回 404，Dashboard 视为正常降级而非 Graph 故障。
+
+认证、Provider、模型凭据和 Agent CLI 自身配置始终由对应工具管理。Peak 不提供 Provider credential 字段，也不直接调用模型 API。所有 Worker 都是 CLI 子进程，由统一的 `ProcessRunner` 调起；Peak 不再内置任何进程内 Agent SDK，`pi` Worker 在运行时解析用户已安装的 `@earendil-works/pi-coding-agent` CLI 入口。
 
 ## 8. Federation 设计
 
@@ -235,25 +252,31 @@ CLI Worker 通过 `ProcessRunner`：
 
 ```text
 peak init [board-directory]
-peak run [board-directory] [--project <configured-name>] [server options] [--no-install-skills]
-peak resume <project-uuid> [board-directory] [--project <configured-name>] [server options]
+peak run [board-directory] [--project <configured-source>] [server options] [--no-install-skills]
+peak resume <project-uuid> [board-directory] [--project <configured-source>] [server options]
 peak serve [--host <host>] [--port <port>] [--token <token>] [--peak-home <dir>]
+peak status [--peak-home <dir>]
+peak stop [--peak-home <dir>]
+peak export <project-uuid> [archive] [--peak-home <dir>]
+peak import <archive> [--peak-home <dir>]
 peak workers
 ```
 
-- `run` 创建或附加 Board 的全部配置 Project 并启动 Plan / Supervise / Execute：空 id 创建并原子回写 UUID，已有 id 直接附加；`--project <name>` 可只启动一个；默认端口为 `0`（临时端口）。
-- `resume` 按 UUID 附加一个持久化 Project 并校验配置 Goal；匹配不唯一时要求 `--project <name>`；默认端口为 `0`。
-- `serve` 只启动持久化 Graph API 和内置 Web UI，不启动 Scheduler/Worker；默认端口为 `8000`。
+- `run` 创建或附加全部配置 Project，并在 detached 后台进程启动 Plan / Supervise / Execute；`--project <source>` 可只启动一个，默认端口为 `0`。
+- `resume` 按 UUID 附加一个持久化 Project 并校验 Goal，同样后台启动；匹配不唯一时要求 `--project <source>`。
+- `serve` 在后台只启动持久化 Graph API 和 Web UI，不启动 Scheduler/Worker；默认端口为 `8000`。
+- `status` 校验 PID 并输出模式、PID、Web URL、启动时间、Board 和日志路径；`stop` 终止 Server 及 Worker 子进程树。
+- `export` 只导出 completed Project，生成含 Board JSON 区块、完整 Graph JSON、一致性 SQLite 快照和全部已注册 Artifact 的可移植 gzip tarball；`import` 在校验 Graph/数据库/Artifact 后以原 UUID 恢复，且不覆盖已有 Project。
 - `init` 脚手架一个带空 `task.json` 的 Board 目录（不创建 `skills/`）。
 - `workers` 输出支持的 Worker type（`opencode`/`codex`/`pi`/`claude-code`）和 task type（`plan`/`supervise`/`execute`）。
 - 通用 server 选项：`--host`（非 loopback 必须 `--token`）、`--port`、`--token`（所有 `/api/*` 请求的 Bearer）、`--peak-home`（默认 `~/.peak` 或 `PEAK_HOME`）。
-- `run` / `resume` 在 Project 变为 stopped/completed 后仍保持 HTTP Server 和 Scheduler 存活，允许 API 客户端（含内置 UI）检视状态、添加 Hint、改变状态和显式 reopen；Project 完成时打印 `[peak] project status: ... completed` 与物化到 `task.json` 同目录的 `[peak] deliverable: <path>`；只在 `SIGINT`、`SIGTERM` 或 fatal monitor error 时退出。
+- 后台 Runtime 在 Project stopped/completed 后仍存活，允许 UI 检视、添加 Hint、改变状态和 reopen；完成状态与 deliverable 路径写入 `server.log`，只由 `peak stop`、信号或 fatal monitor error 关闭。
 
-Runtime shutdown 顺序保证：停止调度、取消 execution、dispose 保留的 Pi session、清理临时 Skill 链接、关闭 HTTP Server，最后关闭 SQLite handle。
+Runtime shutdown 顺序保证：停止调度并取消全部 execution（`ProcessRunner` 终止子进程树）、停止 Runtime heartbeat、清理临时 Skill 链接、关闭 HTTP Server，最后关闭 SQLite handle。Pi session 文件由 Pi CLI 管理，Peak 不维护需要 dispose 的进程内 session。
 
 ## 10. 可选 Web UI
 
-Dashboard 是不依赖 CDN 的单文件 HTML/CSS/JavaScript 客户端，每 2.5 秒轮询 Project 列表和当前 Graph（页面隐藏时暂停自动刷新），通过相同的 `/api/*` 操作读写。本地 Fact 和跨 Project FactRef 超链接均渲染为可独立阅读的节点，FactRef 使用自身持久化的 description 并可由 projectId/factId 追溯源 Fact；Intent 渲染为有向边，Hint 渲染为独立节点；支持 Project 选择、stop/resume、显式 reopen、添加 Hint（creator 默认 `human:web` 且可编辑）、pan/wheel zoom/fit 和 JSON snapshot 下载。Bearer Token 仅保存在 `sessionStorage`，Hint creator 偏好保存在 `localStorage`。
+Dashboard 是不依赖 CDN 的单文件 HTML/CSS/JavaScript 客户端，每 2.5 秒轮询 Project 列表和当前 Graph（页面隐藏时暂停自动刷新），通过相同的 `/api/*` 操作读写。本地 Fact 和跨 Project FactRef 超链接均渲染为可独立阅读的节点，FactRef 使用自身持久化的 description 并可由 projectId/factId 追溯源 Fact；Intent 渲染为有向边，Hint 渲染为独立节点；支持 Project 选择、stop/resume、显式 reopen、添加 Hint（creator 默认 `human:web` 且可编辑）、pan/wheel zoom/fit、JSON snapshot 和 completed Project 归档下载。Bearer Token 仅保存在 `sessionStorage`，Hint creator 偏好保存在 `localStorage`。
 
 UI 不得直接读取文件系统、SQLite 或 Runtime 内存，也不得改变 Fact immutable、Hint、completion 和 reopen 语义。移除、替换或独立托管 Dashboard 都不改变 Graph 行为。
 

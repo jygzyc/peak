@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { initializePeakPaths } from "../config/paths.js";
 import { persistProjectId } from "../config/task-config.js";
 import type { InstalledSkill, ResolvedTaskConfig, TaskProjectConfig } from "../config/types.js";
@@ -10,8 +11,10 @@ import { leafFacts, type ProjectMeta } from "../graph/types.js";
 import { ProjectLoop } from "../project/project-loop.js";
 import { ProjectManager } from "../project/project-manager.js";
 import { serveDashboard } from "../ui/dashboard.js";
-import { WorkerResources, WorkerRuntime } from "../worker/worker-runtime.js";
+import { WorkerRuntime } from "../worker/worker-runtime.js";
+import { runtimeExtensions } from "./runtime-api.js";
 import { ExecutionRegistry } from "./execution-registry.js";
+import { RuntimeStatus } from "./runtime-status.js";
 import { RuntimeScheduler } from "./scheduler.js";
 import { TaskExecutor } from "./task-executor.js";
 
@@ -28,32 +31,33 @@ export class AgentRuntime {
   private readonly executors = new Map<string, TaskExecutor>();
   private readonly federation = new FederationBus();
   private readonly executions = new ExecutionRegistry();
-  private readonly workerResources = new WorkerResources();
+  private readonly runtimeStatus = new RuntimeStatus();
   private taskSkills?: InstalledSkill[];
 
   constructor(readonly config: ResolvedTaskConfig, readonly options: RuntimeOptions = {}) {}
 
-  async start(projectName?: string, projectId?: string): Promise<ProjectMeta[]> {
+  async start(projectSelector?: string, projectId?: string): Promise<ProjectMeta[]> {
     if (this.server) throw new Error("runtime already started");
     try {
       if (this.options.installSkills !== false) this.taskSkills = initializeTaskSkills(this.config);
       this.projectsDir = initializePeakPaths(this.options.peakHome).projectsDir;
       this.registry = new ProjectStoreRegistry(this.projectsDir);
-      this.server = new GraphHttpServer(this.registry, serveDashboard);
+      this.server = new GraphHttpServer(this.registry, serveDashboard, runtimeExtensions(this.runtimeStatus, this.executions));
       await this.server.start({ ...this.options, maxArtifactBytes: this.config.phase.execute.maxArtifactBytes });
       this.client = new GraphClient(this.server.baseUrl, this.options.token);
-      this.scheduler = new RuntimeScheduler(this.config.scheduler, this.executions);
+      this.scheduler = new RuntimeScheduler(this.config, this.executions);
       const projects: ProjectMeta[] = [];
       if (projectId) {
-        projects.push(await this.attachProject(projectId, projectName));
-      } else if (projectName) {
-        projects.push(await this.addProject(projectName));
+        projects.push(await this.attachProject(projectId, projectSelector));
+      } else if (projectSelector) {
+        projects.push(await this.addProject(projectSelector));
       } else {
         for (let index = 0; index < this.config.board.projects.length; index++) {
           projects.push(await this.ensureProject(index));
         }
       }
       await this.seedExistingFacts(projects);
+      this.runtimeStatus.start(this.config.scheduler.intervalMs);
       this.scheduler.start();
       return projects;
     } catch (error) {
@@ -62,21 +66,23 @@ export class AgentRuntime {
     }
   }
 
-  async addProject(projectName: string): Promise<ProjectMeta> {
-    const index = this.projectIndex(projectName);
+  async addProject(projectSelector: string): Promise<ProjectMeta> {
+    const index = this.projectIndex(projectSelector);
     return this.ensureProject(index);
   }
 
-  async attachProject(projectId: string, projectName?: string): Promise<ProjectMeta> {
+  async attachProject(projectId: string, projectSelector?: string): Promise<ProjectMeta> {
     if (!this.client) throw new Error("runtime not started");
     const graph = await this.client.getProject(projectId);
+    const source = graph.facts.find((fact) => fact.id === "origin")?.description;
     const goal = graph.facts.find((fact) => fact.id === "goal")?.description;
-    const candidates = projectName
-      ? [this.workProject(this.projectIndex(projectName))]
+    const candidates = projectSelector
+      ? [this.workProject(this.projectIndex(projectSelector))]
       : this.config.board.projects.map((_project, index) => this.workProject(index));
-    const matches = candidates.filter((project) => (!project.id || project.id === projectId) && goal === project.goal);
+    const matches = candidates.filter((project) => (!project.id || project.id === projectId)
+      && source === project.source && goal === project.goal);
     if (matches.length === 0) throw new Error("Board config does not match persisted Project");
-    if (matches.length > 1) throw new Error("persisted Project matches multiple configured Projects; select one with --project <name>");
+    if (matches.length > 1) throw new Error("persisted Project matches multiple configured Projects; select one with --project <source>");
     const matched = matches[0]!;
     const index = Number.parseInt(matched.key.slice("project-".length), 10) - 1;
     if (!matched.id) persistProjectId(this.config, index, projectId);
@@ -85,7 +91,7 @@ export class AgentRuntime {
   }
 
   private projectIndex(selector: string): number {
-    const index = this.config.board.projects.findIndex((project, item) => project.name === selector || `project-${item + 1}` === selector);
+    const index = this.config.board.projects.findIndex((project, item) => project.source === selector || `project-${item + 1}` === selector);
     if (index < 0) throw new Error(`configured Project not found: ${selector}`);
     return index;
   }
@@ -97,13 +103,12 @@ export class AgentRuntime {
       ...project,
       id: this.projectIds.get(index) ?? project.id,
       key: `project-${index + 1}`,
-      origin: `Project "${project.name}" is open and has not yet proven its goal.`,
     };
   }
 
   private async ensureProject(index: number): Promise<ProjectMeta> {
     const configured = this.workProject(index);
-    if (configured.id) return this.attachProject(configured.id, configured.name);
+    if (configured.id) return this.attachProject(configured.id, configured.source);
     const project = await this.createProject(configured);
     persistProjectId(this.config, index, project.id);
     this.projectIds.set(index, project.id);
@@ -114,8 +119,8 @@ export class AgentRuntime {
     if (!this.client || !this.projectsDir) throw new Error("runtime not started");
     const manager = new ProjectManager(this.projectsDir, this.client);
     const project = await manager.create({
-      title: configured.name,
-      target: configured.origin,
+      title: sourceTitle(configured.source),
+      target: configured.source,
       goal: configured.goal,
     });
     return this.registerProject(project, { ...configured, id: project.id });
@@ -140,10 +145,12 @@ export class AgentRuntime {
       this.config,
       configured,
       this.client,
-      new WorkerRuntime(this.config, this.workerResources),
+      new WorkerRuntime(this.config),
       this.federation,
       projectDir,
       () => this.executions.cancelProject(project.id),
+      join(projectDir, "pi-sessions"),
+      (executionId, pid) => this.executions.setProcessId(executionId, pid),
     );
     this.executors.set(project.id, executor);
     this.scheduler.add(new ProjectLoop(
@@ -171,7 +178,8 @@ export class AgentRuntime {
 
   async stop(): Promise<void> {
     this.scheduler?.stop();
-    this.workerResources.dispose();
+    await this.executions.waitForEmpty();
+    this.runtimeStatus.stop();
     if (this.taskSkills) cleanupTaskSkills(this.taskSkills);
     this.taskSkills = undefined;
     await this.server?.stop();
@@ -195,4 +203,15 @@ export class AgentRuntime {
     if (!this.client) throw new Error("runtime not started");
     return this.client;
   }
+}
+
+/** Project title is only a short UI label; the complete immutable source lives in the origin Fact. */
+function sourceTitle(source: string): string {
+  if (Buffer.byteLength(source, "utf8") <= 1024) return source;
+  let result = "";
+  for (const character of source) {
+    if (Buffer.byteLength(result + character, "utf8") > 1021) break;
+    result += character;
+  }
+  return `${result}...`;
 }

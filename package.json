@@ -20,13 +20,14 @@
     "copy-assets": "node scripts/build.mjs copy-assets",
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test \"tests/**/*.test.ts\"",
+    "test:example": "npm run build && node --test \"examples/**/*.test.ts\"",
     "smoke": "node scripts/smoke.mjs",
     "pack": "node scripts/pack.mjs archive",
     "prepack": "node scripts/pack.mjs prepare"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.82.1",
-    "commander": "^15.0.0"
+    "commander": "^15.0.0",
+    "tar": "^7.5.22"
   },
   "devDependencies": {
     "@types/node": "^26.0.0",

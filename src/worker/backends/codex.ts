@@ -1,20 +1,25 @@
-import type { ProcessResult, ProcessSpec, SessionRef, WorkerRequest } from "../types.js";
-import { CliWorkerDriver, jsonLines, session, textFromJson } from "./base.js";
+import type { ProcessResult, ProcessSpec, WorkerCall, WorkerProtocol, WorkerType } from "../types.js";
+import { jsonLines, session, textFromJson } from "./shared.js";
 
-export class CodexDriver extends CliWorkerDriver {
-  readonly type = "codex";
-  readonly canResume = true;
+const TYPE: WorkerType = "codex";
 
-  protected build(request: WorkerRequest, _session: SessionRef | undefined): ProcessSpec {
-    const argv = request.session
-      ? ["codex", "exec", "resume", request.session.value, "--json"]
+/**
+ * Codex protocol. `codex exec --json` reads the prompt from stdin (`-`).
+ * Session ids are recovered from the `thread.started` event, or from
+ * `session id:` stderr diagnostics on a failed command.
+ */
+export const codexProtocol: WorkerProtocol = {
+  type: TYPE,
+  canResume: true,
+  build(call: WorkerCall): ProcessSpec {
+    const argv = call.session
+      ? ["codex", "exec", "resume", call.session.value, "--json"]
       : ["codex", "exec", "--json"];
-    if (request.config.model) argv.push("--model", request.config.model);
-    argv.push(...request.config.args, "-");
-    return { argv, input: request.prompt };
-  }
-
-  protected parse(result: ProcessResult): { text: string; session?: SessionRef } {
+    if (call.config.model) argv.push("--model", call.config.model);
+    argv.push("-");
+    return { argv, input: call.prompt };
+  },
+  parse(result: ProcessResult): { text: string; session?: ReturnType<typeof session> } {
     const events = jsonLines(result.stdout);
     const id = events.find((event) => event.type === "thread.started")?.thread_id
       ?? /session id:\s*([0-9a-f-]+)/i.exec(result.stderr)?.[1];
@@ -23,6 +28,6 @@ export class CodexDriver extends CliWorkerDriver {
       const item = event.item as Record<string, unknown>;
       return item.type === "agent_message" && typeof item.text === "string" ? [item.text] : [];
     });
-    return { text: messages.join("\n").trim() || textFromJson(result.stdout), session: session(this.type, id) };
-  }
-}
+    return { text: messages.join("\n").trim() || textFromJson(result.stdout), session: session(TYPE, id) };
+  },
+};

@@ -1,5 +1,6 @@
-import { createReadStream } from "node:fs";
+import { createReadStream, createWriteStream, rmSync } from "node:fs";
 import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import type {
   AddHintInput, ArtifactRef, CompleteInput, ConcludeInput, CreateIntentInput, CreateProjectInput,
   Fact, FactRef, Hint, Intent, ProjectGraph, ProjectMeta, ProjectStatus, ReopenInput, ResolvedFactSource,
@@ -56,6 +57,21 @@ export class GraphClient {
 
   async exportProject(id: string, format: "json" | "timeline" = "json"): Promise<string> {
     return this.text("GET", `/api/projects/${id}/export?format=${format}`);
+  }
+
+  async downloadProjectArchive(id: string, destination: string): Promise<void> {
+    const response = await fetch(this.url(`/api/projects/${id}/export?format=archive`), { headers: this.headers() });
+    if (!response.ok) throw new GraphClientError(response.status, await response.text());
+    if (!response.body) throw new Error("Project archive response has no body");
+    try {
+      await pipeline(
+        Readable.fromWeb(response.body as import("node:stream/web").ReadableStream),
+        createWriteStream(destination, { flags: "wx" }),
+      );
+    } catch (error) {
+      rmSync(destination, { force: true });
+      throw error;
+    }
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {

@@ -25,7 +25,7 @@ for (const name of readdirSync(join(root, "scripts")).filter((entry) => entry.en
 
 // run-example.mjs 引用的静态资源必须在打包时存在
 const required = [
-  ["scripts/run-example.mjs 引用的中文示例", join(root, "examples", "ai_agent_safety_zh", "task.json")],
+  ["scripts/run-example.mjs 引用的中文示例", join(root, "examples", "ai_agent_zh", "task.json")],
   ["版本文件", join(root, "version")],
   ["发布日志", join(root, "RELEASE.md")],
 ];

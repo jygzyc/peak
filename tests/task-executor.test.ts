@@ -42,6 +42,13 @@ class SourceMutatingWorkers implements TaskWorkers {
   }
 }
 
+test("built-in phase prompts stay concise and leave judgment to the AI", () => {
+  for (const name of ["plan.md", "supervise.md", "execute.md", "execute-finalize.md"]) {
+    const prompt = readFileSync(join("dist", "runtime", "prompts", name), "utf8");
+    assert.ok(Buffer.byteLength(prompt, "utf8") < 800, `${name} should remain under 800 bytes`);
+  }
+});
+
 test("Plan, Supervise and Execute mutate Graph only through HTTP", async () => {
   const root = mkdtempSync(join(tmpdir(), "peak-task-"));
   const projects = join(root, "projects");
@@ -61,9 +68,8 @@ test("Plan, Supervise and Execute mutate Graph only through HTTP", async () => {
       config,
       {
         key: "project-1",
-        name: config.board.projects[0]!.name,
+        source: config.board.projects[0]!.source,
         goal: config.board.projects[0]!.goal,
-        origin: "start",
       },
       graph,
       workers,
@@ -148,12 +154,12 @@ test("Plan, Supervise and Execute mutate Graph only through HTTP", async () => {
     const planPrompt = workers.calls.find((call) => call.type === "plan")!.prompt;
     const executePrompt = workers.calls.find((call) => call.type === "execute")!.prompt;
     assert.doesNotMatch(supervisePrompt, /skills?/i);
-    assert.match(supervisePrompt, /Review the current Project proof state/);
+    assert.match(supervisePrompt, /Independently judge/);
     assert.match(planPrompt, /Available Skills:[\s\S]*"review"/);
-    assert.match(planPrompt, /Do not invent or rewrite references/);
-    assert.match(planPrompt, /immutable DAG whose current state is its complete leaf frontier/);
-    assert.match(planPrompt, /## Source/);
-    assert.doesNotMatch(planPrompt, /## Origin/);
+    assert.match(planPrompt, /copy every selected reference exactly/);
+    assert.match(planPrompt, /Exercise independent judgment/);
+    assert.match(planPrompt, /Source:/);
+    assert.doesNotMatch(planPrompt, /Origin:/);
     assert.match(executePrompt, /Available Skills:[\s\S]*"review"/);
     assert.match(supervisePrompt, /Use for proof review/);
     assert.match(supervisePrompt, /Review the entire proof carefully/);
@@ -162,8 +168,50 @@ test("Plan, Supervise and Execute mutate Graph only through HTTP", async () => {
     assert.match(planPrompt, /Use for primary research/);
     assert.match(executePrompt, /Use for primary research/);
     assert.match(executePrompt, /Collect primary evidence only/);
-    assert.match(executePrompt, /artifact: null/);
+    assert.match(executePrompt, /"artifact":null/);
     assert.doesNotMatch(`${planPrompt}${executePrompt}`, /\{skills\}/);
+  } finally {
+    await server.stop();
+    registry.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Plan retains independent judgment when no Skill is configured", async () => {
+  const root = mkdtempSync(join(tmpdir(), "peak-plan-no-skill-"));
+  const projects = join(root, "projects");
+  mkdirSync(projects, { recursive: true });
+  const registry = new ProjectStoreRegistry(projects);
+  const server = new GraphHttpServer(registry);
+  await server.start();
+  const graph = new GraphClient(server.baseUrl);
+  try {
+    const project = await graph.createProject({
+      title: "Unfamiliar domain",
+      target: "No analysis has been performed",
+      goal: "Produce a defensible analysis of the assigned problem",
+    });
+    const config = configuration(root);
+    config.board.skills = [];
+    config.phase.plan.customProfile = undefined;
+    config.phase.execute.customProfiles = [];
+    const workers = new FakeWorkers();
+    workers.outputs.plan.push('{"kind":"noop"}');
+    const executor = new TaskExecutor(
+      config,
+      { key: "project-1", source: "No analysis has been performed", goal: config.board.projects[0]!.goal },
+      graph,
+      workers,
+      new FederationBus(),
+      join(projects, project.id),
+    );
+
+    await executor.plan(project.id, "p-no-skill");
+
+    const prompt = workers.calls[0]!.prompt;
+    assert.match(prompt, /Available Skills:\s*\[\]/);
+    assert.match(prompt, /Exercise independent judgment/);
+    assert.ok(prompt.length < 4_000, "built-in Plan instructions stay concise");
   } finally {
     await server.stop();
     registry.close();
@@ -206,7 +254,7 @@ test("Execute resumes a failed started worker through Finalize", async () => {
     const config = configuration(root);
     const executor = new TaskExecutor(
       config,
-      { key: "project-1", id: project.id, name: "P", goal: "done", origin: "start" },
+      { key: "project-1", id: project.id, source: "start", goal: "done" },
       graph,
       workers,
       federation,
@@ -220,7 +268,7 @@ test("Execute resumes a failed started worker through Finalize", async () => {
     assert.equal(executeCalls[0]!.session, undefined);
     assert.deepEqual(executeCalls[1]!.session, resumeSession);
     assert.match(executeCalls[1]!.prompt, /Available Skills:[\s\S]*"review"/);
-    assert.match(executeCalls[1]!.prompt, /bound Execute started but did not return an acceptable strict result/i);
+    assert.match(executeCalls[1]!.prompt, /Convert the bound Execute's existing work into one valid Fact/i);
     assert.match(executeCalls[1]!.prompt, /"executionId": "e-resume"/);
     const result = await graph.getProject(project.id);
     assert.deepEqual(result.intents[0]!.to, {
@@ -270,7 +318,7 @@ test("Execute rejects a source Artifact changed by the worker", async () => {
     federation.register(project.id, join(projects, project.id));
     const executor = new TaskExecutor(
       configuration(root),
-      { key: "project-1", id: project.id, name: "P", goal: "done", origin: "immutable source" },
+      { key: "project-1", id: project.id, source: "immutable source", goal: "done" },
       graph,
       new SourceMutatingWorkers(),
       federation,
@@ -309,7 +357,7 @@ test("Execute rejects custom profile configuration drift", async () => {
     const workers = new FakeWorkers();
     const executor = new TaskExecutor(
       configuration(root),
-      { key: "project-1", id: project.id, name: "P", goal: "done", origin: "start" },
+      { key: "project-1", id: project.id, source: "start", goal: "done" },
       graph,
       workers,
       federation,
@@ -326,21 +374,164 @@ test("Execute rejects custom profile configuration drift", async () => {
   }
 });
 
+test("Plan and Supervise retry transient worker and malformed-output failures", async () => {
+  const root = mkdtempSync(join(tmpdir(), "peak-phase-retry-"));
+  const projects = join(root, "projects");
+  mkdirSync(projects, { recursive: true });
+  const registry = new ProjectStoreRegistry(projects);
+  const server = new GraphHttpServer(registry);
+  await server.start();
+  const graph = new GraphClient(server.baseUrl);
+  try {
+    const project = await graph.createProject({ title: "P", target: "start", goal: "done", scope: "s" });
+    const federation = new FederationBus();
+    federation.register(project.id, join(projects, project.id), project.scope);
+    const workers = new FakeWorkers();
+    const executor = new TaskExecutor(
+      configuration(root),
+      { key: "project-1", source: "start", goal: "done" },
+      graph,
+      workers,
+      federation,
+      join(projects, project.id),
+    );
+
+    // Supervise: malformed JSON on the first attempt, valid output on retry.
+    workers.outputs.supervise.push(
+      "not json at all {",
+      '{"kind":"hint","content":"Verify independently"}',
+    );
+    await executor.supervise(project.id, "s-retry");
+    assert.equal(workers.calls.filter((call) => call.type === "supervise").length, 2);
+    assert.equal((await graph.getProject(project.id)).hints.length, 1);
+
+    // Supervise: failed started worker on the first attempt, noop on retry.
+    workers.outputs.supervise.push(
+      { text: "", stdout: "", stderr: "provider request failed", returncode: 1, timedOut: false, cancelled: false, started: true },
+      '{"kind":"noop"}',
+    );
+    await executor.supervise(project.id, "s-retry2");
+    assert.equal(workers.calls.filter((call) => call.type === "supervise").length, 4);
+    assert.equal((await graph.getProject(project.id)).hints.length, 1);
+
+    // Supervise: an attempt that never started is not retried.
+    workers.outputs.supervise.push(
+      { text: "", stdout: "", stderr: "worker config error", returncode: 1, timedOut: false, cancelled: false, started: false },
+    );
+    await assert.rejects(executor.supervise(project.id, "s-no-retry"), /supervise worker failed/);
+    assert.equal(workers.calls.filter((call) => call.type === "supervise").length, 5);
+
+    // Plan: malformed output on the first attempt, valid intents on retry.
+    workers.outputs.plan.push(
+      '{"kind":"intents","intents":[{"from":[{"projectId":"origin"',
+      `{"kind":"intents","intents":[{"from":[{"projectId":"${project.id}","factId":"origin","description":"start"}],"hintIds":[],"customProfile":null,"description":"Do the work"}]}`,
+    );
+    await executor.plan(project.id, "p-retry");
+    const planCalls = workers.calls.filter((call) => call.type === "plan");
+    assert.equal(planCalls.length, 2);
+    assert.equal(planCalls[1]!.prompt, planCalls[0]!.prompt, "retry reuses the same rendered prompt");
+    assert.equal((await graph.getProject(project.id)).intents.length, 1);
+  } finally {
+    await server.stop();
+    registry.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/** A worker that simulates a concurrent Execute consuming the current leaf
+ * while Plan is thinking, then returns a stale Plan rooted at that leaf. */
+class StaleInjectingWorkers implements TaskWorkers {
+  planCalls = 0;
+  private readonly graph: GraphClient;
+  private readonly projectId: string;
+  private readonly f002: string;
+  constructor(graph: GraphClient, projectId: string, f002: string) {
+    this.graph = graph;
+    this.projectId = projectId;
+    this.f002 = f002;
+  }
+  pick(): string { return "fake"; }
+  release(): void {}
+  async execute(_name: string, type: TaskType): Promise<WorkerResult> {
+    if (type !== "plan") throw new Error(`unexpected worker type ${type}`);
+    this.planCalls += 1;
+    if (this.planCalls === 1) {
+      // A concurrent Execute concludes f001 -> f002 while Plan is thinking,
+      // then Plan returns an Intent still rooted at the now-superseded f001.
+      const concurrent = await this.graph.createIntent(this.projectId, {
+        from: [{ projectId: this.projectId, factId: "f001", description: "Work completed" }],
+        hintIds: [], description: "concurrent consume", createdBy: "concurrent",
+      });
+      await this.graph.conclude(this.projectId, concurrent.id, { description: this.f002, artifact: null, concludedBy: "concurrent" });
+      return this.intent("f001", "Work completed", "stale intent from a consumed leaf");
+    }
+    return this.intent("f002", this.f002, "valid intent from the current leaf");
+  }
+  private intent(factId: string, description: string, intentDescription: string): WorkerResult {
+    const output = JSON.stringify({
+      kind: "intents",
+      intents: [{ from: [{ projectId: this.projectId, factId, description }], hintIds: [], customProfile: null, description: intentDescription }],
+    });
+    return { text: output, stdout: output, stderr: "", returncode: 0, timedOut: false, cancelled: false, started: true };
+  }
+}
+
+test("Plan re-plans instead of failing when a concurrent Execute consumes a source leaf", async () => {
+  const root = mkdtempSync(join(tmpdir(), "peak-stale-"));
+  const projects = join(root, "projects");
+  mkdirSync(projects, { recursive: true });
+  const registry = new ProjectStoreRegistry(projects);
+  const server = new GraphHttpServer(registry);
+  await server.start();
+  const graph = new GraphClient(server.baseUrl);
+  try {
+    const project = await graph.createProject({ title: "P", target: "start", goal: "done", scope: "s" });
+    const projectDir = join(projects, project.id);
+    const federation = new FederationBus();
+    federation.register(project.id, projectDir, project.scope);
+    const config = configuration(root);
+    const projectConfig = { key: "project-1", source: config.board.projects[0]!.source, goal: config.board.projects[0]!.goal };
+
+    // Establish the current leaf f001 ("Work completed") through a normal round.
+    const seed = new FakeWorkers();
+    const seedExecutor = new TaskExecutor(config, projectConfig, graph, seed, federation, projectDir);
+    seed.outputs.plan.push(`{"kind":"intents","intents":[{"from":[{"projectId":"${project.id}","factId":"origin","description":"start"}],"hintIds":[],"customProfile":null,"description":"Do the work"}]}`);
+    await seedExecutor.plan(project.id, "p1");
+    const firstIntent = (await graph.getProject(project.id)).intents[0]!;
+    seed.outputs.execute.push('{"kind":"fact","description":"Work completed","artifact":null}');
+    await seedExecutor.execute(project.id, firstIntent, "e1");
+
+    const f002 = "Deeper analysis built on the completed work";
+    const workers = new StaleInjectingWorkers(graph, project.id, f002);
+    const executor = new TaskExecutor(config, projectConfig, graph, workers, federation, projectDir);
+    await executor.plan(project.id, "p2");
+
+    assert.equal(workers.planCalls, 2, "Plan retried once after its source leaf was consumed mid-flight");
+    const after = await graph.getProject(project.id);
+    const replanned = after.intents.find((intent) => intent.createdBy === "plan:p2");
+    assert.ok(replanned, "the re-planned Intent was persisted");
+    assert.deepEqual(replanned!.from, [{ projectId: project.id, factId: "f002", description: f002 }]);
+  } finally {
+    await server.stop();
+    registry.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 function configuration(root: string): ResolvedTaskConfig {
   return {
     configPath: join(root, "task.json"), taskDir: root,
     board: {
       skills: ["review"],
       projects: [
-        { name: "P", goal: "done" },
-        { name: "Other", goal: "other project assignment" },
+        { source: "start", goal: "done" },
+        { source: "other source", goal: "other project assignment" },
       ],
     },
-    workers: { fake: { type: "pi", taskTypes: ["plan", "supervise", "execute"], maxRunning: 1, priority: 1, args: [] } },
-    scheduler: { maxConcurrent: 4, maxRunningProjects: 4, maxProjectConcurrent: 2, refillPerTick: 4, intervalMs: 10 },
+    workers: { fake: { type: "pi", taskTypes: ["plan", "supervise", "execute"], maxRunning: 1, priority: 1, env: {} } },
+    scheduler: { maxRunningProjects: 4, intervalMs: 10 },
     phase: {
       plan: {
-        maxIntents: 3,
         customProfile: { description: "Use for security planning.", prompt: "Plan every proof edge." },
       },
       supervise: {

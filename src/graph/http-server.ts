@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { appendFileSync, createReadStream } from "node:fs";
+import { appendFileSync, createReadStream, mkdtempSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { pipeline } from "node:stream/promises";
 import { initializeProjectLogsDirectory } from "../config/paths.js";
 import {
   ApiError, localTimestamp, requireCustomProfileDigest, requireDescription, requireFactDescription, requireIntentDescription, requireShortDescription,
@@ -18,16 +19,30 @@ export interface HttpServerOptions {
 
 export type HttpRootHandler = (response: ServerResponse) => boolean;
 
+/**
+ * Generic authenticated `/api/*` extension. GraphHttpServer owns routing and
+ * authorization; an extension receives an already-authenticated request whose
+ * URL matches `matches(method, parts)` and may handle it. Returning `true`
+ * stops further extension probing. graph/ depends only on this type and never
+ * on the implementing module, so Runtime/CLI compose API surface at the
+ * composition root without coupling Graph state to Runtime state.
+ */
+export interface ApiExtension {
+  matches(method: string, parts: string[]): boolean;
+  handle(request: IncomingMessage, response: ServerResponse): Promise<boolean>;
+}
+
 export class GraphHttpServer {
   private server?: ReturnType<typeof createServer>;
   private host = "127.0.0.1";
   private assignedPort = 0;
   private token?: string;
-  private maxArtifactBytes = 100 * 1024 * 1024;
+  private maxArtifactBytes = 10 * 1024 * 1024;
 
   constructor(
     readonly registry: ProjectStoreRegistry,
     private readonly rootHandler?: HttpRootHandler,
+    private readonly apiExtensions: ApiExtension[] = [],
   ) {}
 
   get baseUrl(): string {
@@ -135,6 +150,15 @@ export class GraphHttpServer {
         return exported(response, graphs, url.searchParams.get("format"));
       }
 
+      // Authenticated extension probe: lets Runtime/CLI inject additional
+      // read-only /api/* routes (e.g. /api/runtime/*) without graph/ depending
+      // on runtime/. Probed before the project-scoped guard so non-projects
+      // paths are routable; each extension receives an already-authenticated
+      // request and owns its own path matching.
+      for (const ext of this.apiExtensions) {
+        if (ext.matches(method, parts) && await ext.handle(request, response)) return;
+      }
+
       if (parts[1] !== "projects" || !parts[2]) throw new ApiError(404, "not found");
       const projectId = parts[2];
       const stores = this.registry.get(projectId);
@@ -159,7 +183,9 @@ export class GraphHttpServer {
         return json(response, project);
       }
       if (parts[3] === "export" && method === "GET") {
-        return exported(response, stores.graph.graph(), url.searchParams.get("format"));
+        const format = url.searchParams.get("format");
+        if (format === "archive") return await projectArchive(response, this.registry, projectId);
+        return exported(response, stores.graph.graph(), format);
       }
       if (parts[3] === "facts" && parts[4] && method === "GET") {
         const fact = stores.graph.fact(parts[4]);
@@ -249,6 +275,7 @@ export class GraphHttpServer {
       }
       throw new ApiError(404, "not found");
     } catch (error) {
+      if (response.headersSent) { response.destroy(error instanceof Error ? error : undefined); return; }
       const status = error instanceof ApiError ? error.status : 500;
       json(response, { error: error instanceof Error ? error.message : String(error) }, status);
     }
@@ -335,6 +362,22 @@ function json(response: ServerResponse, value: unknown, status = 200): void {
 function exported(response: ServerResponse, value: Parameters<typeof toTimeline>[0], format: string | null): void {
   if (format !== null && format !== "json" && format !== "timeline") throw new ApiError(400, "invalid export format");
   json(response, format === "timeline" ? toTimeline(value) : value);
+}
+async function projectArchive(response: ServerResponse, registry: ProjectStoreRegistry, projectId: string): Promise<void> {
+  const temporaryDir = mkdtempSync(join(registry.baseDir, ".download-"));
+  const path = join(temporaryDir, `peak-${projectId}.tar.gz`);
+  try {
+    await registry.exportProjectArchive(projectId, path);
+    response.writeHead(200, {
+      "content-type": "application/gzip",
+      "content-length": statSync(path).size,
+      "content-disposition": `attachment; filename=\"peak-${projectId}.tar.gz\"`,
+      "cache-control": "no-store",
+    });
+    await pipeline(createReadStream(path), response);
+  } finally {
+    rmSync(temporaryDir, { recursive: true, force: true });
+  }
 }
 function empty(response: ServerResponse, status: number): void { response.writeHead(status); response.end(); }
 function isLoopback(host: string): boolean { return host === "127.0.0.1" || host === "localhost" || host === "::1"; }

@@ -1,63 +1,43 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { ClaudeCodeDriver } from "../dist/worker/backends/claude-code.js";
-import { CodexDriver } from "../dist/worker/backends/codex.js";
-import { ProcessRunner } from "../dist/worker/process-runner.js";
-import type { ProcessResult, ProcessSpec, WorkerRequest } from "../dist/worker/types.js";
+import { claudeCodeProtocol } from "../dist/worker/backends/claude-code.js";
+import { codexProtocol } from "../dist/worker/backends/codex.js";
+import type { ProcessResult, WorkerCall } from "../dist/worker/types.js";
 
-class FakeProcessRunner extends ProcessRunner {
-  readonly specs: ProcessSpec[] = [];
-  private readonly results: ProcessResult[];
-  constructor(results: ProcessResult[]) {
-    super();
-    this.results = results;
-  }
-  override run(spec: ProcessSpec, _cwd: string, _timeoutMs: number, _signal?: AbortSignal): Promise<ProcessResult> {
-    this.specs.push(spec);
-    return Promise.resolve(this.results.shift()!);
-  }
-}
-
-const failed: ProcessResult = {
-  stdout: "",
-  stderr: "provider request failed",
-  returncode: 1,
-  timedOut: false,
-  cancelled: false,
-  started: true,
-};
-
-function request(type: "codex" | "claude-code"): WorkerRequest {
+function call(type: "codex" | "claude-code", session?: { workerType: "codex" | "claude-code"; value: string }): WorkerCall {
   return {
     workerName: type,
-    config: { type, taskTypes: ["execute"], maxRunning: 1, priority: 1, args: [] },
-    taskType: "execute",
-    prompt: "prompt",
-    cwd: process.cwd(),
-    timeoutMs: 1_000,
+    config: { type, taskTypes: ["execute"], maxRunning: 1, priority: 1, env: {} },
+    taskType: "execute", prompt: "prompt", cwd: process.cwd(), session,
   };
 }
 
-test("Claude Code seeds a resumable session before Execute can fail", async () => {
-  const runner = new FakeProcessRunner([
-    failed,
-    { ...failed, stdout: '{"result":"done"}', stderr: "", returncode: 0 },
-  ]);
-  const driver = new ClaudeCodeDriver(runner);
-  const first = await driver.execute(request("claude-code"));
+test("Claude Code protocol seeds a resumable session before Execute can fail", () => {
+  const seeded = claudeCodeProtocol.prepareSession!(call("claude-code"));
+  assert.equal(seeded!.workerType, "claude-code");
+  assert.match(seeded!.value ?? "", /^[0-9a-f-]{36}$/i);
 
-  assert.equal(first.session?.workerType, "claude-code");
-  assert.match(first.session?.value ?? "", /^[0-9a-f-]{36}$/i);
-  assert.deepEqual(runner.specs[0]!.argv.slice(0, 3), ["claude", "--session-id", first.session!.value]);
+  // Fresh-session argv uses --session-id.
+  const fresh = claudeCodeProtocol.build(call("claude-code"), seeded);
+  assert.deepEqual(fresh.argv.slice(0, 3), ["claude", "--session-id", seeded!.value]);
 
-  await driver.execute({ ...request("claude-code"), session: first.session });
-  assert.deepEqual(runner.specs[1]!.argv.slice(0, 3), ["claude", "-r", first.session!.value]);
+  // Resume argv uses -r when a session is supplied on the call.
+  const resume = claudeCodeProtocol.build(call("claude-code", seeded), seeded);
+  assert.deepEqual(resume.argv.slice(0, 3), ["claude", "-r", seeded!.value]);
+
+  const parsed = claudeCodeProtocol.parse({
+    stdout: '{"result":"done","session_id":"' + seeded!.value + '"}',
+    stderr: "", returncode: 0, timedOut: false, cancelled: false, started: true,
+  } satisfies ProcessResult);
+  assert.equal(parsed.text, "done");
+  assert.equal(parsed.session!.value, seeded!.value);
 });
 
-test("Codex recovers a session id from failed command diagnostics", async () => {
+test("Codex protocol recovers a session id from failed command diagnostics", () => {
   const id = "123e4567-e89b-12d3-a456-426614174000";
-  const runner = new FakeProcessRunner([{ ...failed, stderr: `Session ID: ${id}\nprovider request failed` }]);
-  const result = await new CodexDriver(runner).execute(request("codex"));
-
-  assert.deepEqual(result.session, { workerType: "codex", value: id });
+  const parsed = codexProtocol.parse({
+    stdout: "", stderr: `Session ID: ${id}\nprovider request failed`,
+    returncode: 1, timedOut: false, cancelled: false, started: true,
+  } satisfies ProcessResult);
+  assert.deepEqual(parsed.session, { workerType: "codex", value: id });
 });

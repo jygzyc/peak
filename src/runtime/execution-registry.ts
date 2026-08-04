@@ -7,7 +7,26 @@ export interface ActiveExecution {
   kind: TaskType;
   intentId?: string;
   workerName?: string;
+  processId?: number;
+  startedAt: number;
+  deadlineAt?: number;
   controller: AbortController;
+}
+
+/**
+ * Immutable public DTO for an in-flight execution. Excludes the AbortController
+ * and every internal handle so the Registry never leaks cancellation, prompts,
+ * outputs, argv, env, or Worker objects to API consumers.
+ */
+export interface ExecutionSnapshot {
+  executionId: string;
+  projectId: string;
+  kind: TaskType;
+  intentId: string | null;
+  workerName: string | null;
+  processId: number | null;
+  startedAt: string;
+  deadlineAt: string | null;
 }
 
 export class ExecutionRegistry {
@@ -20,14 +39,61 @@ export class ExecutionRegistry {
     while (this.values.has(executionId));
     return executionId;
   }
-  count(projectId?: string): number {
-    return projectId ? [...this.values.values()].filter((item) => item.projectId === projectId).length : this.values.size;
+  /** Backfills the child PID once the CLI subprocess has spawned. */
+  setProcessId(executionId: string, pid: number): void {
+    const execution = this.values.get(executionId);
+    if (execution) execution.processId = pid;
+  }
+  count(projectId?: string, kind?: TaskType): number {
+    return [...this.values.values()].filter((item) => (!projectId || item.projectId === projectId)
+      && (!kind || item.kind === kind)).length;
   }
   has(projectId: string, kind: TaskType, intentId?: string): boolean {
     return [...this.values.values()].some((item) => item.projectId === projectId && item.kind === kind && item.intentId === intentId);
+  }
+  /** Returns immutable snapshots, optionally filtered to one Project. */
+  snapshot(projectId?: string): ExecutionSnapshot[] {
+    return [...this.values.values()]
+      .filter((item) => !projectId || item.projectId === projectId)
+      .map((item) => ({
+        executionId: item.executionId,
+        projectId: item.projectId,
+        kind: item.kind,
+        intentId: item.intentId ?? null,
+        workerName: item.workerName ?? null,
+        processId: item.processId ?? null,
+        startedAt: toLocalTimestamp(item.startedAt),
+        deadlineAt: item.deadlineAt !== undefined ? toLocalTimestamp(item.deadlineAt) : null,
+      }));
   }
   cancelProject(projectId: string): void {
     for (const execution of this.values.values()) if (execution.projectId === projectId) execution.controller.abort();
   }
   cancelAll(): void { for (const execution of this.values.values()) execution.controller.abort(); }
+  /** Waits for cancelled dispatch promises to finish their ProcessRunner cleanup. */
+  async waitForEmpty(timeoutMs = 10_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.values.size > 0) {
+      if (Date.now() >= deadline) throw new Error(`timed out waiting for ${this.values.size} execution(s) to stop`);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+}
+
+/**
+ * Formats an epoch millisecond timestamp as the local wall-clock format
+ * `YYYYMMDDTHHMMSS.XXX` used by Peak's persisted timestamps, so the snapshot
+ * is presentable to the UI without leaking internal numeric state.
+ */
+function toLocalTimestamp(epochMs: number): string {
+  const date = new Date(epochMs);
+  const pad = (value: number, width = 2): string => String(value).padStart(width, "0");
+  const yyyy = date.getFullYear();
+  const mm = pad(date.getMonth() + 1);
+  const dd = pad(date.getDate());
+  const hh = pad(date.getHours());
+  const mi = pad(date.getMinutes());
+  const ss = pad(date.getSeconds());
+  const ms = pad(date.getMilliseconds(), 3);
+  return `${yyyy}${mm}${dd}T${hh}${mi}${ss}.${ms}`;
 }

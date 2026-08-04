@@ -1,0 +1,57 @@
+{
+  "board": {
+    "name": "AI Harness & Safety",
+    "skills": [
+      "aihot"
+    ],
+    "projects": [
+      {
+        "id": "",
+        "source": "AI 技术热点分析",
+        "goal": "产出一份供工程与治理决策使用的当前 AI 安全情报简报"
+      },
+      {
+        "id": "",
+        "source": "AI 智能体护栏设计",
+        "goal": "产出一份可实施的快速入手的 AI Agent 安全护栏蓝图"
+      }
+    ]
+  },
+  "workers": [
+    {
+      "type": "pi",
+      "model": "deepseek/deepseek-v4-flash",
+      "taskTypes": [
+        "plan",
+        "supervise"
+      ],
+      "priority": 1
+    },
+    {
+      "type": "pi",
+      "model": "minimax-cn/MiniMax-M3",
+      "taskTypes": [
+        "execute"
+      ],
+      "maxRunning": 4,
+      "priority": 1
+    }
+  ],
+  "phase": {
+    "supervise": {
+      "intervalMs": 60000,
+      "customProfile": {
+        "description": "用于复核 AI 安全证据或 AI 智能体护栏工程结果。",
+        "prompt": "对于安全情报，只指出一手来源可追溯性、日期、已确认事实与不确定性区分、实际影响依据方面的具体缺陷。对于护栏设计，只指出威胁覆盖、执行行为、遥测、负责人或量化测试方面的具体缺口。明确写出缺失或矛盾的项目，不得要求泛化扩写或另行制作审查报告。"
+      }
+    },
+    "execute": {
+      "customProfiles": [
+        {
+          "description": "评估论文/官方标准/监管机构文件有效性",
+          "prompt": "请对提供的论文进行深度剖析，评估其核心结论的“有效性（Validity）”与“科学性”，并指出潜在的学术漏洞。请从以下几个维度进行系统化评估：核心论证逻辑，方法论与设计质量，数据与证据支撑度，创新性与实际价值，局限性与潜在漏洞。请使用严谨、建设性的学术语言输出，给出一个总体的【有效性得分】（1-10分，10为完美）；若分值低于 5 分，则不采纳该论文结论"
+        }
+      ]
+    }
+  }
+}

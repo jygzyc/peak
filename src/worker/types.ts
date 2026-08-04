@@ -1,18 +1,56 @@
 import type { TaskType, WorkerConfig, WorkerType } from "../config/types.js";
 
+export type { WorkerType };
+
 export interface SessionRef { workerType: WorkerType; value: string }
-export interface ProcessSpec { argv: string[]; input?: string; env?: Record<string, string> }
+/**
+ * Subprocess specification. `argv` is driven through cmd.exe on Windows so
+ * npm-installed CLIs resolve; `input` is piped via stdin (never on the
+ * command line). An optional `stdoutFilter` lets a protocol discard
+ * high-volume streaming noise (e.g. token deltas) line by line so a long
+ * streaming run is not misread as runaway output: the byte budget counts
+ * only retained lines, and each line is matched without its trailing newline.
+ */
+export interface ProcessSpec {
+  argv: string[];
+  input?: string;
+  env?: Record<string, string>;
+  stdoutFilter?: (line: string) => boolean;
+}
 export interface ProcessResult {
   stdout: string; stderr: string; returncode: number; timedOut: boolean; cancelled: boolean; started: boolean;
 }
 export interface WorkerResult extends ProcessResult { text: string; session?: SessionRef }
-export interface WorkerRequest {
-  workerName: string; config: WorkerConfig; taskType: TaskType; prompt: string; cwd: string;
-  timeoutMs: number; signal?: AbortSignal; session?: SessionRef;
+
+/**
+ * Inputs handed to a CLI protocol builder. `cwd` is the Board directory and
+ * `sessionDir` is an optional process-isolated directory a protocol may use
+ * for its own session files. The prompt is always piped via stdin by the
+ * ProcessRunner; it never appears on the command line.
+ */
+export interface WorkerCall {
+  workerName: string;
+  config: WorkerConfig;
+  taskType: TaskType;
+  prompt: string;
+  cwd: string;
+  session?: SessionRef;
+  sessionDir?: string;
 }
-export interface WorkerDriver {
+
+/**
+ * Stateless per-tool CLI protocol. Each backend describes only how to build
+ * the subprocess argv from a {@link WorkerCall}, how to derive a resumable
+ * session before the run, and how to parse stdout into the final text and an
+ * optional resumable session. Protocols never implement scheduling, process
+ * management, or Graph access; {@link WorkerRuntime} drives the single shared
+ * ProcessRunner uniformly for every protocol.
+ */
+export interface WorkerProtocol {
   readonly type: WorkerType;
   readonly canResume: boolean;
-  execute(request: WorkerRequest): Promise<WorkerResult>;
-  dispose(): void;
+  build(call: WorkerCall, session: SessionRef | undefined): ProcessSpec;
+  /** Seed or carry a resumable session before the run. Defaults to `call.session`. */
+  prepareSession?(call: WorkerCall): SessionRef | undefined;
+  parse(result: ProcessResult): { text: string; session?: SessionRef };
 }

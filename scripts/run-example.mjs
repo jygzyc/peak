@@ -4,9 +4,9 @@
  *
  * 流程：
  *   1. 在当前目录新建 .peak_test 作为测试根目录（先清理旧内容）；
- *   2. 把 examples/ai_agent_safety_zh 的中文测试项目复制到 .peak_test；
+ *   2. 把 examples/ai_agent_zh 的中文测试项目复制到 .peak_test；
  *   3. 直接运行安装版本的 peak（`peak run .peak_test --peak-home .peak_test`），
- *      所有 Project 数据隔离在 .peak_test 下；Ctrl+C 触发优雅关闭。
+ *      所有 Project 数据隔离在 .peak_test 下；Server 在后台运行，可用 peak status/stop 管理。
  */
 import { spawn } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, rmSync } from "node:fs";
@@ -14,7 +14,7 @@ import { join, resolve } from "node:path";
 
 const cwd = process.cwd();
 const testRoot = join(cwd, ".peak_test");
-const exampleDir = resolve(import.meta.dirname, "..", "examples", "ai_agent_safety_zh");
+const exampleDir = resolve(import.meta.dirname, "..", "examples", "ai_agent_zh");
 
 if (!existsSync(exampleDir)) {
   process.stderr.write(`[peak-launcher] 找不到示例项目: ${exampleDir}\n`);
@@ -26,7 +26,7 @@ mkdirSync(testRoot, { recursive: true });
 cpSync(exampleDir, testRoot, { recursive: true });
 
 process.stdout.write(`[peak-launcher] 测试根目录: ${testRoot}\n`);
-process.stdout.write("[peak-launcher] 启动安装版本的 peak ...\n");
+process.stdout.write("[peak-launcher] 在后台启动安装版本的 peak ...\n");
 
 // Windows 上 peak 是 .cmd shim，经 cmd.exe 解析（与 ProcessRunner 相同的引号处理）；
 // POSIX 直接 spawn peak 可执行文件。

@@ -1,18 +1,22 @@
-import type { ProcessResult, ProcessSpec, SessionRef, WorkerRequest } from "../types.js";
-import { CliWorkerDriver, textFromJson } from "./base.js";
+import type { ProcessResult, ProcessSpec, WorkerCall, WorkerProtocol, WorkerType } from "../types.js";
+import { textFromJson } from "./shared.js";
 
-export class OpenCodeDriver extends CliWorkerDriver {
-  readonly type = "opencode";
-  readonly canResume = false;
+const TYPE: WorkerType = "opencode";
 
-  protected build(request: WorkerRequest, _session: SessionRef | undefined): ProcessSpec {
+/**
+ * OpenCode protocol. Prompt is piped via stdin (`opencode run` reads `-`).
+ * Does not currently support Finalize resume.
+ */
+export const opencodeProtocol: WorkerProtocol = {
+  type: TYPE,
+  canResume: false,
+  build(call: WorkerCall): ProcessSpec {
     const argv = ["opencode", "run", "--format", "json"];
-    if (request.config.model) argv.push("--model", request.config.model);
-    argv.push(...request.config.args, "-");
-    return { argv, input: request.prompt };
-  }
-
-  protected parse(result: ProcessResult): { text: string } {
+    if (call.config.model) argv.push("--model", call.config.model);
+    argv.push("-");
+    return { argv, input: call.prompt };
+  },
+  parse(result: ProcessResult): { text: string } {
     const texts = result.stdout.split(/\r?\n/).flatMap((line) => {
       try {
         const event = JSON.parse(line) as Record<string, unknown>;
@@ -22,5 +26,5 @@ export class OpenCodeDriver extends CliWorkerDriver {
       } catch { return []; }
     });
     return { text: texts.join("\n").trim() || textFromJson(result.stdout) };
-  }
-}
+  },
+};

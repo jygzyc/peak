@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { backup, DatabaseSync } from "node:sqlite";
 import { initializeProjectDirectory } from "../config/paths.js";
 import {
   ApiError, localTimestamp, requireCustomProfileDigest, requireDescription, requireFactDescription, requireIntentDescription, requireShortDescription,
@@ -37,6 +37,22 @@ export class SqliteStore {
   }
 
   close(): void { this.database.close(); }
+
+  async backupTo(path: string): Promise<void> {
+    await backup(this.database, path);
+  }
+
+  validatePortableArchive(): void {
+    const integrity = this.database.prepare("PRAGMA quick_check").get();
+    if (text(integrity?.quick_check) !== "ok") throw new Error("Project archive database integrity check failed");
+    const expected = ["artifacts", "counters", "facts", "hints", "intent_sources", "intents", "project"];
+    const actual = this.database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+      .all().map((row) => text(row.name));
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error("Project archive database has an invalid schema");
+    const executableSchema = this.database.prepare("SELECT name FROM sqlite_master WHERE type IN ('trigger','view') AND name NOT LIKE 'sqlite_%'").get();
+    if (executableSchema) throw new Error("Project archive database contains unsupported triggers or views");
+    if (this.database.prepare("PRAGMA foreign_key_check").get()) throw new Error("Project archive database has invalid foreign keys");
+  }
 
   project(): ProjectMeta | undefined {
     const row = this.database.prepare("SELECT * FROM project LIMIT 1").get();
@@ -112,7 +128,11 @@ export class SqliteStore {
 
   artifact(sha256: string): ArtifactRef | undefined {
     const row = this.database.prepare("SELECT * FROM artifacts WHERE sha256=?").get(sha256);
-    return row ? { path: text(row.path), sha256: text(row.sha256), mediaType: text(row.media_type), sizeBytes: number(row.size_bytes), filename: nullableNull(row.filename) } : undefined;
+    return row ? artifact(row) : undefined;
+  }
+
+  artifacts(): ArtifactRef[] {
+    return this.database.prepare("SELECT * FROM artifacts ORDER BY sha256").all().map(artifact);
   }
 
   addHint(input: AddHintInput): Hint {
@@ -340,6 +360,12 @@ function fact(row: Record<string, unknown>): Fact {
     artifact: sha256
       ? { path: text(row.path), sha256, mediaType: text(row.media_type), sizeBytes: number(row.size_bytes), filename: nullableNull(row.filename) }
       : null,
+  };
+}
+function artifact(row: Record<string, unknown>): ArtifactRef {
+  return {
+    path: text(row.path), sha256: text(row.sha256), mediaType: text(row.media_type),
+    sizeBytes: number(row.size_bytes), filename: nullableNull(row.filename),
   };
 }
 function addColumn(database: DatabaseSync, table: string, column: string, definition: string): void {
