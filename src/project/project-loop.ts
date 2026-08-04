@@ -35,6 +35,7 @@ export class ProjectLoop {
     const project = await this.graph.getProject(this.projectId);
     if (project.project.status !== "active") {
       this.executions.cancelProject(this.projectId);
+      this.executor.cleanupRuntimeTmp();
       return 0;
     }
     // Supervise channel (independent of Execute capacity): at most one active

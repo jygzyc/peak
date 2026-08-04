@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -41,6 +41,25 @@ class SourceMutatingWorkers implements TaskWorkers {
     };
   }
 }
+
+test("TaskExecutor.cleanupRuntimeTmp removes the per-Project runtime scratch directory (.tmp)", () => {
+  const root = mkdtempSync(join(tmpdir(), "peak-tmp-"));
+  const projectDir = join(root, "project");
+  const tmpDir = join(projectDir, ".tmp");
+  mkdirSync(tmpDir, { recursive: true });
+  writeFileSync(join(tmpDir, "pi-session.json"), "transient worker cache");
+  const executor = new TaskExecutor(
+    configuration(root),
+    { key: "project-1", source: "start", goal: "done" },
+    {} as never, {} as never, {} as never,
+    projectDir, () => undefined, tmpDir,
+  );
+  assert.equal(existsSync(tmpDir), true, ".tmp exists before cleanup");
+  executor.cleanupRuntimeTmp();
+  assert.equal(existsSync(tmpDir), false, ".tmp removed after cleanup");
+  // Idempotent: a second cleanup on a missing directory is a no-op.
+  executor.cleanupRuntimeTmp();
+});
 
 test("built-in phase prompts stay concise and leave judgment to the AI", () => {
   for (const name of ["plan.md", "supervise.md", "execute.md", "execute-finalize.md"]) {
@@ -89,7 +108,7 @@ test("Plan, Supervise and Execute mutate Graph only through HTTP", async () => {
 
     const result = await graph.getProject(project.id);
     assert.equal(result.project.status, "completed");
-    assert.equal(readFileSync(join(root, "report.md"), "utf8"), "details\n", "final deliverable materialized next to task.json");
+    assert.equal(readFileSync(join(projectDir, "out", "report.md"), "utf8"), "details\n", "final deliverable materialized under the Project out directory");
     assert.equal(result.hints.length, 1);
     assert.equal("kind" in result.hints[0]!, false);
     assert.equal(result.hints[0]?.consumedByIntentId, intent.id);

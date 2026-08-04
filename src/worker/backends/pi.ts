@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ProcessResult, ProcessSpec, SessionRef, WorkerCall, WorkerProtocol, WorkerType } from "../types.js";
@@ -44,7 +45,7 @@ export function buildPiArgv(
   session: SessionRef | undefined,
   target: [string, string[]],
 ): { argv: string[]; input: string; sessionDir: string } {
-  const sessionDir = call.sessionDir ?? fallbackSessionDir();
+  const sessionDir = call.tmpDir ?? fallbackSessionDir();
   mkdirSync(sessionDir, { recursive: true });
   const [command, commandArgs] = target;
   const argv = [command, ...commandArgs, "--mode", "json", "--session-dir", sessionDir];
@@ -57,10 +58,10 @@ export function buildPiArgv(
 /**
  * Pi CLI protocol. Runs `pi --mode json` so the agent session streams as
  * newline-delimited events; the prompt is piped via stdin (`-p`). Session
- * files live under an isolated `--session-dir` so they never pollute the
- * Board directory; Finalize resume passes the captured session id back with
- * `--session`. Pi itself owns provider auth, model catalogs, and session
- * persistence.
+ * files live under the per-Project `.tmp` scratch directory passed as
+ * `--session-dir` so they never pollute the Board directory; Finalize resume
+ * passes the captured session id back with `--session`. Pi itself owns
+ * provider auth, model catalogs, and session persistence.
  */
 export const piProtocol: WorkerProtocol = {
   type: TYPE,
@@ -124,11 +125,11 @@ function keepPiEvent(line: string): boolean {
 }
 
 /**
- * Defensive fallback session dir (never used in production, where Runtime
- * injects a Project-scoped dir) so a direct protocol call does not write into
- * an arbitrary cwd-derived location.
+ * Defensive fallback scratch dir (never used in production, where Runtime
+ * injects the per-Project `.tmp` dir) so a direct protocol call writes under
+ * the OS temp directory instead of the current working directory.
  */
 function fallbackSessionDir(): string {
   const token = randomBytes(8).toString("hex");
-  return join(process.cwd(), ".peak-pi-sessions", token);
+  return join(tmpdir(), ".peak-pi", token);
 }

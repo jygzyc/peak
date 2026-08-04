@@ -48,6 +48,35 @@ export function initializeProjectLogsDirectory(projectDir: string): string {
   return logsDir;
 }
 
+/** Name of the per-Project runtime scratch directory for transient worker files. */
+export const PROJECT_TMP_DIR = ".tmp";
+
+/**
+ * Per-Project runtime scratch directory (`<projectDir>/.tmp`) for transient
+ * worker files such as CLI session caches. It is never persisted to a Project
+ * archive, never stores Fact Artifacts or deliverables, and is cleaned up once
+ * the Project is no longer active.
+ */
+export function projectTmpDir(projectDir: string): string {
+  return join(resolve(projectDir), PROJECT_TMP_DIR);
+}
+
+/** Name of the per-Project deliverable output directory. */
+export const PROJECT_OUT_DIR = "out";
+
+/**
+ * Per-Project output directory (`<projectDir>/out`) where the final Goal
+ * deliverables are materialized using each completion-source Artifact's
+ * content-based filename. Distinct from the content-addressed `artifacts/`
+ * store: `artifacts/` is the immutable source of truth, while `out/` holds the
+ * user-facing materialized copies. It is never persisted to a Project archive
+ * (deliverables are reproducible from the archived Artifacts) and is removed
+ * only when the Project itself is deleted.
+ */
+export function projectOutDir(projectDir: string): string {
+  return join(resolve(projectDir), PROJECT_OUT_DIR);
+}
+
 export function resolveTaskConfigPaths(directory = "."): TaskConfigPaths {
   const taskDir = resolve(directory);
   const configPath = join(taskDir, "task.json");

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -48,6 +48,11 @@ test("completed Project archives carry Graph JSON, SQLite, and verified Artifact
       completedBy: "test",
     });
 
+    // A runtime scratch directory (.tmp) caches transient worker files and must
+    // never leak into the portable Project archive.
+    mkdirSync(join(sourceProjects, project.id, ".tmp"), { recursive: true });
+    writeFileSync(join(sourceProjects, project.id, ".tmp", "pi-session.json"), "transient");
+
     await graph.downloadProjectArchive(project.id, downloadedArchive);
     assert.ok(existsSync(downloadedArchive));
     const targetRegistry = new ProjectStoreRegistry(join(root, "download-target", "projects"));
@@ -57,6 +62,7 @@ test("completed Project archives carry Graph JSON, SQLite, and verified Artifact
       assert.equal(imported.project.status, "completed");
       assert.equal(readFileSync(join(targetRegistry.baseDir, project.id, "artifacts", artifact.sha256), "utf8"), "portable evidence\n");
       assert.ok(existsSync(join(targetRegistry.baseDir, project.id, "analysis.db")));
+      assert.equal(existsSync(join(targetRegistry.baseDir, project.id, ".tmp")), false, ".tmp never enters the Project archive");
       assert.ok((await graph.exportProject(project.id)).includes(project.id));
       await assert.rejects(targetRegistry.importProjectArchive(downloadedArchive), /already exists/);
     } finally {

@@ -1,5 +1,4 @@
-import { join } from "node:path";
-import { initializePeakPaths } from "../config/paths.js";
+import { initializePeakPaths, projectTmpDir } from "../config/paths.js";
 import { persistProjectId } from "../config/task-config.js";
 import type { InstalledSkill, ResolvedTaskConfig, TaskProjectConfig } from "../config/types.js";
 import { cleanupTaskSkills, initializeTaskSkills } from "../config/task-skill-installer.js";
@@ -149,7 +148,7 @@ export class AgentRuntime {
       this.federation,
       projectDir,
       () => this.executions.cancelProject(project.id),
-      join(projectDir, "pi-sessions"),
+      projectTmpDir(projectDir),
       (executionId, pid) => this.executions.setProcessId(executionId, pid),
     );
     this.executors.set(project.id, executor);

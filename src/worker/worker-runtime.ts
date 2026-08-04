@@ -66,7 +66,7 @@ export class WorkerRuntime {
     cwd: string,
     signal?: AbortSignal,
     currentSession?: SessionRef,
-    options: { sessionDir?: string; onSpawn?: (pid: number) => void } = {},
+    options: { tmpDir?: string; onSpawn?: (pid: number) => void } = {},
   ): Promise<WorkerResult> {
     const config = this.config.workers[workerName];
     if (!config) throw new Error(`worker not found: ${workerName}`);
@@ -86,7 +86,7 @@ export class WorkerRuntime {
     }
     try {
       const call: WorkerCall = {
-        workerName, config, taskType, prompt, cwd, session: currentSession, sessionDir: options.sessionDir,
+        workerName, config, taskType, prompt, cwd, session: currentSession, tmpDir: options.tmpDir,
       };
       const session = protocol.prepareSession ? protocol.prepareSession(call) : call.session;
       const spec = protocol.build(call, session);

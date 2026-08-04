@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
-import { appendFileSync, createReadStream, lstatSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, createReadStream, lstatSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { customProfileDigest } from "../config/custom-profile.js";
-import { initializeProjectLogsDirectory } from "../config/paths.js";
+import { initializeProjectLogsDirectory, projectOutDir } from "../config/paths.js";
 import { executeCapacity } from "../config/task-config.js";
 import type { CustomProfileDefinition, ResolvedTaskConfig, TaskProjectConfig, TaskType } from "../config/types.js";
 import { localTimestamp } from "../graph/api.js";
@@ -27,7 +27,7 @@ export interface TaskWorkers {
     cwd: string,
     signal?: AbortSignal,
     session?: SessionRef,
-    options?: { sessionDir?: string; onSpawn?: (pid: number) => void },
+    options?: { tmpDir?: string; onSpawn?: (pid: number) => void },
   ): Promise<WorkerResult>;
 }
 
@@ -77,7 +77,7 @@ export class TaskExecutor {
     private readonly federation: FederationBus,
     readonly projectDir: string,
     private readonly onComplete: () => void = () => undefined,
-    private readonly sessionDir?: string,
+    private readonly tmpDir?: string,
     private readonly reportSpawn?: (executionId: string, pid: number) => void,
   ) { validatePromptTemplates(); }
 
@@ -307,18 +307,18 @@ export class TaskExecutor {
     return this.graph.uploadContent(projectId, content, mediaType, filename ?? undefined);
   }
 
-  /** Materializes the final Goal deliverables next to task.json using each artifact's content-based filename. */
+  /** Materializes the final Goal deliverables under the Project `out/` directory using each completion-source Artifact's content-based filename. */
   private async materializeDeliverables(projectId: string, refs: FactRef[]): Promise<void> {
-    const taskDir = resolve(this.config.taskDir);
+    const outDir = projectOutDir(this.projectDir);
     for (const ref of refs) {
       if (ref.projectId !== projectId) continue;
       const fact = await this.graph.getFact(ref);
       const artifact = fact.artifact;
       if (!artifact?.filename) continue;
-      const outputPath = resolve(taskDir, artifact.filename);
-      const rel = relative(taskDir, outputPath);
+      const outputPath = resolve(outDir, artifact.filename);
+      const rel = relative(outDir, outputPath);
       if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(artifact.filename)) {
-        throw new Error(`deliverable filename escapes the Board directory: ${artifact.filename}`);
+        throw new Error(`deliverable filename escapes the output directory: ${artifact.filename}`);
       }
       const content = await this.graph.artifactContent(projectId, artifact.sha256);
       mkdirSync(dirname(outputPath), { recursive: true });
@@ -335,16 +335,32 @@ export class TaskExecutor {
 
   /**
    * Per-execute options shared by every phase dispatch: the Project-scoped
-   * session directory (used by resumable CLI protocols such as Pi) and a
-   * spawn callback that lets the Runtime record the child PID in its
-   * ExecutionRegistry snapshot. Finalize reuses the Execute execution id so
-   * the same PID slot is updated.
+   * runtime scratch directory (`.tmp`, used by resumable CLI protocols such
+   * as Pi for session caches) and a spawn callback that lets the Runtime
+   * record the child PID in its ExecutionRegistry snapshot. Finalize reuses
+   * the Execute execution id so the same PID slot is updated.
    */
-  private workerOptions(executionId: string): { sessionDir?: string; onSpawn?: (pid: number) => void } {
-    const options: { sessionDir?: string; onSpawn?: (pid: number) => void } = {};
-    if (this.sessionDir) options.sessionDir = this.sessionDir;
+  private workerOptions(executionId: string): { tmpDir?: string; onSpawn?: (pid: number) => void } {
+    const options: { tmpDir?: string; onSpawn?: (pid: number) => void } = {};
+    if (this.tmpDir) options.tmpDir = this.tmpDir;
     if (this.reportSpawn) options.onSpawn = (pid: number) => this.reportSpawn!(executionId, pid);
     return options;
+  }
+
+  /**
+   * Best-effort removal of the per-Project runtime scratch directory
+   * (`<projectDir>/.tmp`) that caches transient worker files such as CLI
+   * session caches. It is never part of a Project archive and never stores
+   * Fact Artifacts or deliverables. Called once the Project is no longer
+   * active; idempotent and safe to retry every tick while it stays inactive.
+   */
+  cleanupRuntimeTmp(): void {
+    if (!this.tmpDir) return;
+    try {
+      rmSync(this.tmpDir, { recursive: true, force: true });
+    } catch (error) {
+      process.stderr.write(`[peak] failed to clean up runtime tmp: ${(error as Error).message}\n`);
+    }
   }
 }
 

@@ -15,10 +15,12 @@ class RecordingExecutor {
   readonly dispatched: Array<{ kind: TaskType; executionId: string; intentId?: string }> = [];
   readonly projectDir: string;
   readonly logEvents: Array<Record<string, unknown>> = [];
+  cleanupCalls = 0;
   private readonly pending = new Set<Promise<void>>();
   constructor(projectDir = "/") { this.projectDir = projectDir; }
   reserveWorker(taskType: TaskType): string | undefined { return taskType; }
   logEvent(type: string, data: Record<string, unknown>): void { this.logEvents.push({ type, ...data }); }
+  cleanupRuntimeTmp(): void { this.cleanupCalls += 1; }
   plan(_projectId: string, executionId: string): Promise<void> { return this.track("plan", executionId); }
   supervise(_projectId: string, executionId: string): Promise<void> { return this.track("supervise", executionId); }
   execute(_projectId: string, _intent: { id: string }, executionId: string): Promise<void> { return this.track("execute", executionId, _intent.id); }
@@ -158,6 +160,28 @@ test("ProjectLoop Execute budgets are independent across Projects", async () => 
     assert.ok(startedB >= 1, "Project B starts its Execute despite A's in-flight Execute");
     assert.equal(executions.count(undefined, "execute"), 2, "both Execute executions are in-flight");
     assert.equal(executor.dispatched.filter((item) => item.kind === "execute").length, 2, "one Execute dispatched per Project");
+  } finally {
+    await server.stop();
+    registry.close();
+    rmSync(projects, { recursive: true, force: true });
+  }
+});
+
+test("ProjectLoop cleans up the per-Project runtime scratch directory once the Project is no longer active", async () => {
+  const projects = mkdtempSync(join(tmpdir(), "peak-loop-"));
+  mkdirSync(projects, { recursive: true });
+  const registry = new ProjectStoreRegistry(projects);
+  const server = new GraphHttpServer(registry);
+  await server.start();
+  const graph = new GraphClient(server.baseUrl);
+  try {
+    const project = await graph.createProject({ title: "P", target: "open", goal: "done", scope: "s" });
+    const executor = new RecordingExecutor();
+    const loop = new ProjectLoop(project.id, config(), graph, executor as never, new ExecutionRegistry(), () => 0);
+    await graph.setStatus(project.id, "stopped");
+    const started = await loop.tick();
+    assert.equal(started, 0, "a non-active Project dispatches no work");
+    assert.equal(executor.cleanupCalls, 1, "runtime scratch directory is cleaned when the Project is no longer active");
   } finally {
     await server.stop();
     registry.close();

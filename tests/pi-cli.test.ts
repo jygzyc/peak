@@ -14,8 +14,8 @@ function piWorker(model?: string): WorkerConfig {
   return { type: "pi", model, taskTypes: ["execute"], maxRunning: 1, priority: 1, env: {} };
 }
 
-function call(config: WorkerConfig, sessionDir = "/sessions", session?: { workerType: "pi"; value: string }): WorkerCall {
-  return { workerName: "pi", config, taskType: "execute", prompt: "prompt", cwd: process.cwd(), sessionDir, session };
+function call(config: WorkerConfig, tmpDir = "/sessions", session?: { workerType: "pi"; value: string }): WorkerCall {
+  return { workerName: "pi", config, taskType: "execute", prompt: "prompt", cwd: process.cwd(), tmpDir, session };
 }
 
 function jsonl(lines: Array<Record<string, unknown>>): string {

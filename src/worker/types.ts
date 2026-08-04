@@ -24,9 +24,10 @@ export interface WorkerResult extends ProcessResult { text: string; session?: Se
 
 /**
  * Inputs handed to a CLI protocol builder. `cwd` is the Board directory and
- * `sessionDir` is an optional process-isolated directory a protocol may use
- * for its own session files. The prompt is always piped via stdin by the
- * ProcessRunner; it never appears on the command line.
+ * `tmpDir` is an optional per-Project scratch directory (`.tmp`) a protocol
+ * may use for its own transient files such as CLI session caches. The prompt
+ * is always piped via stdin by the ProcessRunner; it never appears on the
+ * command line.
  */
 export interface WorkerCall {
   workerName: string;
@@ -35,7 +36,7 @@ export interface WorkerCall {
   prompt: string;
   cwd: string;
   session?: SessionRef;
-  sessionDir?: string;
+  tmpDir?: string;
 }
 
 /**

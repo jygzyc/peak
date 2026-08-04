@@ -139,7 +139,7 @@ test("ai_agent_safety example: depth-first DAG lifecycle through HTTP + TaskExec
 
     const result = await graph.getProject(project.id);
     assert.equal(result.project.status, "completed");
-    assert.equal(readFileSync(join(root, "final-brief.md"), "utf8"), briefContent, "final deliverable materialized next to task.json");
+    assert.equal(readFileSync(join(projectDir, "out", "final-brief.md"), "utf8"), briefContent, "final deliverable materialized under the Project out directory");
     assert.deepEqual(leafFacts(result).map((fact) => fact.id), ["f007"]);
     const factIds = result.facts.map((fact) => fact.id);
     assert.deepEqual(factIds.sort(), ["f001", "f002", "f003", "f004", "f005", "f006", "f007", "goal", "origin"]);
