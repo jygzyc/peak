@@ -9,7 +9,7 @@ npm run typecheck
 npm run build        # 模块化 dist + scripts/*.mjs 语法与一致性校验
 npm test             # 先构建，再针对 dist/ 运行测试
 npm run smoke        # CLI 冒烟：init/workers/--version
-npm run pack         # esbuild 单文件 bundle + npm pack + manifest
+npm run pack         # esbuild 单文件 bundle + 只打包自包含 dist 包 + manifest
 ```
 
 - `npm test` 先执行干净的 TypeScript 构建；测试从 `dist/` 导入模块化文件，绝不直接导入 `src/`。

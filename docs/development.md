@@ -9,7 +9,7 @@ npm run typecheck
 npm run build        # modular dist + scripts/*.mjs syntax & consistency checks
 npm test             # builds first, runs tests against dist/
 npm run smoke        # CLI smoke: init/workers/--version
-npm run pack         # esbuild single-file bundle + npm pack + manifest
+npm run pack         # esbuild single-file bundle + npm pack of the self-contained dist package + manifest
 ```
 
 - `npm test` runs a clean TypeScript build first; tests import modular files from `dist/`, never directly from `src/`.

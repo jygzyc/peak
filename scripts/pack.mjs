@@ -8,8 +8,11 @@
  *      builtins stay external so consumers' node_modules satisfy them.
  *   3. Verify the declared npm binary boots: `node dist/cli.js workers`
  *      must print valid JSON.
- *   4. `npm pack` the bundled dist into dist-packages/.
- *   5. Emit dist-packages/manifest.json with name, version, fileName,
+ *   4. Generate the self-contained publishable package inside dist/ (its own
+ *      package.json, README.md, LICENSE, version) — only the compiled result
+ *      is ever published; the repo root is never packed.
+ *   5. `npm pack ./dist` into dist-packages/.
+ *   6. Emit dist-packages/manifest.json with name, version, fileName,
  *      compressed size, unpacked size, sha256, and bundle metadata.
  *
  * No sourcemap is emitted — performance over debuggability.
@@ -150,6 +153,32 @@ try {
     }
   });
 
+  if (mode !== "archive") await step("dist package", () => {
+    // Only the compiled result is published: dist/ becomes a self-contained
+    // package with its own manifest (name/version/bin/deps), README, LICENSE
+    // and the version file (`src/cli.ts` resolves `version` next to the
+    // bundle when `<moduleDir>/../version` is absent). The repo root —
+    // sources, docs, tests — is never packed.
+    const fileVersion = readFileSync(join(root, "version"), "utf8").trim();
+    const rootPkg = JSON.parse(readFileSync(join(root, "package.json"), "utf-8"));
+    const distPkg = {
+      name: rootPkg.name,
+      version: fileVersion,
+      description: rootPkg.description,
+      type: "module",
+      bin: { peak: "cli.js" },
+      dependencies: rootPkg.dependencies,
+      engines: rootPkg.engines,
+      license: rootPkg.license,
+      repository: rootPkg.repository,
+      publishConfig: rootPkg.publishConfig,
+    };
+    writeFileSync(join(distDir, "package.json"), `${JSON.stringify(distPkg, null, 2)}\n`);
+    for (const name of ["README.md", "LICENSE", "version"]) {
+      copyFileSync(join(root, name), join(distDir, name));
+    }
+  });
+
   if (mode !== "prepare") await step("sync version", () => {
     // version 文件是唯一版本来源；npm pack 读取 package.json，因此先同步。
     const fileVersion = readFileSync(join(root, "version"), "utf8").trim();
@@ -167,10 +196,11 @@ try {
     mkdirSync(outDir, { recursive: true });
 
     const npm = npmInvocation(
+      // Pack only the self-contained dist package, never the repo root.
       // --ignore-scripts: skip the prepack lifecycle hook here, because THIS
       // script IS the prepack step. Without it, prepack → pack.mjs → npm pack
       // → prepack would recurse infinitely once a "prepack" script is declared.
-      ["pack", "--pack-destination", outDir, "--ignore-scripts", "--json"],
+      ["pack", "./dist", "--pack-destination", outDir, "--ignore-scripts", "--json"],
     );
     const packed = spawnSync(
       npm.command,
@@ -194,14 +224,18 @@ try {
     const packedFiles = new Set(
       (entry.files ?? []).map((file) => String(file.path).replaceAll("\\", "/")),
     );
-    const packedExample = [...packedFiles].find((path) => path === "examples" || path.startsWith("examples/"));
-    if (packedExample) {
-      process.stderr.write(`npm package must not contain examples: ${packedExample}\n`);
+    const forbidden = [...packedFiles].find(
+      (path) => /^(examples|docs|src)(\/|$)/.test(path) || path === "AGENTS.md" || path === "RELEASE.md",
+    );
+    if (forbidden) {
+      process.stderr.write(`npm package must contain only the compiled dist package, found: ${forbidden}\n`);
       process.exit(1);
     }
-    if (!packedFiles.has(distEntryRelative)) {
-      process.stderr.write(`npm package does not contain declared binary ${distEntryRelative}\n`);
-      process.exit(1);
+    for (const requiredPath of ["cli.js", "package.json", "version"]) {
+      if (!packedFiles.has(requiredPath)) {
+        process.stderr.write(`npm package is missing ${requiredPath}\n`);
+        process.exit(1);
+      }
     }
     // npm usually honors --pack-destination, but in some lifecycle wrappers
     // (e.g. publish --dry-run) it may write to cwd instead. Check both.
@@ -223,7 +257,7 @@ try {
       sha256: createHash("sha256").update(bytes).digest("hex"),
       bundle: {
         entry: "src/cli.ts",
-        output: distEntryRelative,
+        output: "cli.js", // 位于发布包根（dist package 自身是包根）
         bundleBytes,
         external: EXTERNAL,
         format: "esm",
