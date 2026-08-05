@@ -23,7 +23,7 @@ jobs:
           cache: npm
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install
 
       - name: Typecheck
         run: npm run typecheck
@@ -39,15 +39,3 @@ jobs:
 
       - name: Pack
         run: npm run pack
-
-      # The tag-triggered Release downloads exactly these packed artifacts
-      # (dist-packages/*.tgz + manifest.json) instead of rebuilding. Upload
-      # from one OS only so the artifact name stays unique across the matrix.
-      - name: Upload packed artifacts
-        if: matrix.os == 'ubuntu-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: peak-dist-packages
-          path: dist-packages/
-          if-no-files-found: error
-          retention-days: 30

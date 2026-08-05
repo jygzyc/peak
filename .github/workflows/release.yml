@@ -6,7 +6,6 @@ on:
       - "v*"
 
 permissions:
-  actions: read
   contents: write
 
 jobs:
@@ -19,61 +18,36 @@ jobs:
         with:
           node-version: 22
 
-      # Release consumes only the artifacts packed by the main-branch CI run
-      # for this exact commit (uploaded by ci.yml). Nothing is rebuilt on a
-      # tag; if the commit has no successful CI run (e.g. a [skip ci]
-      # commit), the release fails fast instead of publishing unverified
-      # artifacts.
-      - name: Find CI run for this commit
-        id: ci-run
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const { data: runs } = await github.rest.actions.listWorkflowRuns({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: 'ci.yml',
-              head_sha: context.sha,
-              event: 'push',
-              status: 'success',
-              per_page: 1,
-            });
-            if (runs.total_count === 0) {
-              core.setFailed(`no successful CI run for commit ${context.sha}; push it to main, let CI pass, then tag`);
-              return;
-            }
-            core.setOutput('run_id', runs.workflow_runs[0].id);
+      # package-lock.json is intentionally not tracked, so install from
+      # package.json rather than `npm ci`.
+      - name: Install dependencies
+        run: npm install
 
-      - name: Download packed artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: peak-dist-packages
-          run-id: ${{ steps.ci-run.outputs.run_id }}
-          path: dist-packages/
+      - name: Typecheck
+        run: npm run typecheck
 
-      - name: Verify packaged artifacts match the tag
-        id: verify
+      # Build and pack in this same action: `npm run pack` bundles dist/,
+      # verifies `dist/cli.js workers`, and writes dist-packages/*.tgz +
+      # manifest.json. Only those packed artifacts go to the Release.
+      - name: Pack
+        run: npm run pack
+
+      - name: Verify tag matches version
+        id: version
         run: |
-          set -euo pipefail
-          manifest="dist-packages/manifest.json"
-          test -f "$manifest" || { echo "missing $manifest" >&2; exit 1; }
-          version="$(node -p "require('./$manifest').version")"
+          version="$(cat version | tr -d '\r\n')"
           expected="${GITHUB_REF_NAME#v}"
           if [ "$version" != "$expected" ]; then
-            echo "packaged version ($version) does not match tag ($GITHUB_REF_NAME)" >&2
+            echo "version file ($version) does not match tag ($GITHUB_REF_NAME)" >&2
             exit 1
           fi
-          tarball="dist-packages/$(node -p "require('./$manifest').fileName")"
-          test -f "$tarball" || { echo "missing $tarball" >&2; exit 1; }
-          actual="$(sha256sum "$tarball" | cut -d' ' -f1)"
-          [ "$actual" = "$(node -p "require('./$manifest').sha256")" ] || { echo "sha256 mismatch for $tarball" >&2; exit 1; }
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "value=$version" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: Peak ${{ steps.verify.outputs.version }}
+          name: Peak ${{ steps.version.outputs.value }}
           body_path: RELEASE.md
           files: |
             dist-packages/*.tgz

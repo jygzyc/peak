@@ -164,4 +164,4 @@ npm run smoke
 npm run pack
 ```
 
-Run `npm run pack` last: its `prepack` phase replaces modular `dist/` with the production esbuild bundle, copies the UI to `dist/ui/`, copies runtime prompts, verifies `dist/cli.js workers`, and writes the tarball plus manifest under `dist-packages/`. `dist-packages/` stays gitignored: the main-branch CI uploads it as a workflow artifact, and the tag-triggered GitHub Release downloads exactly that artifact (for the tagged commit's successful CI run) without rebuilding, after verifying that the tag, `manifest.json` version, and tarball sha256 all agree.
+Run `npm run pack` last: its `prepack` phase replaces modular `dist/` with the production esbuild bundle, copies the UI to `dist/ui/`, copies runtime prompts, verifies `dist/cli.js workers`, and writes the tarball plus manifest under `dist-packages/`. `dist-packages/` stays gitignored; the tag-triggered GitHub Release builds and packs in the same action and uploads only those packed artifacts, after verifying that the tag matches the `version` file.
