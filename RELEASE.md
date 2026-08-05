@@ -6,9 +6,9 @@ This file holds the release notes for the **current version only**; the tag-trig
 
 ---
 
-## 0.1.1 — 2026-08-05
+## 0.1.2 — 2026-08-05
 
-首次发布 / First release.
+首次发布 / First release.（替代已撤回的 0.1.1 / supersedes the withdrawn 0.1.1：npm 不允许复用已发布过的版本号；0.1.2 起 npm 包只含编译产物 / npm versions cannot be reused once published; since 0.1.2 the package contains only the compiled dist output.）
 
 ### 中文
 
