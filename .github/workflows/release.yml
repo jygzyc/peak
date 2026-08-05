@@ -14,30 +14,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Pack
-        run: npm run pack
-
-      - name: Read version
-        id: version
+      # Release consumes only the prebuilt artifacts committed under
+      # dist-packages/ (produced by `npm run pack` and verified by CI on
+      # main). Nothing is rebuilt on a tag: the tag, manifest, and tarball
+      # must all agree, otherwise the Release fails fast.
+      - name: Verify packaged artifacts match the tag
+        id: verify
         run: |
-          echo "value=$(cat version | tr -d '\r\n')" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          manifest="dist-packages/manifest.json"
+          test -f "$manifest" || { echo "missing $manifest; run 'npm run pack' and commit dist-packages/" >&2; exit 1; }
+          version="$(node -p "require('./$manifest').version")"
+          expected="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$expected" ]; then
+            echo "packaged version ($version) does not match tag ($GITHUB_REF_NAME)" >&2
+            exit 1
+          fi
+          tarball="dist-packages/$(node -p "require('./$manifest').fileName")"
+          test -f "$tarball" || { echo "missing $tarball" >&2; exit 1; }
+          actual="$(sha256sum "$tarball" | cut -d' ' -f1)"
+          [ "$actual" = "$(node -p "require('./$manifest').sha256")" ] || { echo "sha256 mismatch for $tarball" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: Peak ${{ steps.version.outputs.value }}
+          name: Peak ${{ steps.verify.outputs.version }}
           body_path: RELEASE.md
           files: |
             dist-packages/*.tgz
