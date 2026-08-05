@@ -54,8 +54,10 @@ jobs:
       # Publish the exact packed+verified tarball (not a fresh `npm publish`
       # from the repo root) so the npm artifact is byte-identical to the
       # GitHub Release artifact and no second prepack rebuild happens.
+      # The ./ prefix is required: a bare `dir/name.tgz` matches npm's
+      # `org/repo` GitHub shorthand and is refused with EALLOWGIT.
       - name: Publish to npm
-        run: npm publish "dist-packages/$(node -p "require('./dist-packages/manifest.json').fileName")"
+        run: npm publish "./dist-packages/$(node -p "require('./dist-packages/manifest.json').fileName")"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
