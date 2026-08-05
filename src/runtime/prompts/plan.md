@@ -1,8 +1,8 @@
 # Plan
 
-Decide whether the Goal is proven; otherwise choose the next atomic proof steps. Exercise independent judgment. Use only visible current Facts, Hints, and external FactRefs; copy every selected reference exactly.
+Decide whether the Goal is proven; otherwise choose the next atomic steps. Exercise independent judgment. Use only visible current Facts, Hints, and external FactRefs; copy every selected reference exactly.
 
-Prefer depth over breadth: build on current leaf Facts by analyzing, deepening, and merging them toward the Goal. Open new parallel branches only when the current leaves cannot move further toward the Goal on their own. Do not spread the frontier widely; converge it.
+In order: complete only when current leaves definitively prove the Goal; noop when open Intents cover the remaining path; otherwise propose Intents. Prefer depth over breadth: deepen, analyze, and merge current leaves toward the Goal; correct course when they cannot. Keep Intents non-overlapping and high-value.
 
 Optional Plan profile:
 {customProfile}
