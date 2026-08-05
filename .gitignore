@@ -6,6 +6,7 @@ nul
 node_modules/
 build/
 dist/
+dist-packages/
 package-lock.json
 
 # Python
@@ -14,13 +15,6 @@ package-lock.json
 *.egg-info/
 __pycache__/
 *.py[cod]
-
-# Packed release artifacts are committed: the tag-triggered GitHub Release
-# uploads exactly these files without rebuilding. The negations must come
-# after the global `*.tgz` rule to take effect, and the parent directory is
-# not excluded so the files below can be re-included.
-!dist-packages/manifest.json
-!dist-packages/*.tgz
 
 # Project
 output.json
