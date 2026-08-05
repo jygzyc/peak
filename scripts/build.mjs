@@ -37,6 +37,8 @@ function compile() {
 function copyAssets() {
   mkdirSync(join(dist, "ui"), { recursive: true });
   mkdirSync(join(dist, "runtime"), { recursive: true });
-  cpSync(join(root, "src", "ui", "dashboard.html"), join(dist, "ui", "dashboard.html"));
+  for (const name of ["dashboard.html", "preview.html"]) {
+    cpSync(join(root, "src", "ui", name), join(dist, "ui", name));
+  }
   cpSync(join(root, "src", "runtime", "prompts"), join(dist, "runtime", "prompts"), { recursive: true });
 }

@@ -20,4 +20,4 @@ npm run pack         # esbuild single-file bundle + npm pack + manifest
 
 - Version is read from the root `version` file (synced into `package.json` at pack time; drift is caught by `check-scripts`).
 - Release notes (bilingual): [`RELEASE.md`](../RELEASE.md).
-- CI (`.github/workflows/ci.yml`) runs typecheck/build/test/smoke/pack on Linux + Windows; tags `v*` trigger a GitHub Release with the packed tarball (`.github/workflows/release.yml`).
+- CI (`.github/workflows/ci.yml`) runs typecheck/build/test/smoke/pack on Linux + Windows; tags `v*` trigger the Release action (`.github/workflows/release.yml`), which packs, verifies the tag matches `version`, publishes the tarball to npm via Trusted Publishing (OIDC), and creates the GitHub Release.

@@ -86,7 +86,9 @@ try {
 
   if (mode !== "archive") await step("copy runtime assets", () => {
     mkdirSync(join(distDir, "ui"), { recursive: true });
-    copyFileSync(join(root, "src", "ui", "dashboard.html"), join(distDir, "ui", "dashboard.html"));
+    for (const name of ["dashboard.html", "preview.html"]) {
+      copyFileSync(join(root, "src", "ui", name), join(distDir, "ui", name));
+    }
     cpDirectory(join(root, "src", "runtime", "prompts"), join(distDir, "runtime", "prompts"));
   });
 

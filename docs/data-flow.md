@@ -22,7 +22,7 @@ interface ArtifactRef {
   sha256: string;
   mediaType: string;
   sizeBytes: number;
-  filename: string | null; // 可选内容化输出名；非空时完成阶段物化到 task.json 同目录
+  filename: string | null; // 可选内容化输出名；非空时完成阶段物化到 Project out/ 目录
 }
 
 interface Fact {
@@ -106,12 +106,14 @@ interface ProjectMeta {
 ├── analysis.db
 ├── artifacts/
 │   └── <sha256>
-└── logs/
-    ├── main.log
-    └── graph-<YYYYMMDDTHHMMSS.XXX>-<8-hex-execution-id>-<plan|supervise|execute|finalize>.json
+├── out/                  # 物化的最终 Goal 交付物（内容化文件名）；不入归档（可由 artifacts/ 重现）
+├── logs/
+│   ├── main.log
+│   └── graph-<YYYYMMDDTHHMMSS.XXX>-<8-hex-execution-id>-<plan|supervise|execute|finalize>.json
+└── .tmp/                 # 临时 runtime scratch（CLI session 缓存）；不入归档，Project 不再 active 后清理
 ```
 
-每个 UUID 目录都是独立 shard。Peak Home 另有后台进程控制文件 `server.pid`、`server.json` 和 `server.log`，供 `peak status/stop` 使用，不属于 Graph。Board 目录没有 workspace；完成时只把最终 Goal 交付物物化到那里。
+每个 UUID 目录都是独立 shard。Peak Home 另有后台进程控制文件 `server.pid`、`server.json` 和 `server.log`，供 `peak status/stop` 使用，不属于 Graph。Board 目录没有 workspace，也不接收交付物；最终 Goal 交付物只物化到 Project shard 的 `out/` 目录。
 
 ### 2.1 SQLite 表
 
@@ -141,7 +143,7 @@ CREATE TABLE intent_sources (
 
 Artifact body 以 SHA-256 为文件名保存到当前 Project 的 `artifacts/`，SQLite 只保存 hash、相对路径、media type、大小、可选内容化输出文件名和创建时间。
 
-Workers 不被分配 workspace、不写文件：需要文件的结果由 Execute 在合同中内联返回 `{filename, mediaType, content}`，Runtime 流式上传（POST `/api/projects/{id}/artifacts`，可选 `x-artifact-filename` 头）。上传流式计算 hash 并执行大小限制；可选高级配置 `phase.execute.maxArtifactBytes` 默认不写入 `task.json`，省略时限制为 10 MiB。`filename` 必须是基于内容的相对输出名（不超过 1 KiB，拒绝绝对路径、`\`、`.`/`..`/空段/隐藏段），绝不包含 i001/f001 等图节点编号；只有它非空时，完成阶段才把该 Artifact 物化到 `task.json` 同目录。
+Workers 不被分配 workspace、不写文件：需要文件的结果由 Execute 在合同中内联返回 `{filename, mediaType, content}`，Runtime 流式上传（POST `/api/projects/{id}/artifacts`，可选 `x-artifact-filename` 头）。上传流式计算 hash 并执行大小限制；可选高级配置 `phase.execute.maxArtifactBytes` 默认不写入 `task.json`，省略时限制为 10 MiB。`filename` 必须是基于内容的相对输出名（不超过 1 KiB，拒绝绝对路径、`\`、`.`/`..`/空段/隐藏段），绝不包含 i001/f001 等图节点编号；只有它非空时，完成阶段才把该 Artifact 物化到 Project shard 的 `out/` 目录。
 
 Server 启动时清理超过 24 小时安全窗口且没有 Fact 引用的 Artifact。下载前必须校验 64 位小写十六进制 hash、普通文件和非 symlink。
 
@@ -159,6 +161,7 @@ HTTP 方法具有标准语义，不限制为 POST。主要路由：
 
 ```text
 GET    /                                      Dashboard shell（不要求 Bearer Token）
+GET    /preview.html                          Artifact 预览页 shell（不要求 Bearer Token）
 GET    /api/projects
 POST   /api/projects
 GET    /api/projects/:id
@@ -409,7 +412,6 @@ CLI 参数指向包含 `task.json` 的 Board 目录。Board 只是 Project 集�
 ```text
 my-board/
 ├── task.json
-├── deliverable files...   # 完成时物化到 task.json 同目录的最终 Goal 交付物
 └── skills/                 # 仅在配置 Board-local Skill 时需要
     └── <name>/SKILL.md
 ```
@@ -545,11 +547,11 @@ flowchart LR
   F --> P["FederationBus.publish<br/>{projectId, factId, description}"]
 ```
 
-失败、malformed 或 timed-out 的 Execute 可通过 Finalize resume 同一 worker session 一次。Finalize 写自己的 Graph JSON 并返回相同 Fact 合同。完成时，带 `filename` 的 completion source Artifact 被物化到 `task.json` 同目录（最终 Goal 交付物）。
+失败、malformed 或 timed-out 的 Execute 可通过 Finalize resume 同一 worker session 一次。Finalize 写自己的 Graph JSON 并返回相同 Fact 合同。完成时，带 `filename` 的 completion source Artifact 被物化到 Project shard 的 `out/` 目录（最终 Goal 交付物）。
 
 ### 7.5 Artifact
 
-Execute 内联 `{filename, mediaType, content}` → `GraphClient` 流式上传 → Server 计算 SHA-256 并写入 `artifacts/<sha256>` 与元数据 → Fact 绑定 `artifact_sha256` → 完成时仅将带 filename 的 proof Artifact 物化到 `task.json` 同目录。Artifact 只承载可选的单文件详情；Fact description 始终必填且可独立理解。
+Execute 内联 `{filename, mediaType, content}` → `GraphClient` 流式上传 → Server 计算 SHA-256 并写入 `artifacts/<sha256>` 与元数据 → Fact 绑定 `artifact_sha256` → 完成时仅将带 filename 的 proof Artifact 物化到 Project shard 的 `out/` 目录。Artifact 只承载可选的单文件详情；Fact description 始终必填且可独立理解。
 
 ### 7.6 Federation
 
@@ -572,7 +574,7 @@ flowchart LR
   A["POST /complete"] --> B["校验 FactRef 三字段、源 Fact 与 scope"]
   B --> C["创建指向 goal 的 completion Intent"]
   C --> D["同一事务标记 Project completed"]
-  D --> E["物化最终交付物到 task.json 同目录<br/>+ 取消剩余内存执行"]
+  D --> E["物化最终交付物到 Project out/ 目录<br/>+ 取消剩余内存执行"]
 ```
 
 ```mermaid

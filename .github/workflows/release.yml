@@ -7,6 +7,9 @@ on:
 
 permissions:
   contents: write
+  # npm Trusted Publishing: the npm CLI exchanges this OIDC token for a
+  # short-lived publish credential; no NPM_TOKEN secret is stored.
+  id-token: write
 
 jobs:
   release:
@@ -17,6 +20,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          registry-url: https://registry.npmjs.org
 
       # package-lock.json is intentionally not tracked, so install from
       # package.json rather than `npm ci`.
@@ -28,7 +32,7 @@ jobs:
 
       # Build and pack in this same action: `npm run pack` bundles dist/,
       # verifies `dist/cli.js workers`, and writes dist-packages/*.tgz +
-      # manifest.json. Only those packed artifacts go to the Release.
+      # manifest.json. Only those packed artifacts go to npm and the Release.
       - name: Pack
         run: npm run pack
 
@@ -42,6 +46,16 @@ jobs:
             exit 1
           fi
           echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      # Trusted Publishing requires npm >= 11.5.1; Node 22 ships npm 10.
+      - name: Upgrade npm for Trusted Publishing
+        run: npm install -g npm@latest
+
+      # Publish the exact packed+verified tarball (not a fresh `npm publish`
+      # from the repo root) so the npm artifact is byte-identical to the
+      # GitHub Release artifact and no second prepack rebuild happens.
+      - name: Publish to npm
+        run: npm publish "dist-packages/$(node -p "require('./dist-packages/manifest.json').fileName")"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

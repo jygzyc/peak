@@ -70,7 +70,7 @@ peak import <archive>                导入 Peak home，供其他 Board 复用
 peak workers                         List supported Worker/task types
 ```
 
-后台输出写入 `<peak-home>/server.log`；本地进程元数据仅供 `status` 和 `stop` 使用。常用选项：`--host`（非 loopback 必须 `--token`）、`--port`（`0` = 临时端口）、`--token`、`--peak-home`、`--no-install-skills`。完成时 `run` 会为物化到 `task.json` 同目录的每个最终交付物打印 `[peak] deliverable: <path>`。
+后台输出写入 `<peak-home>/server.log`；本地进程元数据仅供 `status` 和 `stop` 使用。常用选项：`--host`（非 loopback 必须 `--token`）、`--port`（`0` = 临时端口）、`--token`、`--peak-home`、`--no-install-skills`。完成时 `run` 会为物化到 Project shard `out/` 目录（`~/.peak/projects/<uuid>/out/`）的每个最终交付物打印 `[peak] deliverable: <path>`。
 
 `export` 只接受 completed Project。归档包含 `manifest.json`（内含可直接加入 `board.projects` 的 JSON 区块）、`graph.json`、一致性的 `analysis.db` 快照和全部已注册的内容寻址 Artifact。`import` 会校验数据库、Graph JSON、Artifact 元数据/大小/SHA-256，以原 UUID 恢复且绝不覆盖已有 Project；随后把命令输出的 JSON 区块放入目标 Board 的 `task.json` 即可复用。
 

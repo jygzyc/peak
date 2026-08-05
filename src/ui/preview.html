@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>Peak Artifact Preview</title>
+<style>
+:root{--ink:#172033;--muted:#697386;--line:#dfe4ec;--bg:#f5f7fa;--blue:#4f46e5;--rose:#b4233b}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:var(--bg);color:var(--ink);font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.shell{min-height:100vh;display:grid;grid-template-rows:58px minmax(0,1fr)}header{display:flex;align-items:center;gap:12px;padding:0 18px;background:#fff;border-bottom:1px solid var(--line)}header strong{font-size:15px}.meta{min-width:0;color:var(--muted);font:11px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.spacer{flex:1}.btn{border:1px solid var(--line);border-radius:9px;background:#fff;padding:7px 10px;color:inherit;font:650 12px/1.4 inherit;text-decoration:none;cursor:pointer}.btn:hover{background:#f8fafc;border-color:#cbd3df}.btn.primary{color:#4338ca;border-color:#c7d2fe;background:#eef2ff}.stage{min-height:0;padding:18px;display:grid;place-items:center}.preview{width:100%;height:100%;min-height:calc(100vh - 94px);display:grid;place-items:center;border:1px solid var(--line);border-radius:14px;background:#fff;overflow:auto;box-shadow:0 8px 28px rgba(30,41,59,.07)}.preview img,.preview video{display:block;max-width:100%;max-height:calc(100vh - 96px)}.preview audio{width:min(720px,90%)}.preview iframe{width:100%;height:100%;min-height:calc(100vh - 94px);border:0}.preview pre{align-self:stretch;justify-self:stretch;margin:0;padding:20px;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}.message{text-align:center;padding:28px;color:var(--muted)}.message strong{display:block;margin-bottom:6px;color:var(--ink);font-size:16px}.message.error strong{color:var(--rose)}.auth{position:fixed;inset:0;display:grid;place-items:center;padding:20px;background:rgba(15,23,42,.3);backdrop-filter:blur(8px)}.auth.hidden{display:none}.auth form{width:min(390px,100%);padding:22px;background:#fff;border-radius:18px;box-shadow:0 24px 70px rgba(15,23,42,.24)}.auth h2{margin:0 0 5px}.auth p{margin:0 0 16px;color:var(--muted)}.auth input{width:100%;border:1px solid #d9dfe7;border-radius:9px;padding:9px 10px;font:inherit}.auth .btn{width:100%;margin-top:10px}
+</style>
+</head>
+<body>
+<div class="shell">
+  <header><strong>Artifact preview</strong><span id="meta" class="meta"></span><span class="spacer"></span><a class="btn" href="/">Graph</a><a id="download" class="btn primary" hidden>Download</a></header>
+  <main class="stage"><section id="preview" class="preview"><div class="message"><strong>Loading artifact…</strong></div></section></main>
+</div>
+<div id="auth" class="auth hidden"><form><h2>API token required</h2><p>Enter the bearer token configured for this Peak server.</p><input id="token" type="password" autocomplete="current-password" required placeholder="Bearer token"><button class="btn primary" type="submit">Open artifact</button></form></div>
+<script type="module">
+const params=new URLSearchParams(location.search),project=params.get('project')||'',sha256=params.get('artifact')||'',filename=params.get('filename')||sha256;
+const preview=document.querySelector('#preview'),meta=document.querySelector('#meta'),download=document.querySelector('#download'),auth=document.querySelector('#auth'),tokenInput=document.querySelector('#token');
+let token=sessionStorage.getItem('peak-token')||'',objectUrl='';
+meta.textContent=sha256?sha256:'Missing artifact';
+function message(title,detail='',error=false){preview.replaceChildren();const box=document.createElement('div');box.className=`message${error?' error':''}`;const strong=document.createElement('strong');strong.textContent=title;box.append(strong);if(detail)box.append(document.createTextNode(detail));preview.append(box)}
+function show(element){preview.replaceChildren(element)}
+function textual(type){return type.startsWith('text/')||type.includes('json')||type.includes('xml')||type.includes('javascript')||type.includes('yaml')||type.includes('toml')||type.includes('markdown')}
+async function load(){
+  if(!project||!sha256){message('Invalid preview link','Project and artifact identifiers are required.',true);return}
+  message('Loading artifact…');
+  const headers=token?{authorization:`Bearer ${token}`}:{},response=await fetch(`/api/projects/${encodeURIComponent(project)}/artifacts/${encodeURIComponent(sha256)}`,{headers});
+  if(response.status===401){auth.classList.remove('hidden');return}
+  if(!response.ok){let detail=await response.text();try{detail=JSON.parse(detail).error||detail}catch{}message('Unable to preview artifact',detail||`HTTP ${response.status}`,true);return}
+  const blob=await response.blob(),type=(response.headers.get('content-type')||blob.type||'application/octet-stream').split(';')[0].trim().toLowerCase();
+  if(objectUrl)URL.revokeObjectURL(objectUrl);objectUrl=URL.createObjectURL(blob);download.href=objectUrl;download.download=filename;download.hidden=false;meta.textContent=`${filename} · ${type} · ${blob.size.toLocaleString()} bytes`;
+  if(type.startsWith('image/')){const image=new Image();image.alt=filename;image.src=objectUrl;show(image);return}
+  if(type.startsWith('audio/')){const audio=document.createElement('audio');audio.controls=true;audio.src=objectUrl;show(audio);return}
+  if(type.startsWith('video/')){const video=document.createElement('video');video.controls=true;video.src=objectUrl;show(video);return}
+  if(type==='application/pdf'){const frame=document.createElement('iframe');frame.title=filename;frame.src=objectUrl;show(frame);return}
+  if(type==='text/html'||type==='application/xhtml+xml'){const frame=document.createElement('iframe');frame.title=filename;frame.setAttribute('sandbox','');const content=await blob.text();frame.srcdoc=`<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'">${content}`;show(frame);return}
+  if(textual(type)){let content=await blob.text();if(type.includes('json'))try{content=JSON.stringify(JSON.parse(content),null,2)}catch{}const pre=document.createElement('pre');pre.textContent=content;show(pre);return}
+  message('Preview is not available',`Use Download to open ${type} in a compatible application.`)
+}
+auth.querySelector('form').onsubmit=event=>{event.preventDefault();token=tokenInput.value.trim();sessionStorage.setItem('peak-token',token);auth.classList.add('hidden');load().catch(error=>message('Unable to preview artifact',error.message,true))};
+window.addEventListener('pagehide',()=>{if(objectUrl)URL.revokeObjectURL(objectUrl)});load().catch(error=>message('Unable to preview artifact',error.message,true));
+</script>
+</body>
+</html>

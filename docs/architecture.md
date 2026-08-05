@@ -62,7 +62,7 @@ flowchart TB
 3. 一个 Board 通过 `board.projects` 声明非空 Project 集合；Runtime 创建缺少 id 的 Project并将 UUID 回写 `task.json`，已有 id 则附加并复用其 Graph。
 4. `ProjectStoreRegistry` 为每个 UUID Project 打开独立的 SQLite 和 Artifact shard，不存在共享数据库或内存数据库。
 5. Worker 只接收 Prompt；Prompt 文本内含按阶段组装的只读 Graph JSON（不可变快照同时写入 `logs/graph-*.json`）。Worker 不获得 Graph/store 对象、SQLite 路径、Server URL、Token、HTTP 凭据或 `FederationBus`。
-6. Web UI 只是可替换的 HTTP 客户端。Server 从 `/` 提供内置页面仅是发布便利，Graph 正确性不依赖 UI。
+6. Web UI 只是可替换的 HTTP 客户端。Server 从 `/` 提供内置 Dashboard、从 `/preview.html` 提供 Artifact 预览页仅是发布便利（root handler 可处理任意非 `/api` 的 GET 路径），Graph 正确性不依赖 UI。
 7. 执行、取消、Worker 负载与冷却、Reservation、调度 checkpoint 和短期 Agent session 都只存在于内存中。
 
 ## 3. 模块职责
@@ -74,10 +74,10 @@ flowchart TB
 | `src/project/` | ProjectManager、ProjectLoop、Supervise 定时控制 |
 | `src/runtime/` | Runtime 组装、调度、执行注册表、阶段合同、Graph context、内置 Prompt |
 | `src/worker/` | 无状态 CLI 协议（Pi/OpenCode/Codex/Claude Code）、Worker 选择、ProcessRunner |
-| `src/ui/` | 可选的自包含 Dashboard 资源 |
+| `src/ui/` | 可选的自包含 Dashboard 与 Artifact 预览页资源 |
 | `src/cli.ts` | `run`、`resume`、`serve`、`stop`、`export`、`import`、`init`、`workers` 与进程/信号生命周期 |
 
-`sqlite-store.ts` 和 `artifact-store.ts` 是 Graph Server 私有实现，仅由 `graph/project-store-registry.ts` import；`graph/http-server.ts` 通过 `ProjectStoreRegistry` 间接访问 store，二者均不从 `index.ts` 导出。`graph/` 不得 import `ui/`；Runtime/CLI 组合层可向 `GraphHttpServer` 注入可选根路由。
+`sqlite-store.ts` 和 `artifact-store.ts` 是 Graph Server 私有实现，仅由 `graph/project-store-registry.ts` import；`graph/http-server.ts` 通过 `ProjectStoreRegistry` 间接访问 store，二者均不从 `index.ts` 导出。`graph/` 不得 import `ui/`；Runtime/CLI 组合层可向 `GraphHttpServer` 注入可选 root handler，由它决定响应哪些非 `/api` 的 GET 路径（内置实现只应答 `/` 与 `/preview.html`，其余返回 false 走 404）。
 
 ## 4. Graph 模型概念
 
@@ -114,7 +114,7 @@ Intent 的执行产出的长结果属于结果 Fact，Intent 本身不保存 wor
 
 完成是当前 Project 的本地、原子、即时操作。Server 校验所有 proof `FactRef` 存在、无重复、不引用 `goal`，且跨 Project 引用没有越过 Federation scope，随后在一个事务中：创建从这些 proof FactRef 指向当前 Project `goal` 的唯一完成 Intent，并将 Project 状态改为 `completed`。
 
-完成不等待其他 Project 完成，也不等待尚未消费的 Federation delivery。完成后调度器取消该 Project 的活动内存执行，但 Graph 仍可读取和导出。完成时，Runtime 把 completion source Fact 中带 `filename` 的 Artifact 内容物化到 `task.json` 同目录（即最终 Goal 交付物，文件名基于内容、不包含图节点编号），供用户直接使用。
+完成不等待其他 Project 完成，也不等待尚未消费的 Federation delivery。完成后调度器取消该 Project 的活动内存执行，但 Graph 仍可读取和导出。完成时，Runtime 把 completion source Fact 中带 `filename` 的 Artifact 内容物化到该 Project shard 的 `out/` 目录（`~/.peak/projects/<uuid>/out/`，即最终 Goal 交付物，文件名基于内容、不包含图节点编号），供用户直接使用。
 
 ### 4.5 Hint 不参与因果
 
@@ -276,7 +276,9 @@ Runtime shutdown 顺序保证：停止调度并取消全部 execution（`Process
 
 ## 10. 可选 Web UI
 
-Dashboard 是不依赖 CDN 的单文件 HTML/CSS/JavaScript 客户端，每 2.5 秒轮询 Project 列表和当前 Graph（页面隐藏时暂停自动刷新），通过相同的 `/api/*` 操作读写。本地 Fact 和跨 Project FactRef 超链接均渲染为可独立阅读的节点，FactRef 使用自身持久化的 description 并可由 projectId/factId 追溯源 Fact；Intent 渲染为有向边，Hint 渲染为独立节点；支持 Project 选择、stop/resume、显式 reopen、添加 Hint（creator 默认 `human:web` 且可编辑）、pan/wheel zoom/fit、JSON snapshot 和 completed Project 归档下载。Bearer Token 仅保存在 `sessionStorage`，Hint creator 偏好保存在 `localStorage`。
+Dashboard 是不依赖 CDN 的单文件 HTML/CSS/JavaScript 客户端，每 2.5 秒轮询 Project 列表和当前 Graph（页面隐藏时暂停自动刷新），通过相同的 `/api/*` 操作读写。本地 Fact 和跨 Project FactRef 超链接均渲染为可独立阅读的节点，FactRef 使用自身持久化的 description 并可由 projectId/factId 追溯源 Fact；Intent 渲染为有向边，Hint 渲染为独立节点；支持 Project 选择、stop/resume、显式 reopen、添加 Hint（creator 默认 `human:web` 且可编辑）、pan/wheel zoom/fit、JSON snapshot 和 completed Project 归档下载。Bearer Token 仅保存在 `sessionStorage`，Hint creator 偏好保存在 `localStorage`。轮询发现的新 Fact/Intent/Hint 节点和新 Intent 边以淡入加短暂高亮出现（首次渲染不播放），running 中的 Intent 边、标签和终点有脉冲动画；`prefers-reduced-motion` 下这些动画全部关闭。
+
+Fact/FactRef 详情面板在节点带 Artifact 时显示 `Preview artifact` 链接，指向 `/preview.html?project=<projectId>&artifact=<sha256>&filename=<name>`。预览页同样是无 CDN 依赖的自包含页面，通过 `GET /api/projects/{id}/artifacts/{sha256}` 读取内容（与 Dashboard 共用 `sessionStorage` 中的 Bearer Token，未授权时弹出输入框），按 media type 内联渲染图片、音频、视频、PDF 与文本/JSON，HTML Artifact 在无权限的 sandbox iframe 中以 CSP `default-src 'none'` 渲染，其余类型仅提供下载按钮。预览页与 Dashboard 一样不要求 Token 即可加载页面外壳。
 
 UI 不得直接读取文件系统、SQLite 或 Runtime 内存，也不得改变 Fact immutable、Hint、completion 和 reopen 语义。移除、替换或独立托管 Dashboard 都不改变 Graph 行为。
 
@@ -289,4 +291,4 @@ UI 不得直接读取文件系统、SQLite 或 Runtime 内存，也不得改变 
 - Graph operation 必须通过 Server 校验后才写日志；
 - Worker 不可信输出必须经过阶段合同解析和 Server 二次验证；
 - Board 不能覆盖内置 Prompt 合同，也不能注入 HTTP credential、Provider credential 或直接 store 路径；task 中的 phase-scoped custom Prompt 只能附加分析指令；
-- 所有 `/api/*` 请求在配置 Token 时必须带 `Authorization: Bearer <token>`；`/` 不要求 Token，使浏览器可以先加载 UI shell；绑定非 loopback host 时必须配置 Token。
+- 所有 `/api/*` 请求在配置 Token 时必须带 `Authorization: Bearer <token>`；`/` 与 `/preview.html` 不要求 Token，使浏览器可以先加载 UI shell；绑定非 loopback host 时必须配置 Token。

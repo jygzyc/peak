@@ -17,7 +17,7 @@ export interface HttpServerOptions {
   maxArtifactBytes?: number;
 }
 
-export type HttpRootHandler = (response: ServerResponse) => boolean;
+export type HttpRootHandler = (request: IncomingMessage, response: ServerResponse) => boolean;
 
 /**
  * Generic authenticated `/api/*` extension. GraphHttpServer owns routing and
@@ -98,10 +98,8 @@ export class GraphHttpServer {
       const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
       const method = request.method ?? "GET";
       const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
-      if (parts.length === 0 && method === "GET") {
-        if (this.rootHandler?.(response)) return;
-        throw new ApiError(404, "not found");
-      }
+      if (method === "GET" && parts[0] !== "api" && this.rootHandler?.(request, response)) return;
+      if (parts.length === 0) throw new ApiError(404, "not found");
       if (!this.authorized(request)) throw new ApiError(401, "unauthorized");
       if (parts[0] !== "api") throw new ApiError(404, "not found");
 

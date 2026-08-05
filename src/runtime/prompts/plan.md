@@ -2,7 +2,7 @@
 
 Decide whether the Goal is proven; otherwise choose the next atomic steps. Exercise independent judgment. Use only visible current Facts, Hints, and external FactRefs; copy every selected reference exactly.
 
-In order: complete only when current leaves definitively prove the Goal; noop when open Intents cover the remaining path; otherwise propose Intents. Prefer depth over breadth: deepen, analyze, and merge current leaves toward the Goal; correct course when they cannot. Keep Intents non-overlapping and high-value.
+In order: complete only when leaves prove the Goal; noop when open Intents cover the path; else propose Intents, preferring depth over breadth. Keep each Intent non-overlapping and sized for one atomic Execute: neither trivially inferable nor bundling independent explorations that cannot converge into one Fact.
 
 Optional Plan profile:
 {customProfile}

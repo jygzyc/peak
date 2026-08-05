@@ -48,7 +48,7 @@ Do not recreate top-level `agent/`, `app/`, `server/`, `client/`, `session/`, or
 ```text
 src/config/   Strict Board schema/defaults, configured path initialization, Board scaffolding, and Skill installation
 src/graph/    Graph types/API/client/server, private stores, federation, and exports
-src/ui/       Optional bundled dashboard presentation layer
+src/ui/       Optional bundled dashboard and artifact-preview presentation layer
 src/project/  ProjectManager, ProjectLoop, and GraphSupervisor timing
 src/runtime/  Runtime composition, scheduler, execution registry, runtime status, contracts, contexts, prompts
 src/worker/   Stateless CLI protocols (Pi/OpenCode/Codex/Claude Code), Worker selection, ProcessRunner
@@ -86,10 +86,10 @@ Use `fileURLToPath()` for module URL paths. Validate UUIDs, hashes, Artifact siz
 
 - Graph behavior and persistence depend on the HTTP Server only; no Graph operation requires the Web UI.
 - The UI reads and writes exclusively through the public HTTP API and may be omitted, replaced, or hosted separately.
-- As a packaging convenience, Runtime/CLI inject the isolated `src/ui/` root handler so `GET /` serves `src/ui/dashboard.html`. A bare `GraphHttpServer` has no UI route. The HTML shell is intentionally reachable without bearer authentication so the browser can request a token.
+- As a packaging convenience, Runtime/CLI inject the isolated `src/ui/` root handler, which may answer any non-`/api` GET path: the bundled implementation serves `src/ui/dashboard.html` at `/` and `src/ui/preview.html` (the Artifact preview page) at `/preview.html`. A bare `GraphHttpServer` has no UI route. The HTML shells are intentionally reachable without bearer authentication so the browser can request a token.
 - All `/api/*` routes require `Authorization: Bearer <token>` when `--token` is configured.
 - Binding a non-loopback host requires a token.
-- The dashboard is a self-contained HTML/CSS/JavaScript asset with no CDN dependency.
+- The dashboard and the artifact preview page are self-contained HTML/CSS/JavaScript assets with no CDN dependency. The preview page reads one Artifact through `GET /api/projects/{id}/artifacts/{sha256}` and shares the dashboard's `sessionStorage` token.
 - It polls Project state, renders Facts as nodes, Intents as directed edges, and Hints as independent nodes. Intent UI state is one of `open`, `running`, or `concluded`: an open Intent with a matching in-flight Execute shows `running`; otherwise it shows `open` until its target Fact exists, then `concluded`. The runtime heartbeat drives a page-level `runtime online` / `runtime offline` badge; when the heartbeat is stale the execution overlay is cleared and unconcluded Intents fall back to `open`.
 - In addition to the Graph API, the Dashboard polls two read-only Runtime endpoints: `GET /api/runtime/status` (`runtimeId`, `startedAt`, `heartbeatAt`, `sequence`, `schedulerRunning`, `heartbeatWindowMs`) and `GET /api/runtime/projects/{id}/executions` (immutable in-flight execution snapshots with `executionId`, `projectId`, `kind`, `intentId`, `workerName`, `processId`, `startedAt`, `deadlineAt`). Graph snapshot export never includes the Runtime overlay.
 - `GraphHttpServer` exposes a generic authenticated `apiExtensions` hook; Runtime/CLI inject the two Runtime extensions at the composition root. `graph/` depends only on the `ApiExtension` type, never on runtime modules.
@@ -164,4 +164,4 @@ npm run smoke
 npm run pack
 ```
 
-Run `npm run pack` last: its `prepack` phase replaces modular `dist/` with the production esbuild bundle, copies the UI to `dist/ui/`, copies runtime prompts, verifies `dist/cli.js workers`, and writes the tarball plus manifest under `dist-packages/`. `dist-packages/` stays gitignored; the tag-triggered GitHub Release builds and packs in the same action and uploads only those packed artifacts, after verifying that the tag matches the `version` file.
+Run `npm run pack` last: its `prepack` phase replaces modular `dist/` with the production esbuild bundle, copies the UI to `dist/ui/`, copies runtime prompts, verifies `dist/cli.js workers`, and writes the tarball plus manifest under `dist-packages/`. `dist-packages/` stays gitignored; the tag-triggered Release action builds and packs in the same action, verifies the tag matches the `version` file, publishes that exact tarball to npm via Trusted Publishing (OIDC, `id-token: write`, no `NPM_TOKEN`; requires npm >= 11.5.1 so the action upgrades npm first), and uploads only those packed artifacts to the GitHub Release.

@@ -11,7 +11,7 @@ Peak 是 HTTP 原生的分布式图（Graph）Agent 运行时。每个 **Project
 - **Board** —— 包含 `task.json` 的目录：Project 集合与共享运行配置。它自身没有 Goal、Graph 或完成状态。
 - **Project** —— 一张持久化 Graph（`origin` 与 `goal` 两个保留 Fact，加上由 Facts/Intents/Hints 组成的证明 DAG）。Fact 不可变；Plan AI 自主判断证明 DAG 应如何分支、深化、合并或完成。
 - **Plan / Supervise / Execute / Finalize** —— 固定运行单元。Plan 决定下一步 Intent（或完成）；Supervise 审计并可每轮提交一个 Hint；Execute 执行一个原子 Intent 并产出恰好一个 Fact；Finalize 对失败的 Execute 恢复一次。
-- **Artifact** —— Worker 不写文件、不分配 workspace。当 Fact 需要详细证据时，Execute 在合同内联返回文件内容；Runtime 将其作为内容寻址 Artifact 存储。完成时，交付类 Artifact 会物化到 `task.json` 同目录。
+- **Artifact** —— Worker 不写文件、不分配 workspace。当 Fact 需要详细证据时，Execute 在合同内联返回文件内容；Runtime 将其作为内容寻址 Artifact 存储。完成时，交付类 Artifact 会物化到 Project shard 的 `out/` 目录。
 - **Federation** —— 同 scope 的已注册 Project 交换当前叶 `FactRef`；目标只持久化超链接节点，绝不复制源 Fact 实体或 Artifact。
 
 ## 快速开始

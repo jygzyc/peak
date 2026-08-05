@@ -22,7 +22,14 @@ test("the optional UI composes without becoming a Graph Server dependency", asyn
     const html = await response.text();
     assert.match(html, /id="hint-form"/);
     assert.match(html, /Custom profile/);
+    assert.match(html, /\/preview\.html/);
+    assert.match(html, /peak-node-enter/);
+    assert.match(html, /peak-run-pulse/);
     assert.doesNotMatch(html, /kind-filter|Prompt kind/);
+    const preview = await fetch(`${server.baseUrl}/preview.html`);
+    assert.equal(preview.status, 200);
+    assert.match(await preview.text(), /id="preview"/);
+    assert.equal((await fetch(`${server.baseUrl}/missing.html`)).status, 404);
   } finally {
     await server.stop();
     registry.close();

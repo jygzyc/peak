@@ -70,7 +70,7 @@ peak import <archive>                Import it into Peak home for another Board
 peak workers                         List supported Worker/task types
 ```
 
-Background output is written to `<peak-home>/server.log`; local process metadata is used only by `status` and `stop`. Common options: `--host` (non-loopback requires `--token`), `--port` (`0` = ephemeral), `--token`, `--peak-home`, `--no-install-skills`. On completion, `run` prints `[peak] deliverable: <path>` for each final Goal deliverable materialized next to `task.json`.
+Background output is written to `<peak-home>/server.log`; local process metadata is used only by `status` and `stop`. Common options: `--host` (non-loopback requires `--token`), `--port` (`0` = ephemeral), `--token`, `--peak-home`, `--no-install-skills`. On completion, `run` prints `[peak] deliverable: <path>` for each final Goal deliverable materialized under the Project shard's `out/` directory (`~/.peak/projects/<uuid>/out/`).
 
 `export` accepts only completed Projects and creates a portable archive containing `manifest.json` (including a ready-to-paste `board.projects` JSON block), `graph.json`, a consistent `analysis.db` snapshot, and every registered content-addressed Artifact. `import` verifies the database, Graph JSON, Artifact metadata/size/SHA-256, and restores the same UUID without overwriting an existing Project; use the printed JSON block in the destination Board's `task.json`.
 

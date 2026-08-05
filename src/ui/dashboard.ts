@@ -1,15 +1,18 @@
 import { existsSync, readFileSync } from "node:fs";
-import type { ServerResponse } from "node:http";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 
 /** Serve the optional bundled UI without granting it direct Graph access. */
-export function serveDashboard(response: ServerResponse): boolean {
+export function serveDashboard(request: IncomingMessage, response: ServerResponse): boolean {
+  const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
+  const filename = pathname === "/" ? "dashboard.html" : pathname === "/preview.html" ? "preview.html" : undefined;
+  if (!filename) return false;
   const candidates = [
-    join(MODULE_DIR, "dashboard.html"),
-    join(MODULE_DIR, "ui", "dashboard.html"),
+    join(MODULE_DIR, filename),
+    join(MODULE_DIR, "ui", filename),
   ];
   const path = candidates.find(existsSync);
   if (!path) return false;

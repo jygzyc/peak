@@ -11,7 +11,7 @@ Runtime requirements: Node.js `>=22.19.0` (ESM).
 - **Board** — a directory with `task.json`: a Project collection and shared run configuration. It has no Goal, Graph, or completion state of its own.
 - **Project** — one persisted Graph (`origin` and `goal` Facts plus the proof DAG of Facts/Intents/Hints). Facts are immutable; Plan AI independently decides how the proof DAG should branch, deepen, merge, or complete.
 - **Plan / Supervise / Execute / Finalize** — the fixed runtime units. Plan decides next Intents (or completion); Supervise audits and may add one Hint per round; Execute performs one atomic Intent and returns exactly one Fact; Finalize resumes a failed Execute once.
-- **Artifacts** — Workers never write files and are never allocated a workspace. When a Fact needs detailed evidence, Execute returns the file content inline; the Runtime stores it as a content-addressed Artifact. On completion, deliverable Artifacts are materialized next to `task.json`.
+- **Artifacts** — Workers never write files and are never allocated a workspace. When a Fact needs detailed evidence, Execute returns the file content inline; the Runtime stores it as a content-addressed Artifact. On completion, deliverable Artifacts are materialized under the Project shard's `out/` directory.
 - **Federation** — registered Projects in the same scope exchange current leaf `FactRef`s; targets persist only the hyperlink node, never the source Fact entity or Artifact.
 
 ## Quick start
