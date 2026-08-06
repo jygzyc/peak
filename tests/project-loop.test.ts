@@ -78,7 +78,7 @@ function config(): ResolvedTaskConfig {
     board: { skills: [], projects: [{ source: "start", goal: "done" }] },
     workers: { solo: { type: "pi", taskTypes: ["plan", "supervise", "execute"], maxRunning: 1, priority: 1, env: {} } },
     scheduler: { maxRunningProjects: 4, intervalMs: 60_000 },
-    phase: { plan: {}, supervise: { intervalMs: 0 }, execute: { maxArtifactBytes: 1024, customProfiles: [] } },
+    phase: { plan: {}, supervise: { intervalMs: 0 }, execute: { maxArtifactBytes: 1024, customProfile: [] } },
   };
 }
 

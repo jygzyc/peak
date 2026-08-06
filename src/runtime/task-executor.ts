@@ -40,7 +40,8 @@ interface PlanGraphView extends GraphViewBudget {
   source: Fact;
   goal: Fact;
   leafFacts: Fact[];
-  openIntents: Intent[];
+  /** Digest is internal integrity metadata and is never shown to the Plan AI. */
+  openIntents: Array<Omit<Intent, "customProfileDigest">>;
   unconsumedHints: Hint[];
   pendingFactRefs: FactRef[];
 }
@@ -112,12 +113,16 @@ export class TaskExecutor {
           source,
           goal,
           leafFacts: facts,
-          openIntents: project.intents.filter((intent) => intent.to === null),
+          openIntents: project.intents.filter((intent) => intent.to === null)
+            .map(({ customProfileDigest: _, ...intent }) => intent),
           unconsumedHints: project.hints.filter((hint) => hint.consumedByIntentId === null),
           pendingFactRefs: pending,
         }, ["leafFacts", "openIntents", "unconsumedHints", "pendingFactRefs"]);
         const planProfile = profileValue(this.config.phase.plan.customProfile);
-        const executeProfiles = this.config.phase.execute.customProfiles.map(profileValueRequired);
+        // Inject raw {description,prompt} definitions only: the digest is
+        // internal integrity metadata, and showing it to the Plan AI invites
+        // it to select the digest instead of the description.
+        const executeProfiles = this.config.phase.execute.customProfile;
         const capacity = executeCapacity(this.config);
         const rendered = renderPrompt("plan", {
           customProfile: json(planProfile), skills: json(this.config.board.skills),
@@ -152,13 +157,11 @@ export class TaskExecutor {
             for (const intent of output.intents) {
               validateVisible(intent.from, visible);
               validateHints(intent.hintIds, unconsumedHints);
-              const selected = intent.customProfile === null ? undefined
-                : this.config.phase.execute.customProfiles.find((profile) => profile.description === intent.customProfile);
-              if (intent.customProfile !== null && !selected) throw new Error(`unknown customProfile: ${intent.customProfile}`);
+              const selected = intent.customProfile === null ? null : this.executeProfile(intent.customProfile);
               await this.graph.createIntent(projectId, {
                 from: intent.from, hintIds: intent.hintIds, description: intent.description,
                 customProfile: selected?.description ?? null,
-                customProfileDigest: selected ? customProfileDigest(selected) : null,
+                customProfileDigest: selected?.digest ?? null,
                 createdBy: `plan:${executionId}`,
               });
             }
@@ -275,16 +278,20 @@ export class TaskExecutor {
     return parseExecute(result.text);
   }
 
+  private executeProfile(description: string): ProfileValue {
+    const definition = this.config.phase.execute.customProfile.find((profile) => profile.description === description);
+    if (!definition) throw new Error(`unknown customProfile: ${description}`);
+    return profileValue(definition);
+  }
+
   private resolveExecuteProfile(intent: Intent): ProfileValue | null {
     if (intent.customProfile === null || intent.customProfileDigest === null) {
       if (intent.customProfile !== null || intent.customProfileDigest !== null) throw new Error("Intent custom profile is incomplete");
       return null;
     }
-    const definition = this.config.phase.execute.customProfiles.find((profile) => profile.description === intent.customProfile);
-    if (!definition) throw new Error(`Intent references unconfigured customProfile: ${intent.customProfile}`);
-    const digest = customProfileDigest(definition);
-    if (digest !== intent.customProfileDigest) throw new Error(`Intent customProfile digest mismatch: ${intent.customProfile}`);
-    return { ...definition, digest };
+    const profile = this.executeProfile(intent.customProfile);
+    if (profile.digest !== intent.customProfileDigest) throw new Error(`Intent customProfile digest mismatch: ${intent.customProfile}`);
+    return profile;
   }
 
   private snapshot(
@@ -410,11 +417,10 @@ async function verifySources(sources: ResolvedFactSource[]): Promise<void> {
   }
 }
 
+function profileValue(profile: CustomProfileDefinition): ProfileValue;
+function profileValue(profile: CustomProfileDefinition | undefined): ProfileValue | null;
 function profileValue(profile: CustomProfileDefinition | undefined): ProfileValue | null {
-  return profile ? profileValueRequired(profile) : null;
-}
-function profileValueRequired(profile: CustomProfileDefinition): ProfileValue {
-  return { ...profile, digest: customProfileDigest(profile) };
+  return profile ? { ...profile, digest: customProfileDigest(profile) } : null;
 }
 export function budgetGraphView<T extends Record<string, unknown>>(
   view: T,

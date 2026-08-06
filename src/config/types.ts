@@ -44,7 +44,7 @@ export interface ResolvedTaskConfig {
   phase: {
     plan: { customProfile?: CustomProfileDefinition };
     supervise: { intervalMs: number; customProfile?: CustomProfileDefinition };
-    execute: { maxArtifactBytes: number; customProfiles: CustomProfileDefinition[] };
+    execute: { maxArtifactBytes: number; customProfile: CustomProfileDefinition[] };
   };
 }
 

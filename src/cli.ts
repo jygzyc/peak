@@ -14,6 +14,7 @@ import { GraphHttpServer } from "./graph/http-server.js";
 import { ProjectStoreRegistry } from "./graph/project-store-registry.js";
 import { AgentRuntime } from "./runtime/agent-runtime.js";
 import { serveDashboard } from "./ui/dashboard.js";
+import { TASK_TYPES, WORKER_TYPES } from "./worker/registry.js";
 
 /** 版本号以代码根目录的 version 文件为准（打包时随 dist 一起发布）。 */
 function packageVersion(): string {
@@ -52,7 +53,7 @@ const program = new Command()
 
 program.command("run")
   .description("Create or attach Board Projects and start Plan / Supervise / Execute in the background")
-  .argument("[board-directory]", "Board directory containing task.json", ".")
+  .argument("[board-directory]", "Board directory containing task.json (or the task.json file itself)", ".")
   .option("--project <source>", "Run only the configured Project with this source; default runs the full Board")
   .option("--host <host>", "HTTP host (non-loopback requires --token)", "127.0.0.1")
   .option("--port <port>", "HTTP port (0 = ephemeral)", "0")
@@ -67,7 +68,7 @@ program.command("run")
 program.command("resume")
   .description("Attach one persisted Project by UUID and start it in the background")
   .argument("<project-id>", "UUID of the persisted Project to attach")
-  .argument("[board-directory]", "Board directory containing task.json", ".")
+  .argument("[board-directory]", "Board directory containing task.json (or the task.json file itself)", ".")
   .option("--project <source>", "Configured Project source when matching is ambiguous")
   .option("--host <host>", "HTTP host (non-loopback requires --token)", "127.0.0.1")
   .option("--port <port>", "HTTP port (0 = ephemeral)", "0")
@@ -125,7 +126,7 @@ program.command("init")
 program.command("workers")
   .description("List supported Worker and task types")
   .action(() => {
-    process.stdout.write(`${JSON.stringify({ workerTypes: ["opencode", "codex", "pi", "claude-code"], taskTypes: ["plan", "supervise", "execute"] }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify({ workerTypes: WORKER_TYPES, taskTypes: TASK_TYPES }, null, 2)}\n`);
   });
 
 await program.parseAsync();

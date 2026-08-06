@@ -42,7 +42,7 @@ node examples/ai_agent_zh/run.mjs    # 无需参数
   ],
   "phase": {
     "supervise": { "intervalMs": 90000 },
-    "execute": { "customProfiles": [] }
+    "execute": { "customProfile": [] }
   }
 }
 ```

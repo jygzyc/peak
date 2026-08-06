@@ -1,6 +1,7 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { WORKER_REGISTRY } from "../worker/registry.js";
 import type { SkillInstallOptions, WorkerType } from "./types.js";
 
 export interface PeakPaths {
@@ -77,10 +78,13 @@ export function projectOutDir(projectDir: string): string {
   return join(resolve(projectDir), PROJECT_OUT_DIR);
 }
 
-export function resolveTaskConfigPaths(directory = "."): TaskConfigPaths {
-  const taskDir = resolve(directory);
-  const configPath = join(taskDir, "task.json");
-  return Object.freeze({ configPath, taskDir });
+/** Accepts a Board directory or a direct path to its task.json file. */
+export function resolveTaskConfigPaths(path = "."): TaskConfigPaths {
+  const resolved = resolve(path);
+  if (statSync(resolved, { throwIfNoEntry: false })?.isFile()) {
+    return Object.freeze({ configPath: resolved, taskDir: dirname(resolved) });
+  }
+  return Object.freeze({ configPath: join(resolved, "task.json"), taskDir: resolved });
 }
 
 export function resolveTaskSkillSource(taskDir: string, name: string): string {
@@ -99,8 +103,10 @@ export function resolveSkillInstallRoots(
   options: SkillInstallOptions = {},
 ): string[] {
   const paths = resolveSkillDirectories(options);
+  const directories = { agents: paths.agentsDir, claude: paths.claudeDir };
   const roots = new Set<string>();
-  if (types.includes("opencode") || types.includes("pi")) roots.add(paths.agentsDir);
-  if (types.includes("claude-code")) roots.add(paths.claudeDir);
+  for (const type of new Set(types)) {
+    for (const directory of WORKER_REGISTRY[type]?.skillDirectories ?? []) roots.add(directories[directory]);
+  }
   return [...roots];
 }

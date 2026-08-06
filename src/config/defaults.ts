@@ -8,5 +8,5 @@ export const DEFAULT_SCHEDULER: SchedulerConfig = {
 export const DEFAULT_PHASE: ResolvedTaskConfig["phase"] = {
   plan: {},
   supervise: { intervalMs: 60_000 },
-  execute: { maxArtifactBytes: 10 * 1024 * 1024, customProfiles: [] },
+  execute: { maxArtifactBytes: 10 * 1024 * 1024, customProfile: [] },
 };

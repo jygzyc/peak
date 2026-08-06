@@ -127,7 +127,7 @@ test("config is strict and initializes Board skills", () => {
       phase: {
         plan: { customProfile: { description: "Use for security planning.", prompt: "Plan every proof edge." } },
         supervise: { customProfile: { description: "Use for proof review.", prompt: "Check every proof edge." } },
-        execute: { maxArtifactBytes: 2_048, customProfiles: [{ description: "Use for primary research.", prompt: "Collect primary evidence." }] },
+        execute: { maxArtifactBytes: 2_048, customProfile: [{ description: "Use for primary research.", prompt: "Collect primary evidence." }] },
       },
     };
     writeFileSync(join(promptsDir, "task.json"), JSON.stringify(promptTask));
@@ -139,7 +139,7 @@ test("config is strict and initializes Board skills", () => {
       intervalMs: 60_000,
       customProfile: { description: "Use for proof review.", prompt: "Check every proof edge." },
     });
-    assert.deepEqual(promptConfig.phase.execute.customProfiles, [
+    assert.deepEqual(promptConfig.phase.execute.customProfile, [
       { description: "Use for primary research.", prompt: "Collect primary evidence." },
     ]);
     assert.equal(promptConfig.phase.execute.maxArtifactBytes, 2_048);

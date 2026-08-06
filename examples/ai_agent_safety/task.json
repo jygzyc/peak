@@ -46,7 +46,7 @@
       }
     },
     "execute": {
-      "customProfiles": [
+      "customProfile": [
         {
           "description": "Use when assessing one AI safety research paper, official standard, or regulator publication.",
           "prompt": "Verify the exact title, issuing organization, version or publication date, and canonical URL. Extract only claims directly supported by the document, distinguish normative requirements from recommendations, record material limitations, and state one concrete engineering or governance implication. Do not substitute summaries, reposts, or marketing pages for the primary document."

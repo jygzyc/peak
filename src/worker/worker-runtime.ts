@@ -1,17 +1,7 @@
 import type { ResolvedTaskConfig, TaskType, WorkerType } from "../config/types.js";
 import { ProcessRunner } from "./process-runner.js";
-import { claudeCodeProtocol } from "./backends/claude-code.js";
-import { codexProtocol } from "./backends/codex.js";
-import { opencodeProtocol } from "./backends/opencode.js";
-import { piProtocol } from "./backends/pi.js";
+import { WORKER_PROTOCOLS } from "./registry.js";
 import type { SessionRef, WorkerCall, WorkerProtocol, WorkerResult } from "./types.js";
-
-const DEFAULT_PROTOCOLS: Record<WorkerType, WorkerProtocol> = {
-  opencode: opencodeProtocol,
-  codex: codexProtocol,
-  pi: piProtocol,
-  "claude-code": claudeCodeProtocol,
-};
 
 /**
  * WorkerRuntime owns Worker selection, Execute reservations, the per-Worker
@@ -33,7 +23,7 @@ export class WorkerRuntime {
   constructor(
     readonly config: ResolvedTaskConfig,
     private readonly runner = new ProcessRunner(),
-    private readonly protocols: Record<WorkerType, WorkerProtocol> = DEFAULT_PROTOCOLS,
+    private readonly protocols: Record<WorkerType, WorkerProtocol> = WORKER_PROTOCOLS,
   ) {}
 
   pick(taskType: TaskType): string | undefined {

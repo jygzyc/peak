@@ -53,7 +53,7 @@
       }
     },
     "execute": {
-      "customProfiles": [
+      "customProfile": [
         {
           "description": "收集目标应用的攻击面并按功能实现建立风险映射",
           "prompt": "按已安装的 decx-vulnhunt Skill 选定目标轨道并收集攻击面:导出组件、deep link、动态注册接收器、WebView、Provider、Service 等。按功能实现组织输出:每个功能给出实际读到的组件与代码位置、该实现对应的可能风险(匹配的候选漏洞模式),以及当前已发现漏洞的指向;不做深入跟踪,不臆测未读到的代码。"

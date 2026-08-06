@@ -2,10 +2,8 @@ import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { DEFAULT_PHASE, DEFAULT_SCHEDULER } from "./defaults.js";
 import { resolveTaskConfigPaths } from "./paths.js";
-import type { CustomProfileDefinition, ProjectConfig, ResolvedTaskConfig, TaskType, WorkerConfig, WorkerType } from "./types.js";
-
-const WORKER_TYPES: WorkerType[] = ["opencode", "codex", "pi", "claude-code"];
-const TASK_TYPES: TaskType[] = ["plan", "supervise", "execute"];
+import { TASK_TYPES, WORKER_TYPES } from "../worker/registry.js";
+import type { CustomProfileDefinition, ProjectConfig, ResolvedTaskConfig, WorkerConfig } from "./types.js";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_PROFILE_DESCRIPTION_BYTES = 1024;
 const MAX_CUSTOM_PROMPT_BYTES = 8 * 1024;
@@ -122,7 +120,7 @@ function parsePhase(value: unknown): ResolvedTaskConfig["phase"] {
   keys(input, ["plan", "supervise", "execute"], "phase");
   const plan = section(input.plan, "phase.plan", ["customProfile"]);
   const supervise = section(input.supervise, "phase.supervise", ["intervalMs", "customProfile"]);
-  const execute = section(input.execute, "phase.execute", ["maxArtifactBytes", "customProfiles"]);
+  const execute = section(input.execute, "phase.execute", ["maxArtifactBytes", "customProfile"]);
   return {
     plan: {
       ...optionalCustomProfile(plan.customProfile, "phase.plan.customProfile"),
@@ -133,7 +131,7 @@ function parsePhase(value: unknown): ResolvedTaskConfig["phase"] {
     },
     execute: {
       maxArtifactBytes: integer(execute.maxArtifactBytes, "phase.execute.maxArtifactBytes") ?? DEFAULT_PHASE.execute.maxArtifactBytes,
-      customProfiles: customProfiles(execute.customProfiles, "phase.execute.customProfiles"),
+      customProfile: customProfileList(execute.customProfile, "phase.execute.customProfile"),
     },
   };
 }
@@ -204,7 +202,7 @@ function customProfile(value: unknown, label: string): CustomProfileDefinition {
   return { description, prompt };
 }
 
-function customProfiles(value: unknown, label: string): CustomProfileDefinition[] {
+function customProfileList(value: unknown, label: string): CustomProfileDefinition[] {
   if (value === undefined) return [];
   const items = array(value, label);
   const seen = new Set<string>();

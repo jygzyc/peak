@@ -42,7 +42,7 @@ Creates `.peak_test/` in the current directory as an isolated test root, copies 
   ],
   "phase": {
     "supervise": { "intervalMs": 90000 },
-    "execute": { "customProfiles": [] }
+    "execute": { "customProfile": [] }
   }
 }
 ```

@@ -17,7 +17,7 @@ function configuration(root: string): ResolvedTaskConfig {
       executor: { type: "claude-code", taskTypes: ["execute"], maxRunning: 1, priority: 1, env: {} },
     },
     scheduler: { maxRunningProjects: 1, intervalMs: 3_000 },
-    phase: { plan: {}, supervise: { intervalMs: 60_000 }, execute: { maxArtifactBytes: 1024, customProfiles: [] } },
+    phase: { plan: {}, supervise: { intervalMs: 60_000 }, execute: { maxArtifactBytes: 1024, customProfile: [] } },
   };
 }
 

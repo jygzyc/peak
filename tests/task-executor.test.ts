@@ -213,7 +213,7 @@ test("Plan retains independent judgment when no Skill is configured", async () =
     const config = configuration(root);
     config.board.skills = [];
     config.phase.plan.customProfile = undefined;
-    config.phase.execute.customProfiles = [];
+    config.phase.execute.customProfile = [];
     const workers = new FakeWorkers();
     workers.outputs.plan.push('{"kind":"noop"}');
     const executor = new TaskExecutor(
@@ -571,7 +571,7 @@ function configuration(root: string): ResolvedTaskConfig {
       },
       execute: {
         maxArtifactBytes: 1024,
-        customProfiles: [{ description: "Use for primary research.", prompt: "Collect primary evidence only" }],
+        customProfile: [{ description: "Use for primary research.", prompt: "Collect primary evidence only" }],
       },
     },
   };

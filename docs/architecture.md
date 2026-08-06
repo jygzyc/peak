@@ -134,7 +134,7 @@ flowchart LR
   end
 ```
 
-内置英文 Prompt 位于 `src/runtime/prompts/`，只提供上下文、不可变边界和严格合同，把执行选择与判断交给 AI；Board 不能覆盖其阶段合同和安全边界。`task.json` 可为 Plan、Supervise 各配置一个可选 `customProfile`，并为 Execute 配置多个可选 `customProfiles`。每项都是 `{description,prompt}`：description 向 AI 解释何时应该注入该 prompt；定制内容只作为阶段附加指令。Plan 选中的 Execute profile 只在 Intent 上持久化 description 和 `SHA-256(description + "#" + prompt)` 的前 16 位十六进制签名；Fact、Hint、FactRef 不保存 profile。
+内置英文 Prompt 位于 `src/runtime/prompts/`，只提供上下文、不可变边界和严格合同，把执行选择与判断交给 AI；Board 不能覆盖其阶段合同和安全边界。`task.json` 可为 Plan、Supervise 各配置一个可选 `customProfile`，并为 Execute 配置可多选的 `customProfile` 数组。每项都是 `{description,prompt}`：description 向 AI 解释何时应该注入该 prompt；定制内容只作为阶段附加指令。Plan 选中的 Execute profile 只在 Intent 上持久化 description 和 `SHA-256(description + "#" + prompt)` 的前 16 位十六进制签名；Fact、Hint、FactRef 不保存 profile。
 
 ### 5.1 Plan
 

@@ -469,7 +469,7 @@ my-board/
       }
     },
     "execute": {
-      "customProfiles": [
+      "customProfile": [
         { "description": "Use for primary-source research.", "prompt": "Collect primary evidence." },
         { "description": "Use for independent verification.", "prompt": "Independently verify selected claims." }
       ]
@@ -485,7 +485,7 @@ my-board/
 - 非空 `id` 必须是 UUID，同一 Board 内不能重复；Runtime 按 id 附加原 Project并校验其 immutable Goal，不创建副本；
 - 另一个 Board 可以配置相同 UUID 来复用同一 Project Graph、Facts 与 Artifacts；同一 active Project 不得被多个 Runtime 进程并发调度；
 - `workers` 是非空数组；每项字段恰好为 `{type, model?, taskTypes, maxRunning, priority, env}`，Peak 生成内部 Worker identity；空 `model` 表示使用 Agent 工具默认模型；`env` 是传给该 CLI 子进程的字符串 map，不允许 free-form `args`；至少一个 Worker 必须支持 `supervise`，且至少一个必须支持 `execute`；
-- `phase.plan.customProfile` 和 `phase.supervise.customProfile` 各自可选且最多一项；`phase.execute.customProfiles` 默认为空数组，description 必须唯一；
+- `phase.plan.customProfile` 和 `phase.supervise.customProfile` 各自可选且最多一项；`phase.execute.customProfile` 是可多选的数组，默认为空，description 必须唯一；
 - 每个 profile 只能是 `{description,prompt}`；description 是供 AI 判断是否注入的短说明，必填且不超过 UTF-8 1 KiB；prompt 必填且不超过 UTF-8 8 KiB；
 - Worker type 只能是 `opencode`、`codex`、`pi`、`claude-code`；task type 只能是 `plan`、`supervise`、`execute`；
 - `priority` 数值越小越优先，可为 0；其余计数/间隔必须为正整数；

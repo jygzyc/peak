@@ -43,7 +43,7 @@ function config(workers: Record<string, WorkerConfig>): ResolvedTaskConfig {
     board: { skills: [], projects: [{ source: "start", goal: "done" }] },
     workers,
     scheduler: { maxRunningProjects: 4, intervalMs: 3_000 },
-    phase: { plan: {}, supervise: { intervalMs: 1_000 }, execute: { maxArtifactBytes: 1024, customProfiles: [] } },
+    phase: { plan: {}, supervise: { intervalMs: 1_000 }, execute: { maxArtifactBytes: 1024, customProfile: [] } },
   };
 }
 
