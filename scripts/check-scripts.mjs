@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 /**
- * 构建期脚本校验：对 scripts/*.mjs 逐个执行 `node --check`，
- * 并检查打包所需的静态资源存在（打包一致性）。
- * 由 build.mjs 与 pack.mjs 调用；语法/引用问题在打包时失败，而不是运行期才暴露。
+ * Build-time script validation: runs `node --check` on each scripts/*.mjs,
+ * and verifies the static assets required for packaging exist (packaging consistency).
+ * Called by build.mjs and pack.mjs; syntax/reference errors fail the build instead
+ * of surfacing at runtime.
  */
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
@@ -18,30 +19,30 @@ for (const name of readdirSync(join(root, "scripts")).filter((entry) => entry.en
     stdio: "inherit",
   });
   if (result.status !== 0) {
-    process.stderr.write(`[check-scripts] 语法错误: scripts/${name}\n`);
+    process.stderr.write(`[check-scripts] syntax error: scripts/${name}\n`);
     failed = true;
   }
 }
 
-// 打包所需的静态资源必须存在
+// Static assets required for packaging must exist.
 const required = [
-  ["版本文件", join(root, "version")],
-  ["发布日志", join(root, "RELEASE.md")],
+  ["version file", join(root, "version")],
+  ["release notes", join(root, "RELEASE.md")],
 ];
 for (const [label, path] of required) {
   if (!existsSync(path)) {
-    process.stderr.write(`[check-scripts] ${label} 缺失: ${path}\n`);
+    process.stderr.write(`[check-scripts] ${label} missing: ${path}\n`);
     failed = true;
   }
 }
 
-// 版本一致性：根目录 version 文件是唯一版本来源，package.json 必须与其一致
+// Version consistency: the root version file is the single source of truth; package.json must match it.
 const versionPath = join(root, "version");
 if (existsSync(versionPath)) {
   const fileVersion = readFileSync(versionPath, "utf8").trim();
   const packageVersion = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version;
   if (packageVersion !== fileVersion) {
-    process.stderr.write(`[check-scripts] package.json version (${packageVersion}) 与 version 文件 (${fileVersion}) 不一致\n`);
+    process.stderr.write(`[check-scripts] package.json version (${packageVersion}) does not match the version file (${fileVersion})\n`);
     failed = true;
   }
 }

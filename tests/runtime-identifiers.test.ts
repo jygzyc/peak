@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { customProfileDigest } from "../dist/config/custom-profile.js";
+import { customProfileDigest } from "../dist/utils/types.js";
 import { localTimestamp } from "../dist/graph/api.js";
 import { ExecutionRegistry } from "../dist/runtime/execution-registry.js";
 import { budgetGraphView, GRAPH_VIEW_MAX_BYTES } from "../dist/runtime/task-executor.js";

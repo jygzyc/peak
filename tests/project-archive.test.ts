@@ -33,7 +33,7 @@ test("completed Project archives carry Graph JSON, SQLite, and verified Artifact
       /only completed Projects/,
     );
     const intent = await graph.createIntent(project.id, {
-      from: [{ projectId: project.id, factId: "origin", description: "start" }],
+      from: [{ projectId: project.id, id: "origin", description: "start" }],
       description: "Produce portable evidence",
       createdBy: "test",
     });
@@ -43,7 +43,7 @@ test("completed Project archives carry Graph JSON, SQLite, and verified Artifact
       concludedBy: "test",
     });
     await graph.complete(project.id, {
-      from: [{ projectId: project.id, factId: concluded.fact.id, description: concluded.fact.description }],
+      from: [{ projectId: project.id, id: concluded.fact.id, description: concluded.fact.description }],
       description: "Portable goal proven",
       completedBy: "test",
     });
@@ -61,7 +61,7 @@ test("completed Project archives carry Graph JSON, SQLite, and verified Artifact
       assert.deepEqual(imported.boardProject, { id: project.id, source: "start", goal: "portable goal" });
       assert.equal(imported.project.status, "completed");
       assert.equal(readFileSync(join(targetRegistry.baseDir, project.id, "artifacts", artifact.sha256), "utf8"), "portable evidence\n");
-      assert.ok(existsSync(join(targetRegistry.baseDir, project.id, "analysis.db")));
+      assert.ok(existsSync(join(targetRegistry.baseDir, project.id, "project.db")));
       assert.equal(existsSync(join(targetRegistry.baseDir, project.id, ".tmp")), false, ".tmp never enters the Project archive");
       assert.ok((await graph.exportProject(project.id)).includes(project.id));
       await assert.rejects(targetRegistry.importProjectArchive(downloadedArchive), /already exists/);

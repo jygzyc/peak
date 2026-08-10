@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import type { TaskType } from "../config/types.js";
+import type { TaskType } from "../utils/types.js";
 import { localTimestamp } from "../graph/api.js";
 
 export interface ActiveExecution {

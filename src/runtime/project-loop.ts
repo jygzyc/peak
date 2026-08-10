@@ -1,17 +1,27 @@
-import { executeCapacity } from "../config/task-config.js";
-import type { ResolvedTaskConfig, TaskType } from "../config/types.js";
+import { executeCapacity } from "../utils/task-config.js";
+import type { ResolvedTaskConfig, TaskType } from "../utils/types.js";
 import { GraphClient } from "../graph/graph-client.js";
 import type { ProjectGraph } from "../graph/types.js";
-import { ExecutionRegistry } from "../runtime/execution-registry.js";
-import { PHASE_TIMEOUT_MS, TaskExecutor } from "../runtime/task-executor.js";
-import { GraphSupervisor } from "./graph-supervisor.js";
+import { ExecutionRegistry } from "./execution-registry.js";
+import { PHASE_TIMEOUT_MS, TaskExecutor } from "./task-executor.js";
 
 interface Checkpoint { facts: number; hints: number; open: number; federation: number }
 
+/**
+ * In-memory supervise timer. Pure `due/mark` cycle on the supervise interval;
+ * Runtime restarts re-supervise active Projects immediately because this
+ * carries no persisted cursor. Formerly its own 6-line `graph-supervisor.ts`.
+ */
+class SuperviseTimer {
+  private nextAt = 0;
+  constructor(private readonly intervalMs: number) {}
+  due(now = Date.now()): boolean { return now >= this.nextAt; }
+  mark(now = Date.now()): void { this.nextAt = now + this.intervalMs; }
+}
 
 export class ProjectLoop {
   private checkpoint?: Checkpoint;
-  private readonly supervisor: GraphSupervisor;
+  private readonly supervisor: SuperviseTimer;
 
   constructor(
     readonly projectId: string,
@@ -21,7 +31,7 @@ export class ProjectLoop {
     private readonly executions: ExecutionRegistry,
     private readonly pendingCount: () => number,
   ) {
-    this.supervisor = new GraphSupervisor(config.phase.supervise.intervalMs);
+    this.supervisor = new SuperviseTimer(config.phase.supervise.intervalMs);
   }
 
   /**

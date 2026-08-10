@@ -13,8 +13,7 @@
     "version",
     "RELEASE.md",
     "README.md",
-    "README_zh.md",
-    "AGENTS.md"
+    "README_zh.md"
   ],
   "bin": {
     "peak": "dist/cli.js"
@@ -28,7 +27,8 @@
     "test:example": "npm run build && node --test \"examples/**/*.test.ts\"",
     "smoke": "node tests/smoke.mjs",
     "pack": "node scripts/pack.mjs archive",
-    "prepack": "node scripts/pack.mjs prepare"
+    "prepack": "node scripts/pack.mjs prepare",
+    "pack:binary": "node scripts/pack.mjs binary"
   },
   "dependencies": {
     "commander": "^15.0.0",

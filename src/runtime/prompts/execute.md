@@ -8,7 +8,9 @@ Strict output rules:
 - Exactly one JSON object, nothing before or after: no prose, no fences.
 - `description`: trimmed standalone summary, at most 1 KiB UTF-8; longer detail goes in the Artifact.
 - Only the contract fields; extra, missing, or invalid fields are rejected.
-- Artifact content is inline in `artifact.content`; never write files or reference local paths.
+- You may read the supplied Artifact paths and use the current working directory for temporary read/write work.
+- Never create or modify files outside the current Project `.tmp` working directory.
+- Final Artifact content must be inline in `artifact.content`; never return a local path.
 
 Optional profile:
 {customProfile}

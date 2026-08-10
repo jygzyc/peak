@@ -1,6 +1,14 @@
-import type { TaskType, WorkerConfig, WorkerType } from "../config/types.js";
+export type WorkerType = "opencode" | "codex" | "pi" | "claude-code";
 
-export type { WorkerType };
+export interface WorkerDefinition {
+  type: WorkerType;
+  model?: string;
+  /** Per-worker environment variables merged into the CLI subprocess env. */
+  env: Record<string, string>;
+}
+
+/** Minimal configuration owned by WorkerRuntime. */
+export interface WorkerRuntimeConfig { workers: Record<string, WorkerDefinition> }
 
 export interface SessionRef { workerType: WorkerType; value: string }
 /**
@@ -23,18 +31,14 @@ export interface ProcessResult {
 export interface WorkerResult extends ProcessResult { text: string; session?: SessionRef }
 
 /**
- * Inputs handed to a CLI protocol builder. `cwd` is the Board directory and
- * `tmpDir` is an optional per-Project scratch directory (`.tmp`) a protocol
- * may use for its own transient files such as CLI session caches. The prompt
- * is always piped via stdin by the ProcessRunner; it never appears on the
- * command line.
+ * Inputs handed to a CLI protocol builder. `tmpDir` exposes the per-Project
+ * scratch directory (`.tmp`) to protocols that need an explicit transient/
+ * session-cache path. The prompt is always piped via stdin by the
+ * ProcessRunner; it never appears on the command line.
  */
 export interface WorkerCall {
-  workerName: string;
-  config: WorkerConfig;
-  taskType: TaskType;
+  config: WorkerDefinition;
   prompt: string;
-  cwd: string;
   session?: SessionRef;
   tmpDir?: string;
 }

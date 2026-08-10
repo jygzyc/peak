@@ -2,7 +2,8 @@ import { mkdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { WORKER_REGISTRY } from "../worker/registry.js";
-import type { SkillInstallOptions, WorkerType } from "./types.js";
+import type { WorkerType } from "../worker/types.js";
+import type { SkillInstallOptions } from "./types.js";
 
 export interface PeakPaths {
   peakHome: string;
@@ -53,10 +54,10 @@ export function initializeProjectLogsDirectory(projectDir: string): string {
 export const PROJECT_TMP_DIR = ".tmp";
 
 /**
- * Per-Project runtime scratch directory (`<projectDir>/.tmp`) for transient
- * worker files such as CLI session caches. It is never persisted to a Project
- * archive, never stores Fact Artifacts or deliverables, and is cleaned up once
- * the Project is no longer active.
+ * Per-Project runtime scratch directory (`<projectDir>/.tmp`) used as the
+ * Worker subprocess cwd and for transient files such as CLI session caches.
+ * It is never persisted to a Project archive, never stores Fact Artifacts or
+ * deliverables, and is cleaned up once the Project is no longer active.
  */
 export function projectTmpDir(projectDir: string): string {
   return join(resolve(projectDir), PROJECT_TMP_DIR);
@@ -76,6 +77,18 @@ export const PROJECT_OUT_DIR = "out";
  */
 export function projectOutDir(projectDir: string): string {
   return join(resolve(projectDir), PROJECT_OUT_DIR);
+}
+
+const PROJECT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * Absolute path of one Project's shard directory under a Projects root, after
+ * validating the UUID. Replaces the former thin `ProjectManager` wrapper; the
+ * only logic it carried was this validation plus the path join.
+ */
+export function projectDir(projectsDir: string, projectId: string): string {
+  if (!PROJECT_ID_PATTERN.test(projectId)) throw new Error("invalid project id");
+  return join(resolve(projectsDir), projectId);
 }
 
 /** Accepts a Board directory or a direct path to its task.json file. */

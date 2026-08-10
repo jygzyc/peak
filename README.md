@@ -1,6 +1,6 @@
 # Peak
 
-Peak is an HTTP-native distributed Graph agent runtime. Each **Project** owns an independent UUID Graph shard (SQLite + content-addressed Artifacts); Projects compose proofs through immutable **`FactRef`** hyperlink nodes containing `projectId`, `factId`, and the canonical Fact `description`. The Graph is bound to the HTTP server, whose API is the only live Graph protocol. The bundled Web UI is an optional presentation client, not a Graph dependency.
+Peak is an HTTP-native distributed Graph agent runtime. Each **Project** owns an independent UUID Graph shard (SQLite + content-addressed Artifacts); Projects compose proofs through immutable **`FactRef`** hyperlink nodes containing `projectId`, `id`, and the canonical Fact `description`. The Graph is bound to the HTTP server, whose API is the only live Graph protocol. The bundled Web UI is an optional presentation client, not a Graph dependency.
 
 ![Peak result](docs/assets/result.png)
 
@@ -21,7 +21,7 @@ npm install
 npm run build
 
 peak init ./my-board            # scaffold a Board with an empty task.json
-peak run ./my-board             # create/attach Projects and run Plan/Supervise/Execute
+peak start ./my-board           # create/attach Projects and run Plan/Supervise/Execute
 peak serve                      # serve the persisted Graph API + Web UI, no workers
 ```
 
@@ -31,15 +31,15 @@ Configure and authenticate one of `opencode`, `codex`, `pi`, or `claude-code` be
 
 User guides (English / 中文):
 
-- [`docs/usage.md`](docs/usage.md) — English usage guide: quick start, Board configuration, CLI reference, Web UI, examples.
-- [`docs/usage_zh.md`](docs/usage_zh.md) — 中文使用指南：快速开始、Board 配置、CLI 参考、Web UI、示例。
+- [`docs/en/usage.md`](docs/en/usage.md) — English usage guide: quick start, Board configuration, CLI reference, Web UI, examples.
+- [`docs/zh/usage.md`](docs/zh/usage.md) — 中文使用指南：快速开始、Board 配置、CLI 参考、Web UI、示例。
 
-Reference and contributor docs:
+Reference and contributor docs (按语言分 `docs/zh/` 与 `docs/en/`，内容分开发与用法 / 架构 / 数据流三类，索引见 [`docs/README.md`](docs/README.md)):
 
-- [`docs/architecture.md`](docs/architecture.md) — architecture: design goals, module responsibilities, Graph model, runtime phases, scheduling, workers, federation, CLI, Web UI, security.
-- [`docs/data-flow.md`](docs/data-flow.md) — data flow: data model and invariants, persistence layout, HTTP API, task-protocol JSON contracts, Board config schema, end-to-end flows.
-- [`docs/development.md`](docs/development.md) — build, test, and release workflow.
-- [`docs/development_zh.md`](docs/development_zh.md) — 构建、测试与发布工作流（中文）。
+- [`docs/zh/architecture.md`](docs/zh/architecture.md) — 架构：设计目标、模块职责、Graph 模型、Runtime 阶段、调度、Worker、Federation、CLI、Web UI、安全。
+- [`docs/zh/data-flow.md`](docs/zh/data-flow.md) — 数据流：数据模型与不变量、持久化布局、HTTP API、任务协议 JSON 合同、Board 配置 schema、端到端数据流。
+- [`docs/en/development.md`](docs/en/development.md) — build, test, and release workflow.
+- [`docs/zh/development.md`](docs/zh/development.md) — 构建、测试与发布工作流（中文）。
 - [`AGENTS.md`](AGENTS.md) — source layout and non-negotiable boundaries for contributors.
 
 ## License

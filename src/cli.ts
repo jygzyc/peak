@@ -1,23 +1,36 @@
 #!/usr/bin/env node
 import { closeSync, openSync, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { randomBytes } from "node:crypto";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command, Option } from "commander";
-import { initializePeakPaths } from "./config/paths.js";
-import { loadTaskConfig } from "./config/task-config.js";
-import { initializeTaskDirectory } from "./config/task-initializer.js";
+import { initializePeakPaths } from "./utils/paths.js";
 import {
-  getServerProcessStatus, publishServerUrl, registerServerProcess, serverLogPath, stopServerProcess,
-} from "./config/server-process.js";
+  DockerImageUnavailableError, dockerContainerState, dockerStop, launchDockerTask, type DockerTaskOptions,
+} from "./utils/docker.js";
+import {
+  deregisterRuntime, listProjectRegistrations, projectRegistrationExtension, registerProjects, updateRuntimeWebUrl,
+} from "./utils/project-registry.js";
+import { stopTask, taskManagerExtension, type TaskManagerContext } from "./utils/task-manager.js";
+import { loadTaskConfig } from "./utils/task-config.js";
+import { initializeTaskDirectory } from "./utils/task-initializer.js";
+import type { ApiExtension } from "./graph/http-server.js";
+import {
+  getServerProcessStatus, isProcessAlive, publishServerUrl, registerServerProcess, serverLogPath, stopServerProcess,
+  terminateProcess,
+} from "./utils/server-process.js";
 import { GraphHttpServer } from "./graph/http-server.js";
 import { ProjectStoreRegistry } from "./graph/project-store-registry.js";
 import { AgentRuntime } from "./runtime/agent-runtime.js";
 import { serveDashboard } from "./ui/dashboard.js";
-import { TASK_TYPES, WORKER_TYPES } from "./worker/registry.js";
+import { TASK_TYPES } from "./utils/types.js";
+import { WORKER_TYPES } from "./worker/registry.js";
+import { EMBEDDED_VERSION } from "./generated/assets.js";
 
-/** 版本号以代码根目录的 version 文件为准（打包时随 dist 一起发布）。 */
+/** Version is sourced from the version file at the code root (embedded at build time, with the dist on-disk file as fallback). */
 function packageVersion(): string {
+  if (EMBEDDED_VERSION) return EMBEDDED_VERSION;
   const moduleDir = dirname(fileURLToPath(import.meta.url));
   const candidates = [join(moduleDir, "..", "version"), join(moduleDir, "version")];
   for (const path of candidates) {
@@ -32,7 +45,6 @@ function packageVersion(): string {
 interface ServerOptions {
   host: string;
   port: string;
-  token?: string;
   peakHome?: string;
 }
 
@@ -40,6 +52,10 @@ interface RunOptions extends ServerOptions {
   project?: string;
   installSkills: boolean;
   foreground: boolean;
+  graphUrl?: string;
+  projectsRoot?: string;
+  attachOnly: boolean;
+  docker: boolean;
 }
 
 interface ServeOptions extends ServerOptions { foreground: boolean }
@@ -51,43 +67,57 @@ const program = new Command()
   .description("Peak — HTTP-native distributed Graph agent runtime")
   .version(packageVersion());
 
-program.command("run")
+program.command("start")
   .description("Create or attach Board Projects and start Plan / Supervise / Execute in the background")
   .argument("[board-directory]", "Board directory containing task.json (or the task.json file itself)", ".")
-  .option("--project <source>", "Run only the configured Project with this source; default runs the full Board")
-  .option("--host <host>", "HTTP host (non-loopback requires --token)", "127.0.0.1")
+  .option("--project <source>", "Start only the configured Project with this source; default starts the full Board")
+  .option("--host <host>", "HTTP host", "127.0.0.1")
   .option("--port <port>", "HTTP port (0 = ephemeral)", "0")
-  .option("--token <token>", "Bearer token required for every /api/* request")
   .option("--peak-home <directory>", "Peak home directory (default: ~/.peak or PEAK_HOME)")
+  .option("--graph-url <url>", "Attach to an external serve Graph API instead of embedding the Graph server (--host/--port do not apply)")
+  .option("--projects-root <directory>", "Local Projects root used to resolve relative Artifact paths (container: /peak/projects)")
+  .addOption(new Option("--attach-only", "Require persisted Project ids; never create Projects").default(false))
+  .addOption(new Option("--docker", "Run the task in a per-task container (Docker or Podman, PEAK_CONTAINER_RUNTIME to choose; pulls the image when missing; falls back to local mode when the image is unavailable)").default(false))
   .option("--no-install-skills", "Skip Board Skill installation")
   .addOption(new Option("--foreground", "Run in the current process").default(false).hideHelp())
-  .action((taskDirectory: string, options: RunOptions) => options.foreground
-    ? runForeground(taskDirectory, options, undefined, "run")
-    : launchBackground(options.peakHome));
+  .action(async (taskDirectory: string, options: RunOptions) => {
+    if (options.docker) {
+      try {
+        await launchDockerTask(taskDirectory, dockerTaskOptions(options));
+        return;
+      } catch (error) {
+        if (!(error instanceof DockerImageUnavailableError)) throw error;
+        process.stderr.write(`[peak] ${error.message}\n[peak] falling back to local mode\n`);
+      }
+    }
+    if (options.foreground) await runForeground(taskDirectory, options, undefined, "start");
+    else await launchBackground(options.peakHome, "task");
+  });
 
 program.command("resume")
   .description("Attach one persisted Project by UUID and start it in the background")
   .argument("<project-id>", "UUID of the persisted Project to attach")
   .argument("[board-directory]", "Board directory containing task.json (or the task.json file itself)", ".")
   .option("--project <source>", "Configured Project source when matching is ambiguous")
-  .option("--host <host>", "HTTP host (non-loopback requires --token)", "127.0.0.1")
+  .option("--host <host>", "HTTP host", "127.0.0.1")
   .option("--port <port>", "HTTP port (0 = ephemeral)", "0")
-  .option("--token <token>", "Bearer token required for every /api/* request")
   .option("--peak-home <directory>", "Peak home directory (default: ~/.peak or PEAK_HOME)")
+  .option("--graph-url <url>", "Attach to an external serve Graph API instead of embedding the Graph server (--host/--port do not apply)")
+  .option("--projects-root <directory>", "Local Projects root used to resolve relative Artifact paths (container: /peak/projects)")
+  .addOption(new Option("--attach-only", "Require persisted Project ids; never create Projects").default(false))
   .option("--no-install-skills", "Skip Board Skill installation")
   .addOption(new Option("--foreground", "Run in the current process").default(false).hideHelp())
   .action((projectId: string, taskDirectory: string, options: RunOptions) => options.foreground
     ? runForeground(taskDirectory, options, projectId, "resume")
-    : launchBackground(options.peakHome));
+    : launchBackground(options.peakHome, "task"));
 
 program.command("serve")
   .description("Start the persisted Graph API and bundled Web UI in the background; no workers")
-  .option("--host <host>", "HTTP host (non-loopback requires --token)", "127.0.0.1")
+  .option("--host <host>", "HTTP host", "127.0.0.1")
   .option("--port <port>", "HTTP port", "8000")
-  .option("--token <token>", "Bearer token required for every /api/* request")
   .option("--peak-home <directory>", "Peak home directory (default: ~/.peak or PEAK_HOME)")
   .addOption(new Option("--foreground", "Run in the current process").default(false).hideHelp())
-  .action((options: ServeOptions) => options.foreground ? serveForeground(options) : launchBackground(options.peakHome));
+  .action((options: ServeOptions) => options.foreground ? serveForeground(options) : launchBackground(options.peakHome, "serve"));
 
 program.command("status")
   .description("Show the background Peak server status")
@@ -95,11 +125,13 @@ program.command("status")
   .action((options: ArchiveOptions) => printServerStatus(options));
 
 program.command("stop")
-  .description("Stop the Peak server and its active Worker subprocesses")
+  .description("Stop one task by name, or stop the Peak server and all registered task Runtimes when no task is named")
+  .argument("[task-name]", "Stop only this task by name; omit to stop all tasks and the server")
   .option("--peak-home <directory>", "Peak home directory (default: ~/.peak or PEAK_HOME)")
-  .action(async (options: ArchiveOptions) => {
-    const pid = await stopServerProcess(initializePeakPaths(options.peakHome).peakHome);
-    process.stdout.write(`[peak] stopped server: ${pid}\n`);
+  .action(async (taskName: string | undefined, options: ArchiveOptions) => {
+    const peakHome = initializePeakPaths(options.peakHome).peakHome;
+    if (taskName) await stopOneTask(peakHome, taskName);
+    else await stopEverything(peakHome);
   });
 
 program.command("export")
@@ -135,18 +167,30 @@ async function runForeground(
   taskDirectory: string,
   options: RunOptions,
   projectId: string | undefined,
-  mode: "run" | "resume",
+  mode: "start" | "resume",
 ): Promise<void> {
   const lifecycle = shutdownLifecycle();
   const config = loadTaskConfig(taskDirectory);
   const paths = initializePeakPaths(options.peakHome);
-  const unregister = registerServerProcess(paths.peakHome, mode, config.taskDir);
+  const runtimeId = randomBytes(4).toString("hex");
+  const taskName = config.board.name ?? basename(config.taskDir);
+  // Fail fast when a configured/attached UUID is already owned by another
+  // active Runtime; registration after start() is the authoritative guard.
+  const configuredIds = new Set(config.board.projects.map((project) => project.id).filter((id): id is string => id !== undefined && id.length > 0));
+  if (projectId) configuredIds.add(projectId);
+  for (const entry of listProjectRegistrations(paths.peakHome)) {
+    if (configuredIds.has(entry.projectId)) {
+      throw new Error(`Project is already actively registered: ${entry.projectId} (task ${entry.taskName})`);
+    }
+  }
   const runtime = new AgentRuntime(config, {
     host: options.host,
     port: parsePort(options.port),
-    token: options.token,
     peakHome: options.peakHome,
     installSkills: options.installSkills,
+    graphUrl: options.graphUrl,
+    projectsRoot: options.projectsRoot,
+    attachOnly: options.attachOnly,
   });
   // Record process-level crashes in every Project's main.log, then keep the
   // default crash behavior (message + stack on stderr, non-zero exit).
@@ -158,13 +202,29 @@ async function runForeground(
   process.once("uncaughtException", crash("uncaughtException"));
   process.once("unhandledRejection", crash("unhandledRejection"));
   let monitorError: unknown;
+  let registered = false;
   try {
     const projects = await runtime.start(options.project, projectId);
-    publishServerUrl(paths.peakHome, runtime.webUrl);
+    registerProjects(paths.peakHome, projects.map((project) => ({
+      projectId: project.id,
+      taskName,
+      boardDir: config.taskDir,
+      mode,
+      runtimeId,
+      pid: process.pid,
+      container: null,
+      graphUrl: options.graphUrl ?? null,
+      webUrl: null,
+      startedAt: new Date().toISOString(),
+    })));
+    registered = true;
+    // External-graph mode is ready once registered (graphUrl is already
+    // recorded); embedded mode publishes its server URL as the signal.
+    if (!options.graphUrl) updateRuntimeWebUrl(paths.peakHome, runtimeId, runtime.webUrl);
     process.stdout.write([
       `[peak] board: ${runtime.config.board.name ?? "board"}`,
       ...projects.flatMap((project) => [`[peak] source: ${project.title}`, `[peak] id: ${project.id}`]),
-      `[peak] web: ${runtime.webUrl}`,
+      `[peak] web: ${runtime.endpointUrl ?? "external graph"}`,
       "[peak] running; press Ctrl+C to stop",
       "",
     ].join("\n"));
@@ -183,18 +243,31 @@ async function runForeground(
   } finally {
     lifecycle.dispose();
     await runtime.stop();
-    unregister();
+    if (registered) deregisterRuntime(paths.peakHome, runtimeId);
   }
 }
 
 async function serveForeground(options: ServeOptions): Promise<void> {
   const lifecycle = shutdownLifecycle();
   const paths = initializePeakPaths(options.peakHome);
-  const unregister = registerServerProcess(paths.peakHome, "serve");
+  const unregister = registerServerProcess(paths.peakHome);
   const registry = new ProjectStoreRegistry(paths.projectsDir);
-  const server = new GraphHttpServer(registry, serveDashboard);
+  const extensions: ApiExtension[] = [projectRegistrationExtension(paths.peakHome)];
+  const taskContext: TaskManagerContext = {
+    peakHome: paths.peakHome,
+    projectsDir: paths.projectsDir,
+    registry,
+    cliEntry: fileURLToPath(import.meta.url),
+    serveUrl: "",
+    version: packageVersion(),
+  };
+  extensions.push(taskManagerExtension(taskContext));
+  const server = new GraphHttpServer(registry, serveDashboard, extensions);
   try {
-    await server.start({ host: options.host, port: parsePort(options.port), token: options.token });
+    await server.start({ host: options.host, port: parsePort(options.port) });
+    const loopback = new URL(server.baseUrl);
+    loopback.hostname = "127.0.0.1";
+    taskContext.serveUrl = loopback.toString().replace(/\/$/, "");
     publishServerUrl(paths.peakHome, server.baseUrl);
     process.stdout.write(`[peak] web: ${server.baseUrl}\n[peak] serving; press Ctrl+C to stop\n`);
     await lifecycle.promise;
@@ -206,10 +279,12 @@ async function serveForeground(options: ServeOptions): Promise<void> {
   }
 }
 
-async function launchBackground(peakHomeOption?: string): Promise<void> {
+async function launchBackground(peakHomeOption: string | undefined, kind: "serve" | "task"): Promise<void> {
   const paths = initializePeakPaths(peakHomeOption);
-  const current = getServerProcessStatus(paths.peakHome);
-  if (current.running) throw new Error(`Peak server is already running (pid ${current.pid})`);
+  if (kind === "serve") {
+    const current = getServerProcessStatus(paths.peakHome);
+    if (current.running) throw new Error(`Peak server is already running (pid ${current.pid})`);
+  }
   const logPath = serverLogPath(paths.peakHome);
   const log = openSync(logPath, "a");
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url), ...process.argv.slice(2), "--foreground"], {
@@ -223,43 +298,128 @@ async function launchBackground(peakHomeOption?: string): Promise<void> {
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) {
-      throw new Error(`Peak background server exited with code ${child.exitCode}; see ${logPath}`);
+      throw new Error(`Peak background ${kind} exited with code ${child.exitCode}; see ${logPath}`);
     }
-    const status = getServerProcessStatus(paths.peakHome);
-    if (status.running && status.pid === child.pid && status.webUrl) {
-      child.unref();
-      process.stdout.write([
-        `[peak] server: running`,
-        `[peak] pid: ${status.pid}`,
-        `[peak] web: ${status.webUrl}`,
-        `[peak] log: ${logPath}`,
-        "",
-      ].join("\n"));
-      return;
+    if (kind === "serve") {
+      const status = getServerProcessStatus(paths.peakHome);
+      if (status.running && status.pid === child.pid && status.webUrl) {
+        child.unref();
+        process.stdout.write([
+          `[peak] server: running`,
+          `[peak] pid: ${status.pid}`,
+          `[peak] web: ${status.webUrl}`,
+          `[peak] log: ${logPath}`,
+          "",
+        ].join("\n"));
+        return;
+      }
+    } else {
+      // A task Runtime is ready once its registration carries an endpoint
+      // URL; run/resume no longer occupy the single server.pid slot.
+      const ready = listProjectRegistrations(paths.peakHome)
+        .find((entry) => entry.pid === child.pid && (entry.webUrl ?? entry.graphUrl));
+      const readyUrl = ready?.webUrl ?? ready?.graphUrl;
+      if (ready && readyUrl) {
+        child.unref();
+        process.stdout.write([
+          `[peak] task: running`,
+          `[peak] pid: ${child.pid ?? "unknown"}`,
+          `[peak] web: ${readyUrl}`,
+          `[peak] log: ${logPath}`,
+          "",
+        ].join("\n"));
+        return;
+      }
     }
     await new Promise((resolveWait) => setTimeout(resolveWait, 100));
   }
   try { process.kill(child.pid!, "SIGTERM"); } catch { /* best effort */ }
-  throw new Error(`Peak background server did not become ready; see ${logPath}`);
+  throw new Error(`Peak background ${kind} did not become ready; see ${logPath}`);
 }
 
 function printServerStatus(options: ArchiveOptions): void {
   const paths = initializePeakPaths(options.peakHome);
   const status = getServerProcessStatus(paths.peakHome);
-  if (!status.running) {
-    process.stdout.write("[peak] server: stopped\n");
+  const lines: string[] = [];
+  if (status.running) {
+    lines.push(
+      "[peak] server: running",
+      `[peak] pid: ${status.pid}`,
+      `[peak] mode: ${status.mode ?? "unknown"}`,
+      `[peak] web: ${status.webUrl ?? "starting"}`,
+      `[peak] started: ${status.startedAt ?? "unknown"}`,
+      `[peak] board: ${status.boardDir ?? "none"}`,
+    );
+  } else {
+    lines.push("[peak] server: stopped");
+  }
+  lines.push(`[peak] log: ${serverLogPath(paths.peakHome)}`);
+  const registrations = listProjectRegistrations(paths.peakHome);
+  const runtimes = new Map<string, typeof registrations>();
+  for (const entry of registrations) {
+    const group = runtimes.get(entry.runtimeId) ?? [];
+    group.push(entry);
+    runtimes.set(entry.runtimeId, group);
+  }
+  for (const entries of runtimes.values()) {
+    const first = entries[0]!;
+    lines.push(
+      `[peak] task: ${first.taskName} (${first.mode}, ${first.container ? `container ${first.container}` : `pid ${first.pid ?? "unknown"}`})`,
+      `[peak]   board: ${first.boardDir}`,
+      `[peak]   web: ${first.webUrl ?? first.graphUrl ?? "none"}`,
+      `[peak]   started: ${first.startedAt}`,
+      ...entries.map((entry) => `[peak]   project: ${entry.projectId}`),
+    );
+  }
+  if (runtimes.size === 0) lines.push("[peak] tasks: none");
+  process.stdout.write(`${lines.join("\n")}\n\n`);
+}
+
+async function stopOneTask(peakHome: string, taskName: string): Promise<void> {
+  const before = listProjectRegistrations(peakHome).filter((entry) => entry.taskName === taskName);
+  if (before.length === 0) {
+    process.stdout.write(`[peak] no task named: ${taskName}\n`);
     return;
   }
-  process.stdout.write([
-    "[peak] server: running",
-    `[peak] pid: ${status.pid}`,
-    `[peak] mode: ${status.mode ?? "unknown"}`,
-    `[peak] web: ${status.webUrl ?? "starting"}`,
-    `[peak] started: ${status.startedAt ?? "unknown"}`,
-    `[peak] board: ${status.boardDir ?? "none"}`,
-    `[peak] log: ${serverLogPath(paths.peakHome)}`,
-    "",
-  ].join("\n"));
+  await stopTask({ peakHome }, taskName);
+  process.stdout.write(`[peak] stopped task: ${taskName}\n`);
+}
+
+async function stopEverything(peakHome: string): Promise<void> {
+  const registrations = listProjectRegistrations(peakHome);
+  const pids = [...new Set(registrations.map((entry) => entry.pid).filter((pid): pid is number => pid !== null))]
+    .filter(isProcessAlive);
+  // Container tasks: docker stop by container name, then deregister. A
+  // container that is already gone is a stale entry and is only deregistered.
+  const containers = new Map<string, Set<string>>();
+  for (const entry of registrations) {
+    if (!entry.container) continue;
+    const runtimeIds = containers.get(entry.container) ?? new Set<string>();
+    runtimeIds.add(entry.runtimeId);
+    containers.set(entry.container, runtimeIds);
+  }
+  let stopped = 0;
+  for (const [container, runtimeIds] of containers) {
+    try {
+      if (dockerContainerState(container) === "running") dockerStop(container);
+      for (const runtimeId of runtimeIds) deregisterRuntime(peakHome, runtimeId);
+      process.stdout.write(`[peak] stopped container task: ${container}\n`);
+      stopped += 1;
+    } catch (error) {
+      process.stderr.write(`[peak] failed to stop container ${container}: ${(error as Error).message}\n`);
+    }
+  }
+  for (const pid of pids) {
+    await terminateProcess(pid);
+    process.stdout.write(`[peak] stopped task: ${pid}\n`);
+    stopped += 1;
+  }
+  if (getServerProcessStatus(peakHome).running) {
+    const pid = await stopServerProcess(peakHome);
+    process.stdout.write(`[peak] stopped server: ${pid}\n`);
+    stopped += 1;
+  }
+  if (stopped === 0) process.stdout.write("[peak] nothing to stop\n");
 }
 
 async function exportCompletedProject(projectId: string, archive: string | undefined, options: ArchiveOptions): Promise<void> {
@@ -292,6 +452,14 @@ function parsePort(value: string): number {
   const port = Number(value);
   if (!Number.isInteger(port) || port < 0 || port > 65_535) throw new Error(`invalid port: ${value}`);
   return port;
+}
+
+function dockerTaskOptions(options: RunOptions): DockerTaskOptions {
+  return {
+    peakHome: options.peakHome,
+    graphUrl: options.graphUrl,
+    version: packageVersion(),
+  };
 }
 
 function shutdownLifecycle(): { promise: Promise<void>; request: () => void; dispose: () => void } {

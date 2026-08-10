@@ -1,24 +1,38 @@
-import { createHash } from "node:crypto";
-import { appendFileSync, createReadStream, lstatSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { createReadStream, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { customProfileDigest } from "../config/custom-profile.js";
-import { initializeProjectLogsDirectory, projectOutDir } from "../config/paths.js";
-import { executeCapacity } from "../config/task-config.js";
-import type { CustomProfileDefinition, ResolvedTaskConfig, TaskProjectConfig, TaskType } from "../config/types.js";
-import { localTimestamp } from "../graph/api.js";
-import { FederationBus, type FederationReference } from "../graph/federation-bus.js";
-import { GraphClient, GraphClientError } from "../graph/graph-client.js";
+import { writeProjectLog } from "../utils/helpers.js";
+import { initializeProjectLogsDirectory, projectOutDir, projectTmpDir } from "../utils/paths.js";
+import { executeCapacity } from "../utils/task-config.js";
 import {
-  leafFacts, type Fact, type FactRef, type Hint, type Intent, type ProjectMeta, type ResolvedFactSource,
+  customProfileDigest, type CustomProfileDefinition, type ResolvedTaskConfig, type TaskProjectConfig, type TaskType,
+} from "../utils/types.js";
+import { localTimestamp, toJson } from "../graph/api.js";
+import { FederationBus } from "../graph/federation-bus.js";
+import { GraphClient, GraphClientError } from "../graph/graph-client.js";
+import { pathAbstractPath, pathAbstractRelativePath } from "../graph/path-abstract.js";
+import {
+  computePaths, leafFacts, type Fact, type FactRef, type Hint, type Intent, type PathAbstract, type ProjectMeta, type ResolvedFactSource,
+  type ResolvedPathAbstract,
 } from "../graph/types.js";
 import type { SessionRef, WorkerResult } from "../worker/types.js";
-import { parseExecute, parsePlan, parseSupervise } from "./contracts.js";
-import { writeGraphContext, type Phase } from "./context.js";
+import { parseAnalyze, parseExecute, parsePlan, parseSupervise } from "./contracts.js";
+import { EMBEDDED_PROMPTS } from "../generated/assets.js";
+
+type Phase = "plan" | "supervise" | "execute" | "finalize" | "analyze";
+function writeGraphContext(projectDir: string, phase: Phase, executionId: string, value: unknown): string {
+  const logs = initializeProjectLogsDirectory(projectDir);
+  const path = join(logs, `graph-${localTimestamp()}-${executionId}-${phase}.json`);
+  const temporary = join(logs, `.${executionId}-${randomBytes(4).toString("hex")}.tmp`);
+  writeFileSync(temporary, toJson(value), { flag: "wx" });
+  renameSync(temporary, path);
+  return path;
+}
 
 export interface TaskWorkers {
   pick(taskType: TaskType): string | undefined;
-  release(workerName: string): void;
+  release(workerName: string, taskType: TaskType): void;
   execute(
     workerName: string,
     taskType: TaskType,
@@ -31,19 +45,22 @@ export interface TaskWorkers {
   ): Promise<WorkerResult>;
 }
 
-export interface GraphViewBudget {
+interface GraphViewBudget {
   truncated: boolean;
   omitted: Record<string, number>;
 }
-interface PlanGraphView extends GraphViewBudget {
-  project: ProjectMeta;
-  source: Fact;
-  goal: Fact;
-  leafFacts: Fact[];
+interface PlanProjectView {
+  source: FactRef;
+  goal: FactRef;
+  leafFacts: ResolvedFactSource[];
   /** Digest is internal integrity metadata and is never shown to the Plan AI. */
   openIntents: Array<Omit<Intent, "customProfileDigest">>;
   unconsumedHints: Hint[];
-  pendingFactRefs: FactRef[];
+}
+interface PlanGraphView extends GraphViewBudget {
+  projects: Record<string, PlanProjectView>;
+  /** Same-scope leaf FactRefs with their read-only Path Abstract files. */
+  external: ResolvedPathAbstract[];
 }
 interface ExecuteGraphView extends GraphViewBudget { project: ProjectMeta; intent: Intent; sources: ResolvedFactSource[] }
 interface SuperviseGraphView extends GraphViewBudget {
@@ -58,7 +75,7 @@ interface ProfileValue { description: string; prompt: string; digest: string }
 export const GRAPH_VIEW_MAX_BYTES = 256 * 1024;
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
-export const PHASE_TIMEOUT_MS = { plan: 300_000, supervise: 300_000, execute: 600_000, finalize: 120_000 } as const;
+export const PHASE_TIMEOUT_MS = { plan: 300_000, supervise: 300_000, execute: 600_000, finalize: 120_000, analyze: 300_000 } as const;
 // Fixed runtime policy (like phase timeouts, not Board-configurable): bounded
 // retries absorb transient provider failures, timeouts, and malformed JSON
 // output from a single worker round-trip.
@@ -91,10 +108,20 @@ export class TaskExecutor {
     return this.workers.pick(taskType);
   }
 
+  /**
+   * Plan phase: assembles a read-only frontier view (current leaves, open
+   * Intents, unconsumed Hints, pending Federation Paths), asks the Worker for
+   * the next Intents or completion, validates the write against a freshly
+   * re-read Graph, and retries the whole dispatch when a concurrent Execute
+   * consumed a source leaf in the meantime. Runs the path-abstract hook first
+   * so every concluded Fact carries its `path_abs_<factId>` artifact and
+   * current leaf Paths are broadcast before the Plan view is assembled.
+   */
   async plan(projectId: string, executionId: string, signal?: AbortSignal, reservedWorker?: string): Promise<void> {
     const worker = reservedWorker ?? this.requireWorker("plan");
     let handedOff = false;
     try {
+      await this.syncPaths(projectId, signal);
       // Plan reads a Graph view, asks the worker for the next Intents, then
       // writes them. A concurrent Execute can conclude an Intent while the
       // worker is thinking, consuming a source leaf the Plan reasoned over.
@@ -103,21 +130,27 @@ export class TaskExecutor {
       // when a source has been superseded.
       for (let attempt = 1; attempt <= PLAN_DISPATCH_ATTEMPTS; attempt += 1) {
         const project = await this.graph.getProject(projectId);
-        const pending = this.federation.pendingFor(projectId);
+        const pending = this.federation.pendingPathsFor(projectId);
         const facts = leafFacts(project);
         const source = project.facts.find((fact) => fact.id === "origin");
         const goal = project.facts.find((fact) => fact.id === "goal");
         if (!source || !goal) throw new Error("Project source or goal Fact is missing");
-        const graph: PlanGraphView = completeGraphView({
-          project: project.project,
-          source,
-          goal,
-          leafFacts: facts,
+        const refs = facts.map((fact) => factRef(projectId, fact));
+        const resolvedLeaves = await this.graph.resolveFactRefs(projectId, refs);
+        await verifySources(resolvedLeaves);
+        const current: PlanProjectView = {
+          source: factRef(projectId, source),
+          goal: factRef(projectId, goal),
+          leafFacts: resolvedLeaves,
           openIntents: project.intents.filter((intent) => intent.to === null)
             .map(({ customProfileDigest: _, ...intent }) => intent),
           unconsumedHints: project.hints.filter((hint) => hint.consumedByIntentId === null),
-          pendingFactRefs: pending,
-        }, ["leafFacts", "openIntents", "unconsumedHints", "pendingFactRefs"]);
+        };
+        const graph = budgetPlanGraphView(
+          projectId,
+          current,
+          pending.map((path) => this.federation.resolvePath(path)),
+        );
         const planProfile = profileValue(this.config.phase.plan.customProfile);
         // Inject raw {description,prompt} definitions only: the digest is
         // internal integrity metadata, and showing it to the Plan AI invites
@@ -126,14 +159,13 @@ export class TaskExecutor {
         const capacity = executeCapacity(this.config);
         const rendered = renderPrompt("plan", {
           customProfile: json(planProfile), skills: json(this.config.board.skills),
-          source: json(graph.source), goal: json(graph.goal),
-          graph: json(planCurrentState(graph)), executeCustomProfiles: json(executeProfiles),
+          graph: json(graph), executeCustomProfiles: json(executeProfiles),
           maxIntents: String(capacity),
           contract: planContract(capacity, executeProfiles.length > 0),
         });
         this.snapshot("plan", executionId, graph, planProfile, rendered);
         const output = await withPhaseRetries("plan", MAX_PHASE_ATTEMPTS, async () => {
-          const result = await this.workers.execute(worker, "plan", rendered.text, PHASE_TIMEOUT_MS.plan, this.config.taskDir, signal, undefined, this.workerOptions(executionId));
+          const result = await this.workers.execute(worker, "plan", rendered.text, PHASE_TIMEOUT_MS.plan, this.prepareWorkerTmp(), signal, undefined, this.workerOptions(executionId));
           handedOff = true;
           requireSuccess(result, "plan");
           return phaseParse(() => parsePlan(result.text, executeCapacity(this.config), executeProfiles.map((profile) => profile.description)));
@@ -142,7 +174,7 @@ export class TaskExecutor {
         // concurrent Execute is caught under the latest leaf frontier, not the
         // snapshot the worker reasoned over.
         const latest = await this.graph.getProject(projectId);
-        const visible = visibleRefs(projectId, leafFacts(latest), this.federation.pendingFor(projectId));
+        const visible = visibleRefs(projectId, leafFacts(latest));
         const unconsumedHints = latest.hints.filter((hint) => hint.consumedByIntentId === null);
         try {
           if (output.kind === "complete") {
@@ -166,7 +198,7 @@ export class TaskExecutor {
               });
             }
           }
-          if (pending.length) this.federation.markHandled(projectId, pending);
+          if (pending.length) this.federation.markPathsHandled(projectId, pending);
           return;
         } catch (error) {
           if (!isStaleLeafConflict(error) || attempt === PLAN_DISPATCH_ATTEMPTS || signal?.aborted) throw error;
@@ -177,10 +209,16 @@ export class TaskExecutor {
         }
       }
     } finally {
-      if (!handedOff) this.workers.release(worker);
+      if (!handedOff) this.workers.release(worker, "plan");
     }
   }
 
+  /**
+   * Supervise phase: shows the Worker the full Graph (Facts, Intents, Hints)
+   * and lets it submit at most one Hint per round. Supervise can neither
+   * create Facts/Intents nor complete/reopen the Project; duplicate Hint
+   * content is dropped instead of re-written.
+   */
   async supervise(projectId: string, executionId: string, signal?: AbortSignal, reservedWorker?: string): Promise<void> {
     const worker = reservedWorker ?? this.requireWorker("supervise");
     let handedOff = false;
@@ -195,7 +233,7 @@ export class TaskExecutor {
       });
       this.snapshot("supervise", executionId, graph, selected, rendered);
       const output = await withPhaseRetries("supervise", MAX_PHASE_ATTEMPTS, async () => {
-        const result = await this.workers.execute(worker, "supervise", rendered.text, PHASE_TIMEOUT_MS.supervise, this.config.taskDir, signal, undefined, this.workerOptions(executionId));
+        const result = await this.workers.execute(worker, "supervise", rendered.text, PHASE_TIMEOUT_MS.supervise, this.prepareWorkerTmp(), signal, undefined, this.workerOptions(executionId));
         handedOff = true;
         requireSuccess(result, "supervise");
         return phaseParse(() => parseSupervise(result.text));
@@ -207,10 +245,18 @@ export class TaskExecutor {
         if (!(error instanceof GraphClientError) || error.status !== 409) throw error;
       }
     } finally {
-      if (!handedOff) this.workers.release(worker);
+      if (!handedOff) this.workers.release(worker, "supervise");
     }
   }
 
+  /**
+   * Execute phase: resolves the open Intent's source FactRefs, runs the Worker
+   * against the assembled view, verifies source Artifact integrity before and
+   * after the run, and concludes the Intent with exactly one new local Fact
+   * (optionally bound to one uploaded Artifact). A started but failed run gets
+   * at most one Finalize resume over the same Worker session; failures leave
+   * the Intent open for a later tick.
+   */
   async execute(projectId: string, intent: Intent, executionId: string, signal?: AbortSignal, reservedWorker?: string): Promise<void> {
     const worker = reservedWorker ?? this.requireWorker("execute");
     let handedOff = false;
@@ -226,7 +272,7 @@ export class TaskExecutor {
         customProfile: json(selected), skills: json(this.config.board.skills), graph: json(graph), contract: EXECUTE_CONTRACT,
       });
       const executeSnapshot = this.snapshot("execute", executionId, graph, selected, rendered);
-      const running = this.workers.execute(worker, "execute", rendered.text, PHASE_TIMEOUT_MS.execute, this.config.taskDir, signal, undefined, this.workerOptions(executionId));
+      const running = this.workers.execute(worker, "execute", rendered.text, PHASE_TIMEOUT_MS.execute, this.prepareWorkerTmp(), signal, undefined, this.workerOptions(executionId));
       handedOff = true;
       const first = await running;
       let output: ReturnType<typeof parseExecute>;
@@ -245,16 +291,116 @@ export class TaskExecutor {
       const artifact = output.artifact
         ? await this.uploadContent(projectId, output.artifact.filename, output.artifact.mediaType, output.artifact.content)
         : null;
-      const concluded = await this.graph.conclude(projectId, intent.id, {
+      await this.graph.conclude(projectId, intent.id, {
         description: output.description, artifact, concludedBy: `${finalized ? "finalize" : "execute"}:${executionId}`,
       });
-      this.federation.publish(
-        { projectId, factId: concluded.fact.id, description: concluded.fact.description },
-        intent.from.filter((ref) => ref.projectId === projectId),
-      );
+      // Path abstracts and Federation broadcast are NOT generated here: the
+      // pre-Plan hook (syncPaths) owns them so Execute stays a single Worker
+      // round-trip and analysis happens synchronously before the next Plan.
     } finally {
-      if (!handedOff) this.workers.release(worker);
+      if (!handedOff) this.workers.release(worker, "execute");
     }
+  }
+
+  /**
+   * Pre-Plan Federation hook, also run once per Project at Runtime startup.
+   * Ensures every current leaf has an incremental `path_abs_<factId>` artifact,
+   * recursively filling a missing predecessor first, then broadcasts the leaf
+   * FactRef and Path Abstract path to every same-scope Project.
+   */
+  async syncPaths(projectId: string, signal?: AbortSignal): Promise<void> {
+    const graph = await this.graph.getProject(projectId);
+    for (const fact of leafFacts(graph)) {
+      if (fact.id !== "origin") await this.ensurePathAbstract(projectId, graph, fact.id, signal, new Set());
+    }
+    for (const path of computePaths(graph)) {
+      this.federation.publishPath({
+        projectId, leaf: path.leaf, pathAbs: pathAbstractRelativePath(path.leaf.id),
+        segments: path.segments.map((segment) => segment.map((step) => step.fact)),
+      });
+    }
+  }
+
+  private async cachedPathAbstract(projectId: string, factId: string): Promise<PathAbstract | null> {
+    try {
+      return await this.graph.getPathAbstract(projectId, factId);
+    } catch (error) {
+      if (error instanceof GraphClientError && error.status === 404) return null;
+      throw error;
+    }
+  }
+
+  /**
+   * Builds one Fact's Path Abstract from that Fact and the already-verified
+   * abstracts of its direct predecessors. This keeps Analyze incremental and
+   * makes a merge explicit without replaying the whole ancestry.
+   */
+  private async ensurePathAbstract(
+    projectId: string,
+    graph: Awaited<ReturnType<GraphClient["getProject"]>>,
+    factId: string,
+    signal: AbortSignal | undefined,
+    visiting: Set<string>,
+  ): Promise<PathAbstract> {
+    const cached = await this.cachedPathAbstract(projectId, factId);
+    if (cached) return cached;
+    if (visiting.has(factId)) throw new Error(`PathAbstract dependency cycle at ${factId}`);
+    visiting.add(factId);
+    try {
+      const fact = graph.facts.find((item) => item.id === factId);
+      const producer = graph.intents.find((intent) => intent.to?.projectId === projectId && intent.to.id === factId);
+      if (!fact || !producer) throw new Error(`PathAbstract source is missing: ${projectId}/${factId}`);
+      const previous: Array<{ factRef: FactRef; pathAbs: ResolvedPathAbstract["pathAbs"] | null; abstract: PathAbstract | null }> = [];
+      for (const ref of producer.from.filter((item) => item.projectId === projectId)) {
+        const abstract = ref.id === "origin"
+          ? null
+          : await this.ensurePathAbstract(projectId, graph, ref.id, signal, visiting);
+        previous.push({
+          factRef: ref,
+          pathAbs: abstract ? { inputPath: pathAbstractPath(this.projectDir, ref.id), readOnly: true } : null,
+          abstract,
+        });
+      }
+      const [current] = await this.graph.resolveFactRefs(projectId, [factRef(projectId, fact)]);
+      if (!current) throw new Error(`Fact could not be resolved: ${projectId}/${factId}`);
+      await verifySources([current]);
+      const output = await this.analyzePath(projectId, current, previous, signal);
+      return await this.graph.putPathAbstract(projectId, factId, { factRef: current.ref, ...output });
+    } finally {
+      visiting.delete(factId);
+    }
+  }
+
+  private async analyzePath(
+    projectId: string,
+    current: ResolvedFactSource,
+    previous: Array<{ factRef: FactRef; pathAbs: ResolvedPathAbstract["pathAbs"] | null; abstract: PathAbstract | null }>,
+    signal?: AbortSignal,
+  ): Promise<Omit<PathAbstract, "factRef">> {
+    const executionId = `analyze-${current.ref.id}`;
+    let output: Omit<PathAbstract, "factRef">;
+    const worker = this.workers.pick("plan");
+    if (!worker) {
+      output = fallbackAbstract(current, previous);
+    } else {
+      const context = { current, previous };
+      const rendered = renderPrompt("analyze", {
+        skills: json(this.config.board.skills), context: json(context), contract: ANALYZE_CONTRACT,
+      });
+      this.snapshot("analyze", executionId, context, null, rendered);
+      try {
+        output = await withPhaseRetries("analyze", MAX_PHASE_ATTEMPTS, async () => {
+          const result = await this.workers.execute(worker, "plan", rendered.text, PHASE_TIMEOUT_MS.analyze, this.prepareWorkerTmp(), signal, undefined, this.workerOptions(executionId));
+          requireSuccess(result, "analyze");
+          return phaseParse(() => parseAnalyze(result.text));
+        }, signal, (attempt, attempts, message) => this.logEvent("phase_retry", { projectId, phase: "analyze", executionId, attempt, attempts, message }));
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        this.logEvent("analyze_fallback", { projectId, leafFactId: current.ref.id, message: (error as Error).message });
+        output = fallbackAbstract(current, previous);
+      }
+    }
+    return output;
   }
 
   private async finalize(
@@ -273,7 +419,7 @@ export class TaskExecutor {
       boundExecution: json(boundExecution), contract: EXECUTE_CONTRACT,
     });
     this.snapshot("finalize", executionId, graph, selected, rendered, executionId);
-    const result = await this.workers.execute(worker, "execute", rendered.text, PHASE_TIMEOUT_MS.finalize, this.config.taskDir, signal, session, this.workerOptions(executionId));
+    const result = await this.workers.execute(worker, "execute", rendered.text, PHASE_TIMEOUT_MS.finalize, this.prepareWorkerTmp(), signal, session, this.workerOptions(executionId));
     requireSuccess(result, `finalize ${projectId}`);
     return parseExecute(result.text);
   }
@@ -341,15 +487,29 @@ export class TaskExecutor {
   }
 
   /**
-   * Per-execute options shared by every phase dispatch: the Project-scoped
-   * runtime scratch directory (`.tmp`, used by resumable CLI protocols such
-   * as Pi for session caches) and a spawn callback that lets the Runtime
-   * record the child PID in its ExecutionRegistry snapshot. Finalize reuses
-   * the Execute execution id so the same PID slot is updated.
+   * Creates and returns the Project-scoped scratch directory used as every
+   * Worker subprocess cwd. This contains relative files emitted by an Agent
+   * CLI instead of allowing them to pollute the Board directory. Recreating
+   * it here also supports an explicitly reopened Project after prior cleanup.
    */
-  private workerOptions(executionId: string): { tmpDir?: string; onSpawn?: (pid: number) => void } {
-    const options: { tmpDir?: string; onSpawn?: (pid: number) => void } = {};
-    if (this.tmpDir) options.tmpDir = this.tmpDir;
+  private prepareWorkerTmp(): string {
+    const path = this.runtimeTmpDir();
+    mkdirSync(path, { recursive: true });
+    return path;
+  }
+
+  private runtimeTmpDir(): string {
+    return this.tmpDir ?? projectTmpDir(this.projectDir);
+  }
+
+  /**
+   * Per-execute options shared by every phase dispatch: the Project-scoped
+   * runtime scratch directory (`.tmp`, also used as the subprocess cwd and by
+   * resumable CLI protocols for session caches) and a spawn callback that lets
+   * Runtime record the child PID. Finalize reuses the Execute execution id.
+   */
+  private workerOptions(executionId: string): { tmpDir: string; onSpawn?: (pid: number) => void } {
+    const options: { tmpDir: string; onSpawn?: (pid: number) => void } = { tmpDir: this.runtimeTmpDir() };
     if (this.reportSpawn) options.onSpawn = (pid: number) => this.reportSpawn!(executionId, pid);
     return options;
   }
@@ -362,9 +522,8 @@ export class TaskExecutor {
    * active; idempotent and safe to retry every tick while it stays inactive.
    */
   cleanupRuntimeTmp(): void {
-    if (!this.tmpDir) return;
     try {
-      rmSync(this.tmpDir, { recursive: true, force: true });
+      rmSync(this.runtimeTmpDir(), { recursive: true, force: true });
     } catch (error) {
       process.stderr.write(`[peak] failed to clean up runtime tmp: ${(error as Error).message}\n`);
     }
@@ -372,10 +531,7 @@ export class TaskExecutor {
 }
 
 function renderPrompt(name: string, replacements: Record<string, string>): RenderedPrompt {
-  const candidates = [join(MODULE_DIR, "prompts", `${name}.md`), join(MODULE_DIR, "runtime", "prompts", `${name}.md`)];
-  const path = candidates.find((candidate) => { try { return statSync(candidate).isFile(); } catch { return false; } });
-  if (!path) throw new Error(`prompt not found: ${name}`);
-  const template = readFileSync(path, "utf8");
+  const template = loadPromptTemplate(name);
   const tokens = [...new Set([...template.matchAll(/\{([A-Za-z][A-Za-z0-9]*)\}/g)].map((match) => match[1]!))];
   const unknown = tokens.find((token) => !(token in replacements));
   const unused = Object.keys(replacements).find((key) => !tokens.includes(key));
@@ -385,9 +541,19 @@ function renderPrompt(name: string, replacements: Record<string, string>): Rende
   return { text, templateDigest: sha256(template) };
 }
 
+/** Embedded first, with the dist on-disk file as fallback (the dev flow and existing dist layout are unchanged). */
+function loadPromptTemplate(name: string): string {
+  const embedded = EMBEDDED_PROMPTS[name];
+  if (embedded !== undefined) return embedded;
+  const candidates = [join(MODULE_DIR, "prompts", `${name}.md`), join(MODULE_DIR, "runtime", "prompts", `${name}.md`)];
+  const path = candidates.find((candidate) => { try { return statSync(candidate).isFile(); } catch { return false; } });
+  if (!path) throw new Error(`prompt not found: ${name}`);
+  return readFileSync(path, "utf8");
+}
+
 function validatePromptTemplates(): void {
   renderPrompt("plan", {
-    customProfile: "null", skills: "[]", source: "source", goal: "goal", graph: "{}",
+    customProfile: "null", skills: "[]", graph: "{}",
     executeCustomProfiles: "[]", maxIntents: "3", contract: "contract",
   });
   renderPrompt("supervise", { customProfile: "null", graph: "{}", contract: "contract" });
@@ -395,18 +561,14 @@ function validatePromptTemplates(): void {
   renderPrompt("execute-finalize", {
     customProfile: "null", skills: "[]", graph: "{}", boundExecution: "{}", contract: "contract",
   });
-}
-
-function planCurrentState(graph: PlanGraphView): Omit<PlanGraphView, "source" | "goal"> {
-  const { source: _source, goal: _goal, ...current } = graph;
-  return current;
+  renderPrompt("analyze", { skills: "[]", context: "{}", contract: "contract" });
 }
 
 async function verifySources(sources: ResolvedFactSource[]): Promise<void> {
   for (const source of sources) {
     const artifact = source.fact.artifact;
     if (artifact === null) continue;
-    if (artifact.readOnly !== true || !isAbsolute(artifact.inputPath)) throw new Error(`invalid Artifact input path: ${source.ref.factId}`);
+    if (artifact.readOnly !== true || !isAbsolute(artifact.inputPath)) throw new Error(`invalid Artifact input path: ${source.ref.id}`);
     const stat = lstatSync(artifact.inputPath);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== artifact.sizeBytes) {
       throw new Error(`Artifact size or type mismatch: ${artifact.sha256}`);
@@ -422,6 +584,40 @@ function profileValue(profile: CustomProfileDefinition | undefined): ProfileValu
 function profileValue(profile: CustomProfileDefinition | undefined): ProfileValue | null {
   return profile ? { ...profile, digest: customProfileDigest(profile) } : null;
 }
+
+/** Applies the shared byte budget without flattening the public Plan shape. */
+function budgetPlanGraphView(
+  projectId: string,
+  current: PlanProjectView,
+  external: ResolvedPathAbstract[],
+): PlanGraphView {
+  const project = {
+    ...current,
+    leafFacts: [...current.leafFacts],
+    openIntents: [...current.openIntents],
+    unconsumedHints: [...current.unconsumedHints],
+  };
+  const output: PlanGraphView = {
+    projects: { [projectId]: project }, external: [...external], truncated: false,
+    omitted: { leafFacts: 0, openIntents: 0, unconsumedHints: 0, external: 0 },
+  };
+  if (Buffer.byteLength(json(output), "utf8") <= GRAPH_VIEW_MAX_BYTES) return output;
+  output.truncated = true;
+  const lists: Array<[keyof PlanGraphView["omitted"], unknown[]]> = [
+    ["external", output.external],
+    ["unconsumedHints", project.unconsumedHints],
+    ["openIntents", project.openIntents],
+    ["leafFacts", project.leafFacts],
+  ];
+  while (Buffer.byteLength(json(output), "utf8") > GRAPH_VIEW_MAX_BYTES) {
+    const entry = lists.find(([, values]) => values.length > 0);
+    if (!entry) throw new Error(`Graph view exceeds ${GRAPH_VIEW_MAX_BYTES} byte budget`);
+    entry[1].pop();
+    output.omitted[entry[0]] += 1;
+  }
+  return output;
+}
+
 export function budgetGraphView<T extends Record<string, unknown>>(
   view: T,
   listKeys: Array<keyof T>,
@@ -530,20 +726,15 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 }
 function preview(value: string): string { return value.replace(/\s+/g, " ").slice(0, 1_200); }
 
-/** Appends one JSON line to a Project's logs/main.log in the same format as Graph events. */
-function writeProjectLog(projectDir: string, type: string, data: Record<string, unknown>): void {
-  const logs = initializeProjectLogsDirectory(projectDir);
-  appendFileSync(join(logs, "main.log"), `${JSON.stringify({ at: localTimestamp(), type, ...data })}\n`);
+function factRef(projectId: string, fact: { id: string; description: string }): FactRef {
+  return { projectId, id: fact.id, description: fact.description };
 }
-function visibleRefs(projectId: string, facts: Array<{ id: string; description: string }>, pending: FederationReference[]): Map<string, string> {
-  return new Map([
-    ...facts.map((fact): [string, string] => [`${projectId}/${fact.id}`, fact.description]),
-    ...pending.map((ref): [string, string] => [`${ref.projectId}/${ref.factId}`, ref.description]),
-  ]);
+function visibleRefs(projectId: string, facts: Array<{ id: string; description: string }>): Map<string, string> {
+  return new Map(facts.map((fact): [string, string] => [`${projectId}/${fact.id}`, fact.description]));
 }
 function validateVisible(refs: FactRef[], visible: Map<string, string>): void {
   for (const ref of refs) {
-    const key = `${ref.projectId}/${ref.factId}`;
+    const key = `${ref.projectId}/${ref.id}`;
     if (!visible.has(key)) throw new Error(`FactRef is not visible: ${key}`);
     if (visible.get(key) !== ref.description) throw new Error(`FactRef description mismatch: ${key}`);
   }
@@ -569,10 +760,22 @@ function validateHints(ids: string[], hints: Array<{ id: string }>): void {
 }
 
 const planContract = (maxIntents: number, hasProfiles: boolean): string => [
-  `intents: {"kind":"intents","intents":[{"from":[{"projectId":"...","factId":"...","description":"..."}],"hintIds":[]${hasProfiles ? ',"customProfile":null' : ""},"description":"..."}]} (1-${maxIntents})`,
-  'complete: {"kind":"complete","from":[{"projectId":"...","factId":"...","description":"..."}],"hintIds":[],"description":"..."}',
+  `intents: {"kind":"intents","intents":[{"from":[{"projectId":"...","id":"...","description":"..."}],"hintIds":[]${hasProfiles ? ',"customProfile":null' : ""},"description":"..."}]} (1-${maxIntents})`,
+  'complete: {"kind":"complete","from":[{"projectId":"...","id":"...","description":"..."}],"hintIds":[],"description":"..."}',
   'noop: {"kind":"noop"}',
   'Copy FactRefs exactly. Use no undeclared fields. Each Intent is one atomic transition to one Fact.',
 ].join("\n");
 const SUPERVISE_CONTRACT = '{"kind":"hint","content":"..."} or {"kind":"noop"}; no undeclared fields.';
+const ANALYZE_CONTRACT = '{"pathOverview":"...","verifiedCore":["..."]}; 1-16 verifiedCore items; no undeclared fields.';
+
+function fallbackAbstract(
+  current: ResolvedFactSource,
+  previous: Array<{ factRef: FactRef; abstract: PathAbstract | null }>,
+): Omit<PathAbstract, "factRef"> {
+  const prefix = previous.map((item) => item.abstract?.pathOverview ?? item.factRef.description);
+  return {
+    pathOverview: [...prefix, current.ref.description].join(" → "),
+    verifiedCore: [current.ref.description],
+  };
+}
 const EXECUTE_CONTRACT = 'Return exactly one JSON object with nothing before or after it (no prose, no code fences). {"kind":"fact","description":"<trimmed standalone summary, at most 1 KiB UTF-8>","artifact":null} or {"kind":"fact","description":"...","artifact":{"filename":"...","mediaType":"...","content":"<full file content, inline>"}}. Use only these fields; extra fields are rejected. If the result is longer than 1 KiB, keep description short and put the detail in the artifact content.';

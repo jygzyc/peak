@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { WorkerConfig } from "../dist/config/types.js";
+import type { WorkerConfig } from "../dist/utils/types.js";
 import { buildPiArgv, piProtocol } from "../dist/worker/backends/pi.js";
 import type { ProcessResult, WorkerCall } from "../dist/worker/types.js";
 
@@ -15,7 +15,7 @@ function piWorker(model?: string): WorkerConfig {
 }
 
 function call(config: WorkerConfig, tmpDir = "/sessions", session?: { workerType: "pi"; value: string }): WorkerCall {
-  return { workerName: "pi", config, taskType: "execute", prompt: "prompt", cwd: process.cwd(), tmpDir, session };
+  return { config, prompt: "prompt", tmpDir, session };
 }
 
 function jsonl(lines: Array<Record<string, unknown>>): string {

@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, createReadStream, createWriteStream, existsSync, lstatSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, createWriteStream, existsSync, lstatSync, renameSync, rmSync } from "node:fs";
 import { once } from "node:events";
 import { join, resolve } from "node:path";
 import type { Readable } from "node:stream";
-import { initializeArtifactDirectory } from "../config/paths.js";
+import { initializeArtifactDirectory } from "../utils/paths.js";
 import type { ArtifactRef } from "./types.js";
 
 export class ArtifactStore {
@@ -11,20 +11,6 @@ export class ArtifactStore {
 
   constructor(readonly projectDir: string) {
     this.dir = initializeArtifactDirectory(projectDir);
-  }
-
-  saveBuffer(input: string | Buffer, mediaType: string, filename: string | null = null): ArtifactRef {
-    const buffer = Buffer.isBuffer(input) ? input : Buffer.from(input, "utf8");
-    const sha256 = createHash("sha256").update(buffer).digest("hex");
-    const target = join(this.dir, sha256);
-    if (existsSync(target)) {
-      const existing = lstatSync(target);
-      if (!existing.isFile() || existing.isSymbolicLink()) throw new Error("invalid artifact target");
-    } else {
-      writeFileSync(target, buffer, { flag: "wx" });
-    }
-    chmodSync(target, 0o444);
-    return { path: `artifacts/${sha256}`, sha256, mediaType, sizeBytes: buffer.length, filename };
   }
 
   async save(input: Readable, mediaType: string, maxBytes: number, filename: string | null = null): Promise<ArtifactRef> {
@@ -71,7 +57,6 @@ export class ArtifactStore {
     return path;
   }
 
-  stream(sha256: string): Readable { return createReadStream(this.path(sha256)); }
   remove(sha256: string): void {
     const path = join(this.dir, sha256);
     if (existsSync(path)) chmodSync(path, 0o644);

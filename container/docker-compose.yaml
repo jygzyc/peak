@@ -1,0 +1,37 @@
+# peak-task 镜像的对外编排接口。Peak 自身生成并执行全部 docker 命令
+# （peak start --docker），日常任务不需要 compose；本文件面向两类场景：
+#   1. adb 连接 USB 物理设备（见下方说明）；
+#   2. 纳入既有 compose/K8s 编排体系时的参考封装。
+# 镜像构建不在 Peak 仓库范围内（见 container/AUTH.md），compose 的 build
+# 段只是手动替代；四个 agent CLI 一律安装最新版，无版本参数。
+#
+# adb 连接 USB 物理设备：
+#   - Linux 主机：挂载 /dev/bus/usb + privileged 即可，容器内 `adb devices`
+#     直接看到物理设备（建议先在主机 `adb kill-server`，避免容器与主机
+#     争抢 adbd 对设备的独占）。
+#   - Windows（Docker Desktop）：无原生 USB 直通，先用 usbipd-win
+#     （`usbipd bind` + `usbipd attach --wsl`）把设备挂进 WSL2 后端，容器
+#     内同样可见。
+#   - macOS：USB 直通不可用，改用 network adb（设备开 adb over TCP 后
+#     `adb connect <device-ip>:5555`，按需打开 network_mode: host 或端口映射）。
+services:
+  peak-task:
+    image: peak-task:${PEAK_VERSION:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    privileged: true # adb USB 访问所需；纯逆向/分析场景可移除
+    volumes:
+      - /dev/bus/usb:/dev/bus/usb # Linux USB 直通（其他平台见上文）
+      # 按 task 自行追加（等价 peak start --docker 生成的挂载）：
+      # - /data/peak/projects/<uuid>:/peak/projects/<uuid>
+      # - /path/to/board:/board
+      # worker 登录态目录（rw，等价 peak start --docker 的自动挂载，见 AUTH.md）：
+      # - ~/.claude:/root/.claude
+      # - ~/.codex:/root/.codex
+      # - ~/.local/share/opencode:/root/.local/share/opencode
+      # - ~/.pi:/root/.pi
+      # 主机 Skills（rw，等价 peak start --docker 的自动挂载；~/.claude/skills 随上面的 ~/.claude 进入）：
+      # - ~/.agents/skills:/root/.agents/skills
+    # network_mode: host # network adb / 需要容器监听端口对宿主可达时打开
+    command: ["--help"]

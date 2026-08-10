@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { RuntimeStatus, RUNTIME_HEARTBEAT_WINDOW_MS } from "../dist/runtime/runtime-status.js";
+import { RuntimeStatus, RUNTIME_HEARTBEAT_WINDOW_MS } from "../dist/runtime/runtime-api.js";
 
 test("RuntimeStatus advances heartbeatAt and sequence once started", async () => {
   const status = new RuntimeStatus();

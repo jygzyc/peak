@@ -4,7 +4,7 @@ Convert the bound Execute's existing work into one valid Fact. Do not expand its
 
 Base the Fact only on results already confirmed in the bound Execute; no plans, guesses, or filler.
 
-Strict output rules (same as Execute): one JSON object, no prose or fences; `description` at most 1 KiB UTF-8, detail in the inline Artifact; only the contract fields; never write files.
+Strict output rules (same as Execute): one JSON object, no prose or fences; `description` at most 1 KiB UTF-8, detail in the inline Artifact; only the contract fields. Read/write temporary files only inside the current Project `.tmp`; return Artifact content inline, never as a local path.
 
 Optional profile:
 {customProfile}

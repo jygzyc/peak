@@ -19,6 +19,8 @@
  *
  * `prepare` builds and verifies dist/ for the npm prepack lifecycle.
  * `archive` packs that prepared output into dist-packages/.
+ * `binary` compiles a single-file bun binary for the host platform into
+ * dist-packages/ (additional artifact; not part of the npm publish flow).
  * With no mode, both phases run. Idempotent. Runnable via `npm run pack`.
  */
 import { build } from "esbuild";
@@ -50,10 +52,15 @@ const outDir = join(root, "dist-packages");
 const npmCache = mkdtempSync(join(tmpdir(), "peak-npm-cache-"));
 const mode = process.argv[2] ?? "all";
 
-if (!new Set(["all", "prepare", "archive"]).has(mode)) {
+if (!new Set(["all", "prepare", "archive", "binary"]).has(mode)) {
   process.stderr.write(`unknown pack mode: ${mode}\n`);
   process.exit(2);
 }
+
+const doPrepare = mode === "all" || mode === "prepare";
+const doArchive = mode === "all" || mode === "archive";
+const doBinary = mode === "binary";
+let binaryPath = "";
 
 const EXTERNAL = [
   "commander",
@@ -61,7 +68,7 @@ const EXTERNAL = [
 ];
 
 try {
-  if (mode !== "archive") await step("check scripts", () => {
+  if (doPrepare) await step("check scripts", () => {
     const result = spawnSync(process.execPath, [join(root, "scripts", "check-scripts.mjs")], {
       cwd: root,
       stdio: "inherit",
@@ -69,7 +76,16 @@ try {
     if (result.status !== 0) process.exit(result.status ?? 1);
   });
 
-  if (mode !== "archive") await step("typecheck", () => {
+  if (doPrepare || doBinary) await step("embed assets", () => {
+    // src references the generated file; it must be generated before typecheck / bun compile.
+    const result = spawnSync(process.execPath, [join(root, "scripts", "embed-assets.mjs")], {
+      cwd: root,
+      stdio: "inherit",
+    });
+    if (result.status !== 0) process.exit(result.status ?? 1);
+  });
+
+  if (doPrepare) await step("typecheck", () => {
     const npm = npmInvocation(["run", "typecheck"]);
     const result = spawnSync(npm.command, npm.args, {
       cwd: root,
@@ -82,20 +98,20 @@ try {
     }
   });
 
-  if (mode !== "archive") await step("clean dist", () => {
+  if (doPrepare) await step("clean dist", () => {
     rmSync(distDir, { recursive: true, force: true });
     mkdirSync(distDir, { recursive: true });
   });
 
-  if (mode !== "archive") await step("copy runtime assets", () => {
+  if (doPrepare) await step("copy runtime assets", () => {
     mkdirSync(join(distDir, "ui"), { recursive: true });
-    for (const name of ["dashboard.html", "preview.html"]) {
+    for (const name of ["dashboard.html", "preview.html", "tasks.html"]) {
       copyFileSync(join(root, "src", "ui", name), join(distDir, "ui", name));
     }
     cpDirectory(join(root, "src", "runtime", "prompts"), join(distDir, "runtime", "prompts"));
   });
 
-  if (mode !== "archive") await step("esbuild bundle", async () => {
+  if (doPrepare) await step("esbuild bundle", async () => {
     await build({
       entryPoints: [srcEntry],
       outfile: distEntry,
@@ -119,7 +135,7 @@ try {
     }
   });
 
-  if (mode !== "archive") await step("verify bundle", () => {
+  if (doPrepare) await step("verify bundle", () => {
     if (!existsSync(distEntry)) {
       process.stderr.write(`bundle did not produce ${distEntry}\n`);
       process.exit(1);
@@ -153,7 +169,7 @@ try {
     }
   });
 
-  if (mode !== "archive") await step("dist package", () => {
+  if (doPrepare) await step("dist package", () => {
     // Only the compiled result is published: dist/ becomes a self-contained
     // package with its own manifest (name/version/bin/deps), README, LICENSE
     // and the version file (`src/cli.ts` resolves `version` next to the
@@ -179,8 +195,8 @@ try {
     }
   });
 
-  if (mode !== "prepare") await step("sync version", () => {
-    // version 文件是唯一版本来源；npm pack 读取 package.json，因此先同步。
+  if (doArchive) await step("sync version", () => {
+    // The version file is the single source of truth; npm pack reads package.json, so sync it first.
     const fileVersion = readFileSync(join(root, "version"), "utf8").trim();
     const packageJsonPath = join(root, "package.json");
     const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf-8"));
@@ -191,7 +207,7 @@ try {
     }
   });
 
-  if (mode !== "prepare") await step("npm pack", () => {
+  if (doArchive) await step("npm pack", () => {
     rmSync(outDir, { recursive: true, force: true });
     mkdirSync(outDir, { recursive: true });
 
@@ -250,14 +266,14 @@ try {
     const bundleBytes = statSync(distEntry).size;
     const manifest = {
       name: entry.name,
-      version: entry.version, // 与 version 文件同步（npm pack 前已同步 package.json）
+      version: entry.version, // In sync with the version file (package.json is synced before npm pack)
       fileName,
       size: bytes.length,
       unpackedSize: entry.unpackedSize,
       sha256: createHash("sha256").update(bytes).digest("hex"),
       bundle: {
         entry: "src/cli.ts",
-        output: "cli.js", // 位于发布包根（dist package 自身是包根）
+        output: "cli.js", // At the package root (the dist package is itself the package root)
         bundleBytes,
         external: EXTERNAL,
         format: "esm",
@@ -271,6 +287,63 @@ try {
 
     writeFileSync(join(outDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
     process.stdout.write(`${JSON.stringify(manifest, null, 2)}\n`);
+  });
+
+  // Binary mode is an additional artifact: bun compiles a single-file binary for the host platform; the npm publish flow (all) is unchanged.
+  if (doBinary) await step("check bun", () => {
+    const result = spawnSync("bun", ["--version"], { cwd: root, encoding: "utf-8" });
+    if (result.error || result.status !== 0) {
+      process.stderr.write("binary mode requires bun on PATH (https://bun.sh), but `bun --version` failed\n");
+      process.exit(1);
+    }
+  });
+
+  if (doBinary) await step("bun compile", () => {
+    mkdirSync(outDir, { recursive: true });
+    const fileVersion = readFileSync(join(root, "version"), "utf8").trim();
+    const binaryName = `peak-${fileVersion}-${process.platform}-${process.arch}${process.platform === "win32" ? ".exe" : ""}`;
+    binaryPath = join(outDir, binaryName);
+    // commander/tar are bundled into the binary by bun from node_modules; assets are already embedded at build time.
+    const result = spawnSync("bun", ["build", srcEntry, "--compile", "--outfile", binaryPath], {
+      cwd: root,
+      stdio: "inherit",
+    });
+    if (result.status !== 0) process.exit(result.status ?? 1);
+  });
+
+  if (doBinary) await step("verify binary", () => {
+    if (!existsSync(binaryPath)) {
+      process.stderr.write(`bun compile did not produce ${binaryPath}\n`);
+      process.exit(1);
+    }
+    const workers = spawnSync(binaryPath, ["workers"], {
+      cwd: root,
+      encoding: "utf-8",
+      maxBuffer: 1024 * 1024 * 10,
+    });
+    if (workers.status !== 0) {
+      process.stderr.write(`binary verification failed: \`${binaryPath} workers\` exited non-zero\n`);
+      process.stderr.write(workers.stderr || workers.stdout);
+      process.exit(workers.status ?? 1);
+    }
+    try {
+      const parsed = JSON.parse(workers.stdout);
+      if (!parsed || typeof parsed !== "object") {
+        throw new Error("workers output is not a JSON object");
+      }
+    } catch (err) {
+      process.stderr.write(`binary verification: workers output is not valid JSON: ${err.message}\n`);
+      process.exit(1);
+    }
+    const fileVersion = readFileSync(join(root, "version"), "utf8").trim();
+    const versionOutput = spawnSync(binaryPath, ["--version"], { cwd: root, encoding: "utf-8" });
+    if (versionOutput.status !== 0 || versionOutput.stdout.trim() !== fileVersion) {
+      process.stderr.write(
+        `binary verification: --version output ${JSON.stringify(versionOutput.stdout?.trim())} does not match version file ${fileVersion}\n`,
+      );
+      process.exit(1);
+    }
+    process.stdout.write(`[pack] binary verified: ${binaryPath}\n`);
   });
 } finally {
   rmSync(npmCache, { recursive: true, force: true });

@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import type { ResolvedTaskConfig } from "../dist/config/types.js";
+import type { ResolvedTaskConfig } from "../dist/utils/types.js";
 import { AgentRuntime } from "../dist/runtime/agent-runtime.js";
 
 function configuration(root: string): ResolvedTaskConfig {

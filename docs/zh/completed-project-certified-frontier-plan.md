@@ -10,7 +10,7 @@
 
 - active Project 仍只发布 current leaf frontier；
 - completed Project 发布不可变的 `certified proof frontier`；
-- 目标 Project仍只持久化 `{projectId,factId,description}` FactRef；
+- 目标 Project仍只持久化 `{projectId,id,description}` FactRef；
 - 不复制源 Fact、Artifact 或 Graph；
 - 不允许未参与 Goal 证明的历史 Fact 进入 Federation；
 - completed Project 的状态、Graph 和完成时点不受广播与下游消费影响。
@@ -30,7 +30,7 @@
 3. 闭包内绑定 Artifact 的本地 Fact；
 4. 去重后按 Graph 创建顺序稳定排序；
 5. `origin`、`goal`、闭包外 Fact 和空泛中间节点不发布；
-6. 每项仍是规范 `{projectId,factId,description}`。
+6. 每项仍是规范 `{projectId,id,description}`。
 
 最终汇总 Fact必须保留；merge 输入与 Artifact Fact用于补充独立证据。第一版不让 AI 选择发布集合，保证恢复和测试确定性。
 
@@ -89,7 +89,7 @@ Registration 增加源 Project 状态和 publication kind：
   "frontierVersion": 1,
   "targetProjectId": "...",
   "projectId": "...",
-  "factId": "...",
+  "id": "...",
   "description": "..."
 }
 ```

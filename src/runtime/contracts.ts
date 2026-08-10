@@ -3,12 +3,13 @@ import {
 } from "../graph/api.js";
 import type { FactRef } from "../graph/types.js";
 
-export type PlanOutput =
+type PlanOutput =
   | { kind: "complete"; from: FactRef[]; hintIds: string[]; description: string }
   | { kind: "intents"; intents: Array<{ from: FactRef[]; customProfile: string | null; hintIds: string[]; description: string }> }
   | { kind: "noop" };
-export type SuperviseOutput = { kind: "hint"; content: string } | { kind: "noop" };
-export type ExecuteOutput = {
+type SuperviseOutput = { kind: "hint"; content: string } | { kind: "noop" };
+type AnalyzeOutput = { pathOverview: string; verifiedCore: string[] };
+type ExecuteOutput = {
   kind: "fact";
   description: string;
   artifact: { filename: string | null; mediaType: string; content: string } | null;
@@ -36,6 +37,18 @@ export function parsePlan(text: string, maxIntents: number, availableCustomProfi
     }) };
   }
   throw new Error("invalid plan kind");
+}
+
+export function parseAnalyze(text: string): AnalyzeOutput {
+  const value = record(text);
+  exact(value, ["pathOverview", "verifiedCore"]);
+  if (!Array.isArray(value.verifiedCore) || value.verifiedCore.length === 0 || value.verifiedCore.length > 16) {
+    throw new Error("verifiedCore must contain 1-16 items");
+  }
+  return {
+    pathOverview: description(value.pathOverview, "pathOverview"),
+    verifiedCore: value.verifiedCore.map((item) => shortDescription(item, "verifiedCore")),
+  };
 }
 
 export function parseSupervise(text: string): SuperviseOutput {
@@ -149,10 +162,10 @@ function refs(value: unknown): FactRef[] {
   if (!Array.isArray(value) || value.length === 0) throw new Error("FactRef array must not be empty");
   return value.map((item) => {
     const ref = asRecord(item, "FactRef");
-    exact(ref, ["projectId", "factId", "description"]);
+    exact(ref, ["projectId", "id", "description"]);
     return {
       projectId: description(ref.projectId, "projectId"),
-      factId: description(ref.factId, "factId"),
+      id: description(ref.id, "id"),
       description: description(ref.description),
     };
   });

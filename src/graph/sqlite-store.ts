@@ -1,6 +1,8 @@
+import { writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { join } from "node:path";
-import { backup, DatabaseSync } from "node:sqlite";
-import { initializeProjectDirectory } from "../config/paths.js";
+import type { DatabaseSync, StatementSync } from "node:sqlite";
+import { initializeProjectDirectory } from "../utils/paths.js";
 import {
   ApiError, localTimestamp, requireCustomProfileDigest, requireDescription, requireFactDescription, requireIntentDescription, requireShortDescription,
 } from "./api.js";
@@ -11,11 +13,11 @@ import {
 
 export class SqliteStore {
   readonly database: DatabaseSync;
-  readonly projectDir: string;
+  private readonly projectDir: string;
 
   constructor(projectDir: string) {
     this.projectDir = initializeProjectDirectory(projectDir);
-    this.database = new DatabaseSync(join(this.projectDir, "analysis.db"));
+    this.database = backend.open(join(this.projectDir, "project.db"));
     this.database.exec("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;");
     this.database.exec(SCHEMA);
     this.migrateSchema();
@@ -23,7 +25,7 @@ export class SqliteStore {
 
   initialize(id: string, input: CreateProjectInput): ProjectMeta {
     if (this.project()) throw new Error("project already initialized");
-    const now = timestamp();
+    const now = localTimestamp();
     this.transaction(() => {
       this.database.prepare("INSERT INTO project(id,title,status,scope,created_at) VALUES(?,?,?,?,?)")
         .run(id, requireShortDescription(input.title, "title"), "active", input.scope ?? null, now);
@@ -39,7 +41,7 @@ export class SqliteStore {
   close(): void { this.database.close(); }
 
   async backupTo(path: string): Promise<void> {
-    await backup(this.database, path);
+    await backend.backup(this.database, path);
   }
 
   validatePortableArchive(): void {
@@ -69,7 +71,7 @@ export class SqliteStore {
     return { project, facts: this.facts(), intents: this.intents(project.id), hints: this.hints() };
   }
 
-  facts(): Fact[] {
+  private facts(): Fact[] {
     return this.database.prepare(`SELECT f.*,a.path,a.media_type,a.size_bytes,a.filename FROM facts f
       LEFT JOIN artifacts a ON a.sha256=f.artifact_sha256 ORDER BY f.created_at,f.id`).all().map(fact);
   }
@@ -80,7 +82,7 @@ export class SqliteStore {
     return row ? fact(row) : undefined;
   }
 
-  intents(projectId: string): Intent[] {
+  private intents(projectId: string): Intent[] {
     const rows = this.database.prepare("SELECT * FROM intents ORDER BY created_at,id").all();
     const sources = this.database.prepare("SELECT * FROM intent_sources ORDER BY intent_id,position").all();
     const descriptions = new Map(this.database.prepare("SELECT id,description FROM facts").all()
@@ -89,11 +91,11 @@ export class SqliteStore {
     return rows.map((row) => ({
       id: text(row.id),
       from: sources.filter((source) => source.intent_id === row.id).map((source) => ({
-        projectId: text(source.source_project_id), factId: text(source.source_fact_id),
+        projectId: text(source.source_project_id), id: text(source.source_fact_id),
         description: text(source.source_description),
       })),
       to: row.to_fact_id === null ? null : {
-        projectId, factId: text(row.to_fact_id), description: descriptions.get(text(row.to_fact_id))!,
+        projectId, id: text(row.to_fact_id), description: descriptions.get(text(row.to_fact_id))!,
       },
       customProfile: nullableNull(row.custom_profile),
       customProfileDigest: nullableNull(row.custom_profile_digest),
@@ -103,7 +105,7 @@ export class SqliteStore {
     }));
   }
 
-  hints(): Hint[] {
+  private hints(): Hint[] {
     return this.database.prepare("SELECT * FROM hints ORDER BY created_at,id").all().map((row) => ({
       id: text(row.id), content: text(row.content), creator: text(row.creator), createdAt: text(row.created_at),
       consumedByIntentId: nullableNull(row.consumed_by_intent_id), consumedAt: nullableNull(row.consumed_at),
@@ -112,10 +114,11 @@ export class SqliteStore {
 
   registerArtifact(ref: ArtifactRef): ArtifactRef {
     this.database.prepare(`INSERT INTO artifacts(sha256,path,media_type,size_bytes,filename,created_at) VALUES(?,?,?,?,?,?)
-      ON CONFLICT(sha256) DO NOTHING`).run(ref.sha256, ref.path, ref.mediaType, ref.sizeBytes, ref.filename, timestamp());
+      ON CONFLICT(sha256) DO NOTHING`).run(ref.sha256, ref.path, ref.mediaType, ref.sizeBytes, ref.filename, localTimestamp());
     return this.artifact(ref.sha256)!;
   }
 
+  /** Artifact hashes orphaned before the given local timestamp. */
   orphanArtifacts(before: string): string[] {
     return this.database.prepare(`SELECT a.sha256 FROM artifacts a LEFT JOIN facts f ON f.artifact_sha256=a.sha256
       WHERE f.id IS NULL AND a.created_at < ?`).all(before).map((row) => text(row.sha256));
@@ -140,7 +143,7 @@ export class SqliteStore {
     const existing = this.database.prepare("SELECT id FROM hints WHERE trim(content)=?").get(content);
     if (existing) throw new ApiError(409, "duplicate hint");
     const id = this.nextId("hint", "h");
-    const createdAt = timestamp();
+    const createdAt = localTimestamp();
     this.database.prepare("INSERT INTO hints(id,content,creator,created_at,consumed_by_intent_id,consumed_at) VALUES(?,?,?,?,NULL,NULL)")
       .run(id, content, requireShortDescription(input.creator, "creator"), createdAt);
     return { id, content, creator: input.creator.trim(), createdAt, consumedByIntentId: null, consumedAt: null };
@@ -150,7 +153,7 @@ export class SqliteStore {
     this.requireActive();
     if (input.from.length === 0) throw new ApiError(400, "intent requires a source");
     const id = this.nextId("intent", "i");
-    const createdAt = timestamp();
+    const createdAt = localTimestamp();
     const description = requireIntentDescription(input.description);
     const createdBy = requireShortDescription(input.createdBy, "createdBy");
     const customProfile = input.customProfile === undefined || input.customProfile === null
@@ -170,6 +173,12 @@ export class SqliteStore {
     return { id, from: input.from, to: null, customProfile, customProfileDigest, hintIds, description, createdBy, createdAt, concludedBy: null, concludedAt: null };
   }
 
+  /**
+   * Concludes an open Intent atomically: creates exactly one new immutable
+   * local Fact (optionally bound to a registered Artifact) and points the
+   * Intent's `to` at it in the same transaction. Concurrent conclusions race
+   * on `to_fact_id`, so only the first one wins.
+   */
   conclude(intentId: string, input: ConcludeInput): { intent: Intent; fact: Fact } {
     this.requireActive();
     const description = requireFactDescription(input.description);
@@ -182,7 +191,7 @@ export class SqliteStore {
       if (!intent) throw new ApiError(404, "intent not found");
       if (intent.to_fact_id !== null) throw new ApiError(409, "intent already concluded");
       const id = this.nextId("fact", "f");
-      const createdAt = timestamp();
+      const createdAt = localTimestamp();
       this.database.prepare("INSERT INTO facts(id,description,artifact_sha256,created_at) VALUES(?,?,?,?)")
         .run(id, description, artifact?.sha256 ?? null, createdAt);
       this.database.prepare("UPDATE intents SET to_fact_id=?,concluded_by=?,concluded_at=? WHERE id=?")
@@ -194,12 +203,18 @@ export class SqliteStore {
     return { intent, fact: created };
   }
 
+  /**
+   * Completes the Project atomically: creates the single completion Intent
+   * from the proof FactRefs to `goal` and flips the Project status to
+   * `completed` in one transaction. A Project with an existing completion is
+   * rejected with 409.
+   */
   complete(input: CompleteInput): Intent {
     this.requireActive();
     const current = this.database.prepare("SELECT id FROM intents WHERE to_fact_id='goal'").get();
     if (current) throw new ApiError(409, "project already has a completion");
     const id = this.nextId("intent", "i");
-    const now = timestamp();
+    const now = localTimestamp();
     const description = requireIntentDescription(input.description);
     const actor = requireShortDescription(input.completedBy, "completedBy");
     const hintIds = uniqueIds(input.hintIds ?? [], "hintIds");
@@ -213,13 +228,20 @@ export class SqliteStore {
     return this.intents(this.project()!.id).find((item) => item.id === id)!;
   }
 
+  /**
+   * Reopens a completed Project: deletes the completion Intent (releasing its
+   * consumed Hints), records the external feedback as a new immutable Fact
+   * sourced from all current local leaves via a concluded `External feedback`
+   * Intent, and flips the Project back to `active` — so work resumes from the
+   * feedback leaf, never from a stale historical node.
+   */
   reopen(input: ReopenInput): ProjectGraph {
     const project = this.project();
     if (!project || project.status !== "completed") throw new ApiError(409, "project is not completed");
     const completion = this.database.prepare("SELECT id FROM intents WHERE to_fact_id='goal'").get();
     if (!completion) throw new ApiError(409, "completion not found");
     const sources = leafFacts(this.graph()).map((fact): FactRef => ({
-      projectId: project.id, factId: fact.id, description: fact.description,
+      projectId: project.id, id: fact.id, description: fact.description,
     }));
     if (sources.length === 0) throw new ApiError(409, "completed project has no current leaf Facts");
     const description = requireFactDescription(input.description);
@@ -230,7 +252,7 @@ export class SqliteStore {
       this.database.prepare("DELETE FROM intents WHERE id=?").run(completion.id);
       const factId = this.nextId("fact", "f");
       const intentId = this.nextId("intent", "i");
-      const now = timestamp();
+      const now = localTimestamp();
       this.database.prepare("INSERT INTO facts(id,description,artifact_sha256,created_at) VALUES(?,?,?,?)")
         .run(factId, description, null, now);
       this.database.prepare(`INSERT INTO intents(id,to_fact_id,custom_profile,custom_profile_digest,description,created_by,created_at,concluded_by,concluded_at)
@@ -241,11 +263,6 @@ export class SqliteStore {
     return this.graph();
   }
 
-  setTitle(title: string): ProjectMeta {
-    this.database.prepare("UPDATE project SET title=?").run(requireShortDescription(title, "title"));
-    return this.project()!;
-  }
-
   setStatus(status: "active" | "stopped"): ProjectMeta {
     const project = this.project();
     if (!project || project.status === "completed") throw new ApiError(409, "completed project must be reopened");
@@ -253,26 +270,11 @@ export class SqliteStore {
     return this.project()!;
   }
 
-  externalReferences(projectId: string): number {
-    const row = this.database.prepare("SELECT count(*) count FROM intent_sources WHERE source_project_id=?").get(projectId);
-    return number(row?.count);
-  }
-
-  repairSourceDescriptions(resolveDescription: (projectId: string, factId: string) => string | undefined): void {
-    const rows = this.database.prepare(`SELECT intent_id,position,source_project_id,source_fact_id FROM intent_sources
-      WHERE source_description=''`).all();
-    const update = this.database.prepare("UPDATE intent_sources SET source_description=? WHERE intent_id=? AND position=?");
-    for (const row of rows) {
-      const description = resolveDescription(text(row.source_project_id), text(row.source_fact_id));
-      if (description !== undefined) update.run(description, row.intent_id, row.position);
-    }
-  }
-
   private insertSources(intentId: string, sources: FactRef[]): void {
     const insert = this.database.prepare(`INSERT INTO intent_sources(intent_id,position,source_project_id,source_fact_id,source_description)
       VALUES(?,?,?,?,?)`);
     sources.forEach((source, position) => insert.run(
-      intentId, position, source.projectId, source.factId, source.description,
+      intentId, position, source.projectId, source.id, source.description,
     ));
   }
 
@@ -329,7 +331,7 @@ export class SqliteStore {
   private nextId(counter: "fact" | "intent" | "hint", prefix: string): string {
     this.database.prepare("UPDATE counters SET value=value+1 WHERE name=?").run(counter);
     const row = this.database.prepare("SELECT value FROM counters WHERE name=?").get(counter);
-    return `${prefix}${String(number(row?.value)).padStart(3, "0")}`;
+    return `${prefix}${String(number(row?.value)).padStart(4, "0")}`;
   }
 
   private requireActive(): void {
@@ -382,8 +384,71 @@ function uniqueIds(values: string[], label: string): string[] {
   if (new Set(result).size !== result.length) throw new ApiError(400, `${label} contains duplicates`);
   return result;
 }
-function timestamp(): string { return localTimestamp(); }
 function text(value: unknown): string { return String(value); }
 function nullable(value: unknown): string | undefined { return value === null || value === undefined ? undefined : String(value); }
 function nullableNull(value: unknown): string | null { return value === null || value === undefined ? null : String(value); }
 function number(value: unknown): number { return Number(value ?? 0); }
+
+/** Minimal structural typing for bun:sqlite (no bun-types dependency). */
+interface BunStatement {
+  run(...params: unknown[]): { changes: number; lastInsertRowid: number | bigint };
+  get(...params: unknown[]): Record<string, unknown> | null;
+  all(...params: unknown[]): Array<Record<string, unknown>>;
+}
+interface BunDatabase {
+  exec(sql: string): void;
+  prepare(sql: string): BunStatement;
+  close(): void;
+  serialize(): Uint8Array;
+}
+
+interface SqliteBackend {
+  open(path: string): DatabaseSync;
+  backup(database: DatabaseSync, path: string): Promise<void>;
+}
+
+/**
+ * Runtime SQLite backend detection: Bun does not implement node:sqlite, so the
+ * same compiled artifact loads node:sqlite under Node and bun:sqlite under Bun.
+ * createRequire("bun:sqlite") is verified to work both under bare `bun` and in
+ * `bun build --compile` binaries. The Bun adapter normalizes StatementSync.get
+ * to return `undefined` (not null) for missing rows; backup uses serialize().
+ */
+const backend: SqliteBackend = (() => {
+  const requireModule = createRequire(import.meta.url);
+  if (process.versions.bun) {
+    const { Database } = requireModule("bun:sqlite") as { Database: new (path: string) => BunDatabase };
+    return {
+      open(path) {
+        const database = new Database(path);
+        const adapted: DatabaseSync & { serialize(): Uint8Array } = {
+          exec: (sql: string) => database.exec(sql),
+          prepare: (sql: string) => {
+            const statement = database.prepare(sql);
+            // Only run/get/all are used by this store; cast to the full
+            // node:sqlite StatementSync shape (type-level only).
+            return {
+              run: (...params: unknown[]) => statement.run(...params),
+              get: (...params: unknown[]) => statement.get(...params) ?? undefined,
+              all: (...params: unknown[]) => statement.all(...params),
+            } as unknown as StatementSync;
+          },
+          close: () => database.close(),
+          serialize: () => database.serialize(),
+        };
+        return adapted;
+      },
+      async backup(database, path) {
+        writeFileSync(path, (database as DatabaseSync & { serialize(): Uint8Array }).serialize());
+      },
+    };
+  }
+  const { DatabaseSync: NodeDatabaseSync, backup } = requireModule("node:sqlite") as {
+    DatabaseSync: new (path: string) => DatabaseSync;
+    backup: (database: DatabaseSync, path: string) => Promise<void>;
+  };
+  return {
+    open: (path) => new NodeDatabaseSync(path),
+    backup,
+  };
+})();

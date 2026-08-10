@@ -31,9 +31,9 @@ try {
   for (const value of ["opencode", "codex", "pi", "claude-code", "plan", "supervise", "execute"]) {
     if (!workers.includes(value)) throw new Error(`workers output missing ${value}`);
   }
-  // 版本号必须与根目录 version 文件一致。
+  // The version must match the root version file.
   const version = run(["--version"]).trim();
   const expected = readFileSync(join(root, "version"), "utf8").trim();
-  if (version !== expected) throw new Error(`peak --version (${version}) !== version 文件 (${expected})`);
+  if (version !== expected) throw new Error(`peak --version (${version}) !== version file (${expected})`);
   console.log("smoke ok");
 } finally { rmSync(workspace, { recursive: true, force: true }); }

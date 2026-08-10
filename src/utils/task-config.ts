@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { DEFAULT_PHASE, DEFAULT_SCHEDULER } from "./defaults.js";
+import { DEFAULT_PHASE, DEFAULT_SCHEDULER, TASK_TYPES } from "./types.js";
 import { resolveTaskConfigPaths } from "./paths.js";
-import { TASK_TYPES, WORKER_TYPES } from "../worker/registry.js";
+import { WORKER_TYPES } from "../worker/registry.js";
 import type { CustomProfileDefinition, ProjectConfig, ResolvedTaskConfig, WorkerConfig } from "./types.js";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_PROFILE_DESCRIPTION_BYTES = 1024;
@@ -265,13 +265,13 @@ function integer(value: unknown, label: string, minimum = 1): number | undefined
   return value as number;
 }
 
-function enumeration<T extends string>(value: unknown, allowed: T[], label: string): T {
+function enumeration<T extends string>(value: unknown, allowed: readonly T[], label: string): T {
   const result = requiredString(value, label);
   if (!allowed.includes(result as T)) throw new Error(`${label} must be one of: ${allowed.join(", ")}`);
   return result as T;
 }
 
-function enumerations<T extends string>(value: unknown, allowed: T[], label: string): T[] | undefined {
+function enumerations<T extends string>(value: unknown, allowed: readonly T[], label: string): T[] | undefined {
   const values = strings(value, label);
   return values?.map((item) => enumeration(item, allowed, label));
 }

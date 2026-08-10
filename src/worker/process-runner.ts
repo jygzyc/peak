@@ -4,6 +4,12 @@ import type { ProcessResult, ProcessSpec } from "./types.js";
 const MAX_OUTPUT = 10 * 1024 * 1024;
 
 export class ProcessRunner {
+  /**
+   * Spawns one CLI Worker subprocess per call: pipes the prompt via stdin,
+   * pins cwd and the conventional temp variables to the Project `.tmp`
+   * scratch, merges env (host < spec < Worker), caps stdout/stderr at 10 MiB
+   * each, and kills the whole process tree on timeout/cancellation.
+   */
   run(
     spec: ProcessSpec,
     cwd: string,
@@ -16,8 +22,13 @@ export class ProcessRunner {
     return new Promise((resolve) => {
       // Worker env wins over the parent env so per-Worker configuration
       // (PI_MODEL, ANTHROPIC_API_KEY, ...) overrides the host default; spec.env
-      // (protocol-specific) sits between them, and PEAK_AGENT_ACTIVE always set.
-      const childEnv = { ...process.env, ...spec.env, ...(env ?? {}), PEAK_AGENT_ACTIVE: "1" };
+      // (protocol-specific) sits between them. Runtime supplies the Project
+      // `.tmp` as cwd; force conventional cwd/temp variables to the same path
+      // so subprocess-relative and OS-temp writes remain Project-scoped.
+      const childEnv = {
+        ...process.env, ...spec.env, ...(env ?? {}),
+        PWD: cwd, TMPDIR: cwd, TMP: cwd, TEMP: cwd, PEAK_AGENT_ACTIVE: "1",
+      };
       const child = spawn(...launchTarget(spec.argv), {
         cwd, env: childEnv,
         stdio: [spec.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],

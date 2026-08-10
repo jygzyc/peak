@@ -6,9 +6,8 @@ import type { ProcessResult, WorkerCall } from "../dist/worker/types.js";
 
 function call(type: "codex" | "claude-code", session?: { workerType: "codex" | "claude-code"; value: string }): WorkerCall {
   return {
-    workerName: type,
     config: { type, taskTypes: ["execute"], maxRunning: 1, priority: 1, env: {} },
-    taskType: "execute", prompt: "prompt", cwd: process.cwd(), session,
+    prompt: "prompt", session,
   };
 }
 

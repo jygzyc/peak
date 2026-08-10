@@ -10,7 +10,7 @@
     "projects": [
       {
         "id": "",
-        "source": "审计目标:<在此填写应用信息,如应用名称、包名、版本,以及 APK 本地路径或下载地址>。环境中已安装 decx CLI,可用 decx process open 打开目标并通过 decx code / decx android 检查反编译代码与组件清单。",
+        "source": "审计目标: base.apk。环境中已安装 decx CLI,可用 decx process open 打开目标并通过 decx code / decx android 检查反编译代码与组件清单。",
         "goal": "针对 source 描述的应用产出一份安全审计报告,包含三部分:仅收录完整证据链且经 PoC 验证的已证实漏洞;按功能实现组织的风险地图,列出每个功能对应的可能风险与当前已发现漏洞;潜在风险清单,收录存在代码级漏洞证据但现有利用条件不足、证据链有明确缺口的路径"
       }
     ]

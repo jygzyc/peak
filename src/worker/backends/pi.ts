@@ -1,44 +1,21 @@
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import type { ProcessResult, ProcessSpec, SessionRef, WorkerCall, WorkerProtocol, WorkerType } from "../types.js";
 import { jsonLines } from "./shared.js";
 
 const TYPE: WorkerType = "pi";
-const PI_PACKAGE = "@earendil-works/pi-coding-agent";
 
-/**
- * Resolves the Pi CLI entry from the installed dependency, then launches it
- * through `process.execPath` so Peak never depends on `pi` being on PATH.
- *
- * pi-coding-agent seals its subpaths behind a package "exports" map, so the
- * CLI entry cannot be resolved as a bare subpath (`.../dist/cli.js`). Resolve
- * the package main instead, walk back to its root, and read the published
- * "bin.pi" target. Throws a clear error if Pi is not installed.
- */
+/** Pi runs as a plain PATH command, exactly like the other Worker backends. */
 function piCliTarget(): [string, string[]] {
-  let entry: string;
-  try {
-    const mainPath = fileURLToPath(import.meta.resolve(PI_PACKAGE));
-    const pkgRoot = dirname(dirname(mainPath));
-    const pkg = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf8")) as {
-      bin?: Record<string, string>;
-    };
-    const binTarget = pkg.bin?.pi;
-    if (!binTarget) throw new Error("missing bin.pi");
-    entry = join(pkgRoot, binTarget);
-  } catch {
-    throw new Error(`pi CLI entry not found; install ${PI_PACKAGE}`);
-  }
-  return [process.execPath, [entry]];
+  return ["pi", []];
 }
 
 /**
  * Builds the Pi CLI argv from a resolved `[command, commandArgs]` target.
- * Pure and testable: the target is produced by {@link piCliTarget} in
- * production but can be stubbed in tests without Pi installed.
+ * Pure and testable: the target is the PATH command in production but can be
+ * stubbed in tests without Pi installed.
  */
 export function buildPiArgv(
   call: WorkerCall,
@@ -56,9 +33,9 @@ export function buildPiArgv(
 }
 
 /**
- * Pi CLI protocol. Runs `pi --mode json` so the agent session streams as
- * newline-delimited events; the prompt is piped via stdin (`-p`). Session
- * files live under the per-Project `.tmp` scratch directory passed as
+ * Pi CLI protocol. Runs `pi --mode json` from PATH so the agent session
+ * streams as newline-delimited events; the prompt is piped via stdin (`-p`).
+ * Session files live under the per-Project `.tmp` scratch directory passed as
  * `--session-dir` so they never pollute the Board directory; Finalize resume
  * passes the captured session id back with `--session`. Pi itself owns
  * provider auth, model catalogs, and session persistence.

@@ -2,8 +2,8 @@ import { constants, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, mk
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { initializeProjectsDirectory } from "../config/paths.js";
-import { ApiError, localTimestamp, requireUuid } from "./api.js";
+import { initializeProjectsDirectory } from "../utils/paths.js";
+import { ApiError, localTimestamp, requireUuid, UUID_PATTERN } from "./api.js";
 import { ArtifactStore } from "./artifact-store.js";
 import {
   extractProjectArchive, packProjectArchive, parseProjectArchiveGraph, PROJECT_ARCHIVE_DATABASE, PROJECT_ARCHIVE_GRAPH,
@@ -151,46 +151,39 @@ export class ProjectStoreRegistry {
     return stores;
   }
 
+  /**
+   * Server-boundary FactRef validation: refs must be non-empty, unique, local
+   * to the target Project (cross-Project references are rejected; Federation
+   * Paths are read-only and never Intent sources), point at existing Facts,
+   * and carry the Fact's exact immutable description.
+   */
   validateRefs(targetProjectId: string, refs: FactRef[], allowGoal = false): void {
-    const target = this.get(targetProjectId).graph.project()!;
+    const target = this.get(targetProjectId).graph;
     if (refs.length === 0) throw new ApiError(400, "at least one FactRef is required");
     const unique = new Set<string>();
     for (const ref of refs) {
-      const key = `${ref.projectId}/${ref.factId}`;
+      const key = `${ref.projectId}/${ref.id}`;
+      if (ref.projectId !== targetProjectId) throw new ApiError(400, `FactRef must be a local Fact: ${key}`);
       if (unique.has(key)) throw new ApiError(400, "duplicate FactRef");
       unique.add(key);
-      if (!allowGoal && ref.factId === "goal") throw new ApiError(400, "goal cannot be a source");
-      const source = this.get(ref.projectId).graph;
-      const fact = source.fact(ref.factId);
+      if (!allowGoal && ref.id === "goal") throw new ApiError(400, "goal cannot be a source");
+      const fact = target.fact(ref.id);
       if (!fact) throw new ApiError(400, `fact not found: ${key}`);
       if (ref.description !== fact.description) throw new ApiError(400, `FactRef description mismatch: ${key}`);
-      const sourceProject = source.project()!;
-      if (ref.projectId !== targetProjectId && sourceProject.scope !== target.scope) {
-        throw new ApiError(400, "FactRef crosses federation scope");
-      }
     }
   }
 
+  /** validateRefs plus the current-frontier rule: every source must still be a local leaf Fact. */
   validateLeafRefs(targetProjectId: string, refs: FactRef[]): void {
     this.validateRefs(targetProjectId, refs);
-    const leavesByProject = new Map<string, Set<string>>();
+    const leaves = new Set(leafFacts(this.get(targetProjectId).graph.graph()).map((fact) => fact.id));
     for (const ref of refs) {
-      let leaves = leavesByProject.get(ref.projectId);
-      if (!leaves) {
-        leaves = new Set(leafFacts(this.get(ref.projectId).graph.graph()).map((fact) => fact.id));
-        leavesByProject.set(ref.projectId, leaves);
-      }
-      if (!leaves.has(ref.factId)) throw new ApiError(409, `FactRef is not a current leaf: ${ref.projectId}/${ref.factId}`);
+      if (!leaves.has(ref.id)) throw new ApiError(409, `FactRef is not a current leaf: ${ref.projectId}/${ref.id}`);
     }
   }
 
   remove(projectId: string): void {
     const target = this.get(projectId);
-    for (const [id, stores] of this.stores) {
-      if (id !== projectId && stores.graph.externalReferences(projectId) > 0) {
-        throw new ApiError(409, "project is referenced by another project");
-      }
-    }
     target.graph.close();
     this.stores.delete(projectId);
     rmSync(target.dir, { recursive: true, force: true });
@@ -213,11 +206,8 @@ export class ProjectStoreRegistry {
 
   private load(): void {
     for (const name of readdirSync(this.baseDir)) {
-      if (!isUuid(name) || !existsSync(join(this.baseDir, name, "analysis.db"))) continue;
+      if (!isUuid(name) || !existsSync(join(this.baseDir, name, "project.db"))) continue;
       this.open(name);
-    }
-    for (const stores of this.stores.values()) {
-      stores.graph.repairSourceDescriptions((projectId, factId) => this.stores.get(projectId)?.graph.fact(factId)?.description);
     }
   }
 
@@ -235,7 +225,7 @@ export class ProjectStoreRegistry {
 }
 
 function isUuid(value: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+  return UUID_PATTERN.test(value);
 }
 function pathEntryExists(path: string): boolean {
   try { lstatSync(path); return true; }

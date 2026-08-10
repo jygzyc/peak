@@ -8,6 +8,7 @@ build/
 dist/
 dist-packages/
 package-lock.json
+src/generated/
 
 # Python
 .venv/
@@ -37,3 +38,4 @@ examples/*.apk
 
 # Test root created by scripts/run-example.mjs
 .peak_test/
+examples/app_security/base.apk

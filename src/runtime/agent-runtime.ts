@@ -1,23 +1,36 @@
-import { initializePeakPaths, projectTmpDir } from "../config/paths.js";
-import { persistProjectId } from "../config/task-config.js";
-import type { InstalledSkill, ResolvedTaskConfig, TaskProjectConfig } from "../config/types.js";
-import { cleanupTaskSkills, initializeTaskSkills } from "../config/task-skill-installer.js";
+import { projectDir as projectDirPath } from "../utils/paths.js";
+import { initializePeakPaths, initializeProjectsDirectory, projectTmpDir } from "../utils/paths.js";
+import { sourceTitle } from "../utils/helpers.js";
+import { persistProjectId } from "../utils/task-config.js";
+import type { InstalledSkill, ResolvedTaskConfig, TaskProjectConfig } from "../utils/types.js";
+import { cleanupTaskSkills, initializeTaskSkills } from "../utils/task-skill-installer.js";
 import { FederationBus } from "../graph/federation-bus.js";
 import { GraphClient } from "../graph/graph-client.js";
 import { GraphHttpServer, type HttpServerOptions } from "../graph/http-server.js";
 import { ProjectStoreRegistry } from "../graph/project-store-registry.js";
-import { leafFacts, type ProjectMeta } from "../graph/types.js";
-import { ProjectLoop } from "../project/project-loop.js";
-import { ProjectManager } from "../project/project-manager.js";
+import { type ProjectMeta } from "../graph/types.js";
 import { serveDashboard } from "../ui/dashboard.js";
-import { WorkerRuntime } from "../worker/worker-runtime.js";
-import { runtimeExtensions } from "./runtime-api.js";
 import { ExecutionRegistry } from "./execution-registry.js";
-import { RuntimeStatus } from "./runtime-status.js";
+import { ProjectLoop } from "./project-loop.js";
+import { RuntimeStatus, runtimeExtensions } from "./runtime-api.js";
 import { RuntimeScheduler } from "./scheduler.js";
 import { TaskExecutor } from "./task-executor.js";
+import { WorkerPool } from "./worker-pool.js";
 
-export interface RuntimeOptions extends HttpServerOptions { peakHome?: string; installSkills?: boolean }
+export interface RuntimeOptions extends HttpServerOptions {
+  peakHome?: string;
+  installSkills?: boolean;
+  /**
+   * External Graph mode: attach to a remote `peak serve` Graph API instead of
+   * embedding ProjectStoreRegistry + GraphHttpServer. No UI root handler or
+   * runtime apiExtensions are hosted in this mode.
+   */
+  graphUrl?: string;
+  /** Local Projects root used to re-anchor relative Artifact paths (container: /peak/projects). */
+  projectsRoot?: string;
+  /** Attach-only mode: every selected Project must already have a persisted id; nothing is created. */
+  attachOnly?: boolean;
+}
 
 export class AgentRuntime {
   private registry?: ProjectStoreRegistry;
@@ -39,11 +52,19 @@ export class AgentRuntime {
     if (this.server) throw new Error("runtime already started");
     try {
       if (this.options.installSkills !== false) this.taskSkills = initializeTaskSkills(this.config);
-      this.projectsDir = initializePeakPaths(this.options.peakHome).projectsDir;
-      this.registry = new ProjectStoreRegistry(this.projectsDir);
-      this.server = new GraphHttpServer(this.registry, serveDashboard, runtimeExtensions(this.runtimeStatus, this.executions));
-      await this.server.start({ ...this.options, maxArtifactBytes: this.config.phase.execute.maxArtifactBytes });
-      this.client = new GraphClient(this.server.baseUrl, this.options.token);
+      this.projectsDir = this.options.projectsRoot
+        ? initializeProjectsDirectory(this.options.projectsRoot)
+        : initializePeakPaths(this.options.peakHome).projectsDir;
+      if (this.options.graphUrl) {
+        // External Graph mode: the Graph API lives in a separate serve
+        // process; this Runtime only schedules and runs Workers.
+        this.client = new GraphClient(this.options.graphUrl, { projectsRoot: this.projectsDir });
+      } else {
+        this.registry = new ProjectStoreRegistry(this.projectsDir);
+        this.server = new GraphHttpServer(this.registry, serveDashboard, runtimeExtensions(this.runtimeStatus, this.executions));
+        await this.server.start({ ...this.options, maxArtifactBytes: this.config.phase.execute.maxArtifactBytes });
+        this.client = new GraphClient(this.server.baseUrl, { projectsRoot: this.projectsDir });
+      }
       this.scheduler = new RuntimeScheduler(this.config, this.executions);
       const projects: ProjectMeta[] = [];
       if (projectId) {
@@ -55,7 +76,7 @@ export class AgentRuntime {
           projects.push(await this.ensureProject(index));
         }
       }
-      await this.seedExistingFacts(projects);
+      await this.seedProjectPaths(projects);
       this.runtimeStatus.start(this.config.scheduler.intervalMs);
       this.scheduler.start();
       return projects;
@@ -65,12 +86,12 @@ export class AgentRuntime {
     }
   }
 
-  async addProject(projectSelector: string): Promise<ProjectMeta> {
+  private async addProject(projectSelector: string): Promise<ProjectMeta> {
     const index = this.projectIndex(projectSelector);
     return this.ensureProject(index);
   }
 
-  async attachProject(projectId: string, projectSelector?: string): Promise<ProjectMeta> {
+  private async attachProject(projectId: string, projectSelector?: string): Promise<ProjectMeta> {
     if (!this.client) throw new Error("runtime not started");
     const graph = await this.client.getProject(projectId);
     const source = graph.facts.find((fact) => fact.id === "origin")?.description;
@@ -108,6 +129,7 @@ export class AgentRuntime {
   private async ensureProject(index: number): Promise<ProjectMeta> {
     const configured = this.workProject(index);
     if (configured.id) return this.attachProject(configured.id, configured.source);
+    if (this.options.attachOnly) throw new Error(`attach-only mode requires a persisted Project id: ${configured.source}`);
     const project = await this.createProject(configured);
     persistProjectId(this.config, index, project.id);
     this.projectIds.set(index, project.id);
@@ -115,9 +137,8 @@ export class AgentRuntime {
   }
 
   private async createProject(configured: TaskProjectConfig): Promise<ProjectMeta> {
-    if (!this.client || !this.projectsDir) throw new Error("runtime not started");
-    const manager = new ProjectManager(this.projectsDir, this.client);
-    const project = await manager.create({
+    if (!this.client) throw new Error("runtime not started");
+    const project = await this.client.createProject({
       title: sourceTitle(configured.source),
       target: configured.source,
       goal: configured.goal,
@@ -125,26 +146,29 @@ export class AgentRuntime {
     return this.registerProject(project, { ...configured, id: project.id });
   }
 
-  private async seedExistingFacts(projects: ProjectMeta[]): Promise<void> {
-    if (!this.client) throw new Error("runtime not started");
+  /**
+   * Seeds every loaded Project's Federation state at startup: generates any
+   * missing `path_abs_<factId>` descriptions and broadcasts the current
+   * leaf references. Files are cached, so restarts cost no Worker
+   * dispatches for already-analyzed Facts.
+   */
+  private async seedProjectPaths(projects: ProjectMeta[]): Promise<void> {
     for (const project of projects) {
-      const graph = await this.client.getProject(project.id);
-      for (const fact of leafFacts(graph)) {
-        if (fact.id === "origin") continue;
-        this.federation.publish({ projectId: project.id, factId: fact.id, description: fact.description });
-      }
+      const executor = this.executors.get(project.id);
+      if (!executor) throw new Error(`executor not registered: ${project.id}`);
+      await executor.syncPaths(project.id);
     }
   }
 
   private registerProject(project: ProjectMeta, configured: TaskProjectConfig): ProjectMeta {
     if (!this.client || !this.projectsDir || !this.scheduler) throw new Error("runtime not started");
-    const projectDir = new ProjectManager(this.projectsDir, this.client).projectDir(project.id);
+    const projectDir = projectDirPath(this.projectsDir, project.id);
     this.federation.register(project.id, projectDir, project.scope);
     const executor = new TaskExecutor(
       this.config,
       configured,
       this.client,
-      new WorkerRuntime(this.config),
+      new WorkerPool(this.config),
       this.federation,
       projectDir,
       () => this.executions.cancelProject(project.id),
@@ -158,7 +182,7 @@ export class AgentRuntime {
       this.client,
       executor,
       this.executions,
-      () => this.federation.pendingFor(project.id).length,
+      () => this.federation.pendingPathsFor(project.id).length,
     ));
     this.firstProjectId ??= project.id;
     return project;
@@ -211,19 +235,13 @@ export class AgentRuntime {
     return this.server.baseUrl;
   }
 
+  /** Embedded server URL, or the external Graph URL in external-graph mode (registration readiness signal). */
+  get endpointUrl(): string | null {
+    return this.server ? this.server.baseUrl : this.options.graphUrl ?? null;
+  }
+
   get graphClient(): GraphClient {
     if (!this.client) throw new Error("runtime not started");
     return this.client;
   }
-}
-
-/** Project title is only a short UI label; the complete immutable source lives in the origin Fact. */
-function sourceTitle(source: string): string {
-  if (Buffer.byteLength(source, "utf8") <= 1024) return source;
-  let result = "";
-  for (const character of source) {
-    if (Buffer.byteLength(result + character, "utf8") > 1021) break;
-    result += character;
-  }
-  return `${result}...`;
 }

@@ -3,11 +3,11 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import type { ResolvedTaskConfig, TaskType } from "../dist/config/types.js";
+import type { ResolvedTaskConfig, TaskType } from "../dist/utils/types.js";
 import { GraphClient } from "../dist/graph/graph-client.js";
 import { GraphHttpServer } from "../dist/graph/http-server.js";
 import { ProjectStoreRegistry } from "../dist/graph/project-store-registry.js";
-import { ProjectLoop } from "../dist/project/project-loop.js";
+import { ProjectLoop } from "../dist/runtime/project-loop.js";
 import { ExecutionRegistry } from "../dist/runtime/execution-registry.js";
 
 /** Records every dispatched phase and never resolves, so we can observe in-flight state. */
@@ -93,7 +93,7 @@ test("ProjectLoop dispatches Plan and Supervise concurrently and Execute up to i
     const project = await graph.createProject({ title: "P", target: "open", goal: "done", scope: "s" });
     // Create one open Intent from origin so the Execute channel has work to do.
     await graph.createIntent(project.id, {
-      from: [{ projectId: project.id, factId: "origin", description: "open" }],
+      from: [{ projectId: project.id, id: "origin", description: "open" }],
       customProfile: null, customProfileDigest: null, hintIds: [],
       description: "first atomic step", createdBy: "test",
     });
@@ -114,7 +114,7 @@ test("ProjectLoop dispatches Plan and Supervise concurrently and Execute up to i
     // Per-Project budget caps concurrent Execute dispatches: with one Execute
     // already in-flight and executeCapacity=1, a second open Intent stays idle.
     await graph.createIntent(project.id, {
-      from: [{ projectId: project.id, factId: "origin", description: "open" }],
+      from: [{ projectId: project.id, id: "origin", description: "open" }],
       customProfile: null, customProfileDigest: null, hintIds: [],
       description: "second atomic step", createdBy: "test",
     });
@@ -142,7 +142,7 @@ test("ProjectLoop Execute budgets are independent across Projects", async () => 
     const second = await graph.createProject({ title: "B", target: "open", goal: "done B", scope: "s" });
     for (const project of [first, second]) {
       await graph.createIntent(project.id, {
-        from: [{ projectId: project.id, factId: "origin", description: "open" }],
+        from: [{ projectId: project.id, id: "origin", description: "open" }],
         customProfile: null, customProfileDigest: null, hintIds: [],
         description: "atomic step", createdBy: "test",
       });

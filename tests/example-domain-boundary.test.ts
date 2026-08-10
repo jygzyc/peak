@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
-import { executeCapacity, loadTaskConfig } from "../dist/config/task-config.js";
+import { executeCapacity, loadTaskConfig } from "../dist/utils/task-config.js";
 
 const INTERNAL_PLANNING_TERMS = /\b(?:Graph|DAG|Intent|Fact|FactRef|Leaf|origin)\b/i;
 

@@ -1,5 +1,4 @@
-import type { WorkerType } from "../../config/types.js";
-import type { SessionRef } from "../types.js";
+import type { SessionRef, WorkerType } from "../types.js";
 
 /** Parses stdout as newline-delimited JSON objects, skipping non-JSON lines. */
 export function jsonLines(stdout: string): Array<Record<string, unknown>> {

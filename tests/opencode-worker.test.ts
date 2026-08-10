@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { WorkerConfig } from "../dist/config/types.js";
+import type { WorkerConfig } from "../dist/utils/types.js";
 import { opencodeProtocol } from "../dist/worker/backends/opencode.js";
 import type { ProcessResult, WorkerCall } from "../dist/worker/types.js";
 
@@ -14,7 +14,7 @@ const config: WorkerConfig = {
 };
 
 function call(session?: WorkerCall["session"]): WorkerCall {
-  return { workerName: "worker", config, taskType: "execute", prompt: "prompt", cwd: "/board", session };
+  return { config, prompt: "prompt", session };
 }
 
 const result = (stdout: string): ProcessResult => ({

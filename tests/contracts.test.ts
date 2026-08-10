@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parseExecute, parsePlan, parseSupervise } from "../dist/runtime/contracts.js";
+import { parseAnalyze, parseExecute, parsePlan, parseSupervise } from "../dist/runtime/contracts.js";
 
 test("contracts accept JSON embedded in prose or fences but reject garbage", () => {
   assert.equal(parsePlan("```json\n{\"kind\":\"noop\"}\n```", 4).kind, "noop");
@@ -15,6 +15,9 @@ test("contracts accept JSON embedded in prose or fences but reject garbage", () 
   assert.equal(parseExecute("<think>I should emit { kind: fact } here</think>\n{\"kind\":\"fact\",\"description\":\"x\",\"artifact\":{\"filename\":\"x.md\",\"mediaType\":\"text/markdown\",\"content\":\"x\"}}").kind, "fact");
   assert.equal(parsePlan("<think>planning with { fake } braces</think>\n```json\n{\"kind\":\"noop\"}\n```", 4).kind, "noop");
   assert.equal(parseSupervise("<think>multi\nline\nreasoning</think>{\"kind\":\"noop\"}").kind, "noop");
+  assert.deepEqual(parseAnalyze('{"pathOverview":"origin to fact","verifiedCore":["verified result"]}'), {
+    pathOverview: "origin to fact", verifiedCore: ["verified result"],
+  });
   // Trailing prose after the JSON object (e.g. a markdown explanation whose own
   // text contains braces) must be ignored via brace-balanced extraction.
   assert.equal(parseSupervise('{"kind":"hint","content":"verify the evidence"}\n\n| Rationale | {why} |\n| --- | --- |').kind, "hint");
@@ -29,6 +32,8 @@ test("contracts reject unknown, missing, and oversized Fact fields", () => {
   assert.throws(() => parseExecute('{"kind":"fact","description":"x","artifact":[]}'), /object/);
   assert.throws(() => parseExecute('{"kind":"fact","description":"x","artifact":[]}'), /object/);
   assert.throws(() => parseSupervise('{"kind":"hint"}'));
+  assert.throws(() => parseAnalyze('{"pathOverview":"x","verifiedCore":[]}'), /1-16/);
+  assert.throws(() => parseAnalyze('{"pathOverview":"x","verifiedCore":["x"],"extra":1}'), /unknown field/);
   assert.throws(
     () => parseExecute(JSON.stringify({ kind: "fact", description: "安".repeat(342), artifact: { filename: "x.md", mediaType: "text/markdown", content: "x" } })),
     /1 KiB/,
@@ -36,18 +41,18 @@ test("contracts reject unknown, missing, and oversized Fact fields", () => {
   assert.throws(() => parseSupervise(JSON.stringify({ kind: "hint", content: "安".repeat(342) })), /1 KiB/);
   assert.equal(parsePlan(JSON.stringify({
     kind: "intents",
-    intents: [{ from: [{ projectId: "project", factId: "origin", description: "origin" }], description: "安".repeat(342) }],
+    intents: [{ from: [{ projectId: "project", id: "origin", description: "origin" }], description: "安".repeat(342) }],
   }), 1).kind, "intents", "Intent descriptions may be longer than Fact descriptions");
   assert.equal(parsePlan(JSON.stringify({
     kind: "intents",
-    intents: [{ from: [{ projectId: "project", factId: "origin", description: "origin" }], customProfile: "Use for research.", description: "work" }],
+    intents: [{ from: [{ projectId: "project", id: "origin", description: "origin" }], customProfile: "Use for research.", description: "work" }],
   }), 1, ["Use for research."]).kind, "intents");
   assert.throws(() => parsePlan(JSON.stringify({
     kind: "intents",
-    intents: [{ from: [{ projectId: "project", factId: "origin", description: "origin" }], customProfile: "unknown", description: "work" }],
+    intents: [{ from: [{ projectId: "project", id: "origin", description: "origin" }], customProfile: "unknown", description: "work" }],
   }), 1, ["Use for research."]), /unknown customProfile/);
   assert.throws(() => parsePlan(JSON.stringify({
     kind: "intents",
-    intents: [{ from: [{ projectId: "project", factId: "origin", description: "origin" }], description: "安".repeat(683) }],
+    intents: [{ from: [{ projectId: "project", id: "origin", description: "origin" }], description: "安".repeat(683) }],
   }), 1), /2 KiB/);
 });

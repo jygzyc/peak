@@ -3,10 +3,10 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { initializePeakPaths, resolveTaskConfigPaths } from "../dist/config/paths.js";
-import { loadTaskConfig } from "../dist/config/task-config.js";
-import { initializeTaskDirectory } from "../dist/config/task-initializer.js";
-import { cleanupTaskSkills, initializeTaskSkills } from "../dist/config/task-skill-installer.js";
+import { initializePeakPaths, resolveTaskConfigPaths } from "../dist/utils/paths.js";
+import { loadTaskConfig } from "../dist/utils/task-config.js";
+import { initializeTaskDirectory } from "../dist/utils/task-initializer.js";
+import { cleanupTaskSkills, initializeTaskSkills } from "../dist/utils/task-skill-installer.js";
 
 test("config owns configured paths and Board directory initialization", () => {
   const root = mkdtempSync(join(tmpdir(), "peak-paths-"));

@@ -1,6 +1,6 @@
-import type { ResolvedTaskConfig } from "../config/types.js";
-import { ProjectLoop } from "../project/project-loop.js";
+import type { ResolvedTaskConfig } from "../utils/types.js";
 import { ExecutionRegistry } from "./execution-registry.js";
+import { ProjectLoop } from "./project-loop.js";
 
 export class RuntimeScheduler {
   private readonly loops = new Map<string, ProjectLoop>();
@@ -10,10 +10,6 @@ export class RuntimeScheduler {
 
   constructor(private readonly config: ResolvedTaskConfig, readonly executions: ExecutionRegistry) {}
   add(loop: ProjectLoop): void { this.loops.set(loop.projectId, loop); }
-  remove(projectId: string): void {
-    this.loops.get(projectId)?.dispose();
-    this.loops.delete(projectId);
-  }
 
   start(): void {
     if (this.timer) return;
@@ -36,7 +32,7 @@ export class RuntimeScheduler {
     this.executions.cancelAll();
   }
 
-  async tick(): Promise<void> {
+  private async tick(): Promise<void> {
     if (this.ticking) return;
     this.ticking = true;
     try {

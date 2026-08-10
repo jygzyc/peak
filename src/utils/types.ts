@@ -1,14 +1,16 @@
-export type WorkerType = "opencode" | "codex" | "pi" | "claude-code";
-export type TaskType = "plan" | "supervise" | "execute";
+import { createHash } from "node:crypto";
+import type { WorkerDefinition } from "../worker/types.js";
 
-export interface WorkerConfig {
-  type: WorkerType;
-  model?: string;
+export type { WorkerType } from "../worker/types.js";
+
+export const TASK_TYPES = ["plan", "supervise", "execute"] as const;
+export type TaskType = typeof TASK_TYPES[number];
+
+/** Config-layer routing and scheduling metadata for one named Worker. */
+export interface WorkerConfig extends WorkerDefinition {
   taskTypes: TaskType[];
   maxRunning: number;
   priority: number;
-  /** Per-worker environment variables merged into the CLI subprocess env. */
-  env: Record<string, string>;
 }
 
 export interface CustomProfileDefinition {
@@ -57,4 +59,22 @@ export interface InstalledSkill {
 export interface SkillInstallOptions {
   agentsDir?: string;
   claudeDir?: string;
+}
+
+export const DEFAULT_SCHEDULER: SchedulerConfig = {
+  maxRunningProjects: 4,
+  intervalMs: 3_000,
+};
+
+export const DEFAULT_PHASE: ResolvedTaskConfig["phase"] = {
+  plan: {},
+  supervise: { intervalMs: 60_000 },
+  execute: { maxArtifactBytes: 10 * 1024 * 1024, customProfile: [] },
+};
+
+export function customProfileDigest(profile: CustomProfileDefinition): string {
+  return createHash("sha256")
+    .update(`${profile.description}#${profile.prompt}`, "utf8")
+    .digest("hex")
+    .slice(0, 16);
 }

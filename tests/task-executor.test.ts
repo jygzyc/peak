@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import type { ResolvedTaskConfig, TaskType } from "../dist/config/types.js";
+import type { ResolvedTaskConfig, TaskType } from "../dist/utils/types.js";
 import { FederationBus } from "../dist/graph/federation-bus.js";
 import { GraphClient } from "../dist/graph/graph-client.js";
 import { GraphHttpServer } from "../dist/graph/http-server.js";
@@ -13,11 +13,20 @@ import type { SessionRef, WorkerResult } from "../dist/worker/types.js";
 
 class FakeWorkers implements TaskWorkers {
   readonly outputs: Record<TaskType, Array<string | WorkerResult>> = { plan: [], supervise: [], execute: [] };
-  readonly calls: Array<{ type: TaskType; prompt: string; session?: SessionRef }> = [];
+  readonly calls: Array<{ type: TaskType; prompt: string; timeout: number; cwd: string; session?: SessionRef; tmpDir?: string }> = [];
   pick(): string { return "fake"; }
   release(): void {}
-  async execute(_name: string, type: TaskType, prompt: string, _timeout: number, _cwd: string, _signal?: AbortSignal, session?: SessionRef): Promise<WorkerResult> {
-    this.calls.push({ type, prompt, session });
+  async execute(
+    _name: string,
+    type: TaskType,
+    prompt: string,
+    timeout: number,
+    cwd: string,
+    _signal?: AbortSignal,
+    session?: SessionRef,
+    options?: { tmpDir?: string },
+  ): Promise<WorkerResult> {
+    this.calls.push({ type, prompt, timeout, cwd, session, tmpDir: options?.tmpDir });
     const output = this.outputs[type].shift()!;
     return typeof output === "string"
       ? { text: output, stdout: output, stderr: "", returncode: 0, timedOut: false, cancelled: false, started: true }
@@ -64,7 +73,7 @@ test("TaskExecutor.cleanupRuntimeTmp removes the per-Project runtime scratch dir
 test("built-in phase prompts stay concise and leave judgment to the AI", () => {
   for (const name of ["plan.md", "supervise.md", "execute.md", "execute-finalize.md"]) {
     const prompt = readFileSync(join("dist", "runtime", "prompts", name), "utf8");
-    assert.ok(Buffer.byteLength(prompt, "utf8") < 800, `${name} should remain under 800 bytes`);
+    assert.ok(Buffer.byteLength(prompt, "utf8") < 1_500, `${name} should remain under 1500 bytes`);
   }
 });
 
@@ -75,12 +84,32 @@ test("Plan, Supervise and Execute mutate Graph only through HTTP", async () => {
   const registry = new ProjectStoreRegistry(projects);
   const server = new GraphHttpServer(registry);
   await server.start();
-  const graph = new GraphClient(server.baseUrl);
+  const graph = new GraphClient(server.baseUrl, { projectsRoot: projects });
   try {
     const project = await graph.createProject({ title: "P", target: "start", goal: "done", scope: "s" });
     const projectDir = join(projects, project.id);
     const federation = new FederationBus();
     federation.register(project.id, projectDir, project.scope);
+    const external = await graph.createProject({ title: "External", target: "external evidence", goal: "external goal", scope: "s" });
+    federation.register(external.id, join(projects, external.id), external.scope);
+    const externalIntent = await graph.createIntent(external.id, {
+      from: [{ projectId: external.id, id: "origin", description: "external evidence" }],
+      description: "Verify external evidence", createdBy: "test",
+    });
+    await graph.conclude(external.id, externalIntent.id, { description: "external verified", artifact: null, concludedBy: "test" });
+    await graph.putPathAbstract(external.id, "f0001", {
+      factRef: { projectId: external.id, id: "f0001", description: "external verified" },
+      pathOverview: "external path summary", verifiedCore: ["external verified"],
+    });
+    federation.publishPath({
+      projectId: external.id,
+      leaf: { projectId: external.id, id: "f0001", description: "external verified" },
+      pathAbs: "artifacts/path_abs_f0001",
+      segments: [[
+        { projectId: external.id, id: "origin", description: "external evidence" },
+        { projectId: external.id, id: "f0001", description: "external verified" },
+      ]],
+    });
     const workers = new FakeWorkers();
     const config = configuration(root);
     const executor = new TaskExecutor(
@@ -98,13 +127,30 @@ test("Plan, Supervise and Execute mutate Graph only through HTTP", async () => {
 
     workers.outputs.supervise.push('{"kind":"hint","content":"Verify the result independently"}');
     await executor.supervise(project.id, "s1");
-    workers.outputs.plan.push(`{"kind":"intents","intents":[{"from":[{"projectId":"${project.id}","factId":"origin","description":"start"}],"hintIds":["h001"],"customProfile":"Use for primary research.","description":"Do the work"}]}`);
+    workers.outputs.plan.push(`{"kind":"intents","intents":[{"from":[{"projectId":"${project.id}","id":"origin","description":"start"}],"hintIds":["h0001"],"customProfile":"Use for primary research.","description":"Do the work"}]}`);
     await executor.plan(project.id, "p1");
     const intent = (await graph.getProject(project.id)).intents[0]!;
     workers.outputs.execute.push('{"kind":"fact","description":"Work completed","artifact":{"filename":"report.md","mediaType":"text/markdown","content":"details\\n"}}');
     await executor.execute(project.id, intent, "e1");
-    workers.outputs.plan.push(`{"kind":"complete","from":[{"projectId":"${project.id}","factId":"f001","description":"Work completed"}],"description":"Goal proven"}`);
+    // Execute does not broadcast: the pre-Plan hook (syncPaths) generates the
+    // analysis summary and publishes the Path before the next Plan runs.
+    workers.outputs.plan.push('{"pathOverview":"origin to Work completed: the assigned work is done","verifiedCore":["the assigned work is done"]}');
+    workers.outputs.plan.push(`{"kind":"complete","from":[{"projectId":"${project.id}","id":"f0001","description":"Work completed"}],"description":"Goal proven"}`);
     await executor.plan(project.id, "p2");
+
+    // The conclusion was broadcast to the same-scope external Project as a Path.
+    const broadcast = federation.pendingPathsFor(external.id);
+    assert.equal(broadcast.length, 1);
+    assert.deepEqual(broadcast[0]!.leaf, { projectId: project.id, id: "f0001", description: "Work completed" });
+    assert.equal(broadcast[0]!.pathAbs, "artifacts/path_abs_f0001");
+    assert.deepEqual(broadcast[0]!.segments, [[
+      { projectId: project.id, id: "origin", description: "start" },
+      { projectId: project.id, id: "f0001", description: "Work completed" },
+    ]]);
+    // The analysis result is persisted at the deterministic Path Abstract path.
+    const pathInfo = await graph.getPathAbstract(project.id, "f0001");
+    assert.equal(pathInfo.pathOverview, "origin to Work completed: the assigned work is done");
+    assert.equal(existsSync(join(projectDir, "artifacts", "path_abs_f0001")), true);
 
     const result = await graph.getProject(project.id);
     assert.equal(result.project.status, "completed");
@@ -114,8 +160,8 @@ test("Plan, Supervise and Execute mutate Graph only through HTTP", async () => {
     assert.equal(result.hints[0]?.consumedByIntentId, intent.id);
     assert.equal(intent.customProfile, "Use for primary research.");
     assert.match(intent.customProfileDigest!, /^[0-9a-f]{16}$/);
-    assert.equal("customProfile" in result.facts.find((fact) => fact.id === "f001")!, false);
-    assert.equal(result.facts.find((fact) => fact.id === "f001")?.artifact?.mediaType, "text/markdown");
+    assert.equal("customProfile" in result.facts.find((fact) => fact.id === "f0001")!, false);
+    assert.equal(result.facts.find((fact) => fact.id === "f0001")?.artifact?.mediaType, "text/markdown");
     const logs = readdirSync(join(projectDir, "logs"));
     assert.ok(logs.some((name) => /^graph-.*-supervise\.json$/.test(name)));
     const executeLog = logs.find((name) => /^graph-.*-execute\.json$/.test(name));
@@ -146,28 +192,49 @@ test("Plan, Supervise and Execute mutate Graph only through HTTP", async () => {
     const plans = planLogs.map((name) => JSON.parse(readFileSync(join(projectDir, "logs", name), "utf8")) as {
       executionId: string;
       context: {
-        source: { id: string; description: string; artifact: null };
-        goal: { id: string; description: string; artifact: null };
-        leafFacts: Array<{ id: string }>;
-        openIntents: Array<{ to: unknown }>;
-        unconsumedHints: Array<{ id: string }>;
+        projects: Record<string, {
+          source: { projectId: string; id: string; description: string };
+          goal: { projectId: string; id: string; description: string };
+          leafFacts: Array<{ ref: { projectId: string; id: string; description: string }; fact: { id: string } }>;
+          openIntents: Array<{ to: unknown }>;
+          unconsumedHints: Array<{ id: string }>;
+        }>;
+        external: Array<{ factRef: { projectId: string; id: string; description: string }; pathAbs: { inputPath: string; readOnly: boolean } }>;
         truncated: boolean;
         omitted: Record<string, number>;
       };
     });
     const initialPlan = plans.find((snapshot) => snapshot.executionId === "p1")!;
     const finalPlan = plans.find((snapshot) => snapshot.executionId === "p2")!;
-    assert.equal(initialPlan.context.source.id, "origin");
-    assert.equal(initialPlan.context.source.description, "start");
-    assert.equal(initialPlan.context.source.artifact, null);
-    assert.equal(initialPlan.context.goal.id, "goal");
-    assert.deepEqual(initialPlan.context.leafFacts.map((fact) => fact.id), ["origin"]);
-    assert.deepEqual(initialPlan.context.unconsumedHints.map((hint) => hint.id), ["h001"]);
-    assert.deepEqual(finalPlan.context.leafFacts.map((fact) => fact.id), ["f001"]);
-    assert.equal(finalPlan.context.openIntents.length, 0);
-    assert.equal(finalPlan.context.unconsumedHints.length, 0);
+    const initialProject = initialPlan.context.projects[project.id]!;
+    const finalProject = finalPlan.context.projects[project.id]!;
+    assert.deepEqual(Object.keys(initialPlan.context.projects), [project.id]);
+    assert.equal("title" in initialProject, false, "Plan current Project omits the source-duplicate title");
+    assert.deepEqual(initialProject.source, { projectId: project.id, id: "origin", description: "start" });
+    assert.deepEqual(initialProject.goal, { projectId: project.id, id: "goal", description: "done" });
+    assert.deepEqual(initialProject.leafFacts.map((source) => source.ref), [
+      { projectId: project.id, id: "origin", description: "start" },
+    ]);
+    assert.deepEqual(initialProject.unconsumedHints.map((hint) => hint.id), ["h0001"]);
+    assert.deepEqual(initialPlan.context.external.map((item) => item.factRef), [
+      { projectId: external.id, id: "f0001", description: "external verified" },
+    ]);
+    assert.equal(initialPlan.context.external[0]!.pathAbs.readOnly, true);
+    assert.match(initialPlan.context.external[0]!.pathAbs.inputPath, /path_abs_f0001$/);
+    assert.deepEqual(finalProject.leafFacts.map((source) => source.ref), [
+      { projectId: project.id, id: "f0001", description: "Work completed" },
+    ]);
+    assert.equal(finalProject.openIntents.length, 0);
+    assert.equal(finalProject.unconsumedHints.length, 0);
     assert.equal(finalPlan.context.truncated, false);
     assert.equal(logs.some((name) => name.includes("output")), false);
+
+    const workerTmp = join(projectDir, ".tmp");
+    assert.ok(workers.calls.length > 0);
+    assert.ok(workers.calls.every((call) => call.cwd === workerTmp), "every Worker phase runs from the Project .tmp directory");
+    assert.ok(workers.calls.every((call) => call.tmpDir === workerTmp), "protocol scratch path matches the Worker cwd");
+    assert.equal(workers.calls.find((call) => call.prompt.startsWith("# Analyze"))?.timeout, 300_000);
+    assert.equal(existsSync(workerTmp), true);
 
     const supervisePrompt = workers.calls.find((call) => call.type === "supervise")!.prompt;
     const planPrompt = workers.calls.find((call) => call.type === "plan")!.prompt;
@@ -177,7 +244,7 @@ test("Plan, Supervise and Execute mutate Graph only through HTTP", async () => {
     assert.match(planPrompt, /Available Skills:[\s\S]*"review"/);
     assert.match(planPrompt, /copy every selected reference exactly/);
     assert.match(planPrompt, /Exercise independent judgment/);
-    assert.match(planPrompt, /Source:/);
+    assert.doesNotMatch(planPrompt, /\nSource:\n|\nGoal:\n/);
     assert.doesNotMatch(planPrompt, /Origin:/);
     assert.match(executePrompt, /Available Skills:[\s\S]*"review"/);
     assert.match(supervisePrompt, /Use for proof review/);
@@ -249,7 +316,7 @@ test("Execute resumes a failed started worker through Finalize", async () => {
   try {
     const project = await graph.createProject({ title: "P", target: "start", goal: "done", scope: "s" });
     const intent = await graph.createIntent(project.id, {
-      from: [{ projectId: project.id, factId: "origin", description: "start" }],
+      from: [{ projectId: project.id, id: "origin", description: "start" }],
       description: "Recover partial work",
       createdBy: "test",
     });
@@ -271,6 +338,7 @@ test("Execute resumes a failed started worker through Finalize", async () => {
       '{"kind":"fact","description":"Recovered confirmed result","artifact":{"filename":"recovered.md","mediaType":"text/markdown","content":"Recovered confirmed result\\n"}}',
     );
     const config = configuration(root);
+    workers.outputs.plan.push('{"pathOverview":"origin to Recovered confirmed result","verifiedCore":["Recovered confirmed result"]}');
     const executor = new TaskExecutor(
       config,
       { key: "project-1", id: project.id, source: "start", goal: "done" },
@@ -291,10 +359,10 @@ test("Execute resumes a failed started worker through Finalize", async () => {
     assert.match(executeCalls[1]!.prompt, /"executionId": "e-resume"/);
     const result = await graph.getProject(project.id);
     assert.deepEqual(result.intents[0]!.to, {
-      projectId: project.id, factId: "f001", description: "Recovered confirmed result",
+      projectId: project.id, id: "f0001", description: "Recovered confirmed result",
     });
     assert.equal(result.intents[0]!.concludedBy, "finalize:e-resume");
-    assert.equal(result.facts.find((fact) => fact.id === "f001")?.description, "Recovered confirmed result");
+    assert.equal(result.facts.find((fact) => fact.id === "f0001")?.description, "Recovered confirmed result");
     const finalizeLog = readdirSync(join(projects, project.id, "logs")).find((name) => /^graph-.*-finalize\.json$/.test(name));
     assert.ok(finalizeLog);
     const finalizeSnapshot = JSON.parse(readFileSync(join(projects, project.id, "logs", finalizeLog), "utf8")) as {
@@ -316,21 +384,21 @@ test("Execute rejects a source Artifact changed by the worker", async () => {
   const registry = new ProjectStoreRegistry(projects);
   const server = new GraphHttpServer(registry);
   await server.start();
-  const graph = new GraphClient(server.baseUrl);
+  const graph = new GraphClient(server.baseUrl, { projectsRoot: projects });
   try {
     const project = await graph.createProject({ title: "P", target: "immutable source", goal: "done" });
     const sourcePath = join(root, "source.md");
     writeFileSync(sourcePath, "immutable source details\n");
     const sourceArtifact = await graph.uploadArtifact(project.id, sourcePath, "text/markdown");
     const sourceIntent = await graph.createIntent(project.id, {
-      from: [{ projectId: project.id, factId: "origin", description: "immutable source" }],
+      from: [{ projectId: project.id, id: "origin", description: "immutable source" }],
       description: "Materialize one source file", createdBy: "test",
     });
     const source = await graph.conclude(project.id, sourceIntent.id, {
       description: "Immutable source file", artifact: sourceArtifact, concludedBy: "test",
     });
     const intent = await graph.createIntent(project.id, {
-      from: [{ projectId: project.id, factId: source.fact.id, description: source.fact.description }],
+      from: [{ projectId: project.id, id: source.fact.id, description: source.fact.description }],
       description: "Attempt mutation", createdBy: "test",
     });
     const federation = new FederationBus();
@@ -347,7 +415,7 @@ test("Execute rejects a source Artifact changed by the worker", async () => {
     await assert.rejects(executor.execute(project.id, intent, "e-tamper"), /Artifact size or type mismatch|Artifact hash mismatch/);
     const result = await graph.getProject(project.id);
     assert.equal(result.intents[1]?.to, null);
-    assert.deepEqual(result.facts.map((fact) => fact.id).sort(), ["f001", "goal", "origin"]);
+    assert.deepEqual(result.facts.map((fact) => fact.id).sort(), ["f0001", "goal", "origin"]);
   } finally {
     await server.stop();
     registry.close();
@@ -366,7 +434,7 @@ test("Execute rejects custom profile configuration drift", async () => {
   try {
     const project = await graph.createProject({ title: "P", target: "start", goal: "done" });
     const intent = await graph.createIntent(project.id, {
-      from: [{ projectId: project.id, factId: "origin", description: "start" }],
+      from: [{ projectId: project.id, id: "origin", description: "start" }],
       customProfile: "Use for primary research.",
       customProfileDigest: "0000000000000000",
       description: "Research", createdBy: "test",
@@ -443,7 +511,7 @@ test("Plan and Supervise retry transient worker and malformed-output failures", 
     // Plan: malformed output on the first attempt, valid intents on retry.
     workers.outputs.plan.push(
       '{"kind":"intents","intents":[{"from":[{"projectId":"origin"',
-      `{"kind":"intents","intents":[{"from":[{"projectId":"${project.id}","factId":"origin","description":"start"}],"hintIds":[],"customProfile":null,"description":"Do the work"}]}`,
+      `{"kind":"intents","intents":[{"from":[{"projectId":"${project.id}","id":"origin","description":"start"}],"hintIds":[],"customProfile":null,"description":"Do the work"}]}`,
     );
     await executor.plan(project.id, "p-retry");
     const planCalls = workers.calls.filter((call) => call.type === "plan");
@@ -469,6 +537,181 @@ test("Plan and Supervise retry transient worker and malformed-output failures", 
   }
 });
 
+test("syncPaths caches deterministic Path Abstracts and never re-runs the worker", async () => {
+  const root = mkdtempSync(join(tmpdir(), "peak-analyze-cache-"));
+  const projects = join(root, "projects");
+  mkdirSync(projects, { recursive: true });
+  const registry = new ProjectStoreRegistry(projects);
+  const server = new GraphHttpServer(registry);
+  await server.start();
+  const graph = new GraphClient(server.baseUrl);
+  try {
+    const project = await graph.createProject({ title: "P", target: "start", goal: "done", scope: "s" });
+    const intent = await graph.createIntent(project.id, {
+      from: [{ projectId: project.id, id: "origin", description: "start" }],
+      description: "Do the work", createdBy: "test",
+    });
+    await graph.conclude(project.id, intent.id, { description: "Work completed", artifact: null, concludedBy: "test" });
+    const federation = new FederationBus();
+    federation.register(project.id, join(projects, project.id), project.scope);
+    const workers = new FakeWorkers();
+    const executor = new TaskExecutor(
+      configuration(root),
+      { key: "project-1", id: project.id, source: "start", goal: "done" },
+      graph,
+      workers,
+      federation,
+      join(projects, project.id),
+    );
+
+    workers.outputs.plan.push('{"pathOverview":"cached analysis","verifiedCore":["Work completed"]}');
+    await executor.syncPaths(project.id);
+    const dispatches = workers.calls.filter((call) => call.type === "plan").length;
+    assert.equal(dispatches, 1);
+
+    await executor.syncPaths(project.id);
+    assert.equal(workers.calls.filter((call) => call.type === "plan").length, dispatches, "cached Path Abstract: no worker dispatch");
+    const info = await graph.getPathAbstract(project.id, "f0001");
+    assert.equal(info.pathOverview, "cached analysis");
+  } finally {
+    await server.stop();
+    registry.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("syncPaths falls back to a description join when the worker keeps failing", async () => {
+  const root = mkdtempSync(join(tmpdir(), "peak-analyze-fallback-"));
+  const projects = join(root, "projects");
+  mkdirSync(projects, { recursive: true });
+  const registry = new ProjectStoreRegistry(projects);
+  const server = new GraphHttpServer(registry);
+  await server.start();
+  const graph = new GraphClient(server.baseUrl);
+  try {
+    const project = await graph.createProject({ title: "P", target: "start", goal: "done", scope: "s" });
+    const intent = await graph.createIntent(project.id, {
+      from: [{ projectId: project.id, id: "origin", description: "start" }],
+      description: "Do the work", createdBy: "test",
+    });
+    await graph.conclude(project.id, intent.id, { description: "Work completed", artifact: null, concludedBy: "test" });
+    const federation = new FederationBus();
+    federation.register(project.id, join(projects, project.id), project.scope);
+    const workers = new FakeWorkers();
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      workers.outputs.plan.push({ text: "", stdout: "", stderr: "provider down", returncode: 1, timedOut: false, cancelled: false, started: true });
+    }
+    const executor = new TaskExecutor(
+      configuration(root),
+      { key: "project-1", id: project.id, source: "start", goal: "done" },
+      graph,
+      workers,
+      federation,
+      join(projects, project.id),
+    );
+
+    await executor.syncPaths(project.id);
+    assert.equal(workers.calls.filter((call) => call.type === "plan").length, 3, "all analysis attempts exhausted before the fallback");
+    // The fallback is persisted too, so the failure is not retried on every restart.
+    const info = await graph.getPathAbstract(project.id, "f0001");
+    assert.equal(info.pathOverview, "start → Work completed");
+  } finally {
+    await server.stop();
+    registry.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("syncPaths persists structured Path Abstract content", async () => {
+  const root = mkdtempSync(join(tmpdir(), "peak-analyze-cap-"));
+  const projects = join(root, "projects");
+  mkdirSync(projects, { recursive: true });
+  const registry = new ProjectStoreRegistry(projects);
+  const server = new GraphHttpServer(registry);
+  await server.start();
+  const graph = new GraphClient(server.baseUrl);
+  try {
+    const project = await graph.createProject({ title: "P", target: "start", goal: "done", scope: "s" });
+    const intent = await graph.createIntent(project.id, {
+      from: [{ projectId: project.id, id: "origin", description: "start" }],
+      description: "Do the work", createdBy: "test",
+    });
+    await graph.conclude(project.id, intent.id, { description: "Work completed", artifact: null, concludedBy: "test" });
+    const federation = new FederationBus();
+    federation.register(project.id, join(projects, project.id), project.scope);
+    const workers = new FakeWorkers();
+    workers.outputs.plan.push(JSON.stringify({ pathOverview: "start to verified result", verifiedCore: ["core one", "core two"] }));
+    const executor = new TaskExecutor(
+      configuration(root),
+      { key: "project-1", id: project.id, source: "start", goal: "done" },
+      graph,
+      workers,
+      federation,
+      join(projects, project.id),
+    );
+
+    await executor.syncPaths(project.id);
+    const abstract = await graph.getPathAbstract(project.id, "f0001");
+    assert.equal(abstract.pathOverview, "start to verified result");
+    assert.deepEqual(abstract.verifiedCore, ["core one", "core two"]);
+    assert.deepEqual(JSON.parse(readFileSync(join(projects, project.id, "artifacts", "path_abs_f0001"), "utf8")), abstract);
+  } finally {
+    await server.stop();
+    registry.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Analyze builds Fact n from its direct predecessor path_abs description", async () => {
+  const root = mkdtempSync(join(tmpdir(), "peak-analyze-chain-"));
+  const projects = join(root, "projects");
+  mkdirSync(projects, { recursive: true });
+  const registry = new ProjectStoreRegistry(projects);
+  const server = new GraphHttpServer(registry);
+  await server.start();
+  const graph = new GraphClient(server.baseUrl);
+  try {
+    const project = await graph.createProject({ title: "P", target: "start", goal: "done", scope: "s" });
+    const first = await graph.createIntent(project.id, {
+      from: [{ projectId: project.id, id: "origin", description: "start" }],
+      description: "First step", createdBy: "test",
+    });
+    await graph.conclude(project.id, first.id, { description: "First verified", artifact: null, concludedBy: "test" });
+    const second = await graph.createIntent(project.id, {
+      from: [{ projectId: project.id, id: "f0001", description: "First verified" }],
+      description: "Second step", createdBy: "test",
+    });
+    await graph.conclude(project.id, second.id, { description: "Second verified", artifact: null, concludedBy: "test" });
+
+    const federation = new FederationBus();
+    federation.register(project.id, join(projects, project.id), project.scope);
+    const workers = new FakeWorkers();
+    workers.outputs.plan.push('{"pathOverview":"start to first","verifiedCore":["first core"]}');
+    workers.outputs.plan.push('{"pathOverview":"start through first to second","verifiedCore":["first core","second core"]}');
+    const executor = new TaskExecutor(
+      configuration(root),
+      { key: "project-1", id: project.id, source: "start", goal: "done" },
+      graph, workers, federation, join(projects, project.id),
+    );
+
+    await executor.syncPaths(project.id);
+    const analyzeCalls = workers.calls.filter((call) => call.type === "plan");
+    assert.equal(analyzeCalls.length, 2);
+    assert.equal(analyzeCalls[0]!.timeout, 300_000);
+    assert.equal(analyzeCalls[1]!.timeout, 300_000);
+    assert.match(analyzeCalls[1]!.prompt, /path_abs_f0001/);
+    assert.match(analyzeCalls[1]!.prompt, /start to first/);
+    assert.match(analyzeCalls[1]!.prompt, /First verified/);
+    const current = await graph.getPathAbstract(project.id, "f0002");
+    assert.equal(current.pathOverview, "start through first to second");
+    assert.deepEqual(current.verifiedCore, ["first core", "second core"]);
+  } finally {
+    await server.stop();
+    registry.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 /** A worker that simulates a concurrent Execute consuming the current leaf
  * while Plan is thinking, then returns a stale Plan rooted at that leaf. */
 class StaleInjectingWorkers implements TaskWorkers {
@@ -487,21 +730,21 @@ class StaleInjectingWorkers implements TaskWorkers {
     if (type !== "plan") throw new Error(`unexpected worker type ${type}`);
     this.planCalls += 1;
     if (this.planCalls === 1) {
-      // A concurrent Execute concludes f001 -> f002 while Plan is thinking,
-      // then Plan returns an Intent still rooted at the now-superseded f001.
+      // A concurrent Execute concludes f0001 -> f0002 while Plan is thinking,
+      // then Plan returns an Intent still rooted at the now-superseded f0001.
       const concurrent = await this.graph.createIntent(this.projectId, {
-        from: [{ projectId: this.projectId, factId: "f001", description: "Work completed" }],
+        from: [{ projectId: this.projectId, id: "f0001", description: "Work completed" }],
         hintIds: [], description: "concurrent consume", createdBy: "concurrent",
       });
       await this.graph.conclude(this.projectId, concurrent.id, { description: this.f002, artifact: null, concludedBy: "concurrent" });
-      return this.intent("f001", "Work completed", "stale intent from a consumed leaf");
+      return this.intent("f0001", "Work completed", "stale intent from a consumed leaf");
     }
-    return this.intent("f002", this.f002, "valid intent from the current leaf");
+    return this.intent("f0002", this.f002, "valid intent from the current leaf");
   }
-  private intent(factId: string, description: string, intentDescription: string): WorkerResult {
+  private intent(id: string, description: string, intentDescription: string): WorkerResult {
     const output = JSON.stringify({
       kind: "intents",
-      intents: [{ from: [{ projectId: this.projectId, factId, description }], hintIds: [], customProfile: null, description: intentDescription }],
+      intents: [{ from: [{ projectId: this.projectId, id, description }], hintIds: [], customProfile: null, description: intentDescription }],
     });
     return { text: output, stdout: output, stderr: "", returncode: 0, timedOut: false, cancelled: false, started: true };
   }
@@ -523,14 +766,18 @@ test("Plan re-plans instead of failing when a concurrent Execute consumes a sour
     const config = configuration(root);
     const projectConfig = { key: "project-1", source: config.board.projects[0]!.source, goal: config.board.projects[0]!.goal };
 
-    // Establish the current leaf f001 ("Work completed") through a normal round.
+    // Establish the current leaf f0001 ("Work completed") through a normal round.
     const seed = new FakeWorkers();
     const seedExecutor = new TaskExecutor(config, projectConfig, graph, seed, federation, projectDir);
-    seed.outputs.plan.push(`{"kind":"intents","intents":[{"from":[{"projectId":"${project.id}","factId":"origin","description":"start"}],"hintIds":[],"customProfile":null,"description":"Do the work"}]}`);
+    seed.outputs.plan.push(`{"kind":"intents","intents":[{"from":[{"projectId":"${project.id}","id":"origin","description":"start"}],"hintIds":[],"customProfile":null,"description":"Do the work"}]}`);
     await seedExecutor.plan(project.id, "p1");
     const firstIntent = (await graph.getProject(project.id)).intents[0]!;
     seed.outputs.execute.push('{"kind":"fact","description":"Work completed","artifact":null}');
     await seedExecutor.execute(project.id, firstIntent, "e1");
+    // Generate f0001's path_abs up front so the re-plan's pre-Plan hook
+    // hits the cache and never touches the stale-injecting worker.
+    seed.outputs.plan.push('{"pathOverview":"origin to Work completed","verifiedCore":["Work completed"]}');
+    await seedExecutor.syncPaths(project.id);
 
     const f002 = "Deeper analysis built on the completed work";
     const workers = new StaleInjectingWorkers(graph, project.id, f002);
@@ -541,7 +788,7 @@ test("Plan re-plans instead of failing when a concurrent Execute consumes a sour
     const after = await graph.getProject(project.id);
     const replanned = after.intents.find((intent) => intent.createdBy === "plan:p2");
     assert.ok(replanned, "the re-planned Intent was persisted");
-    assert.deepEqual(replanned!.from, [{ projectId: project.id, factId: "f002", description: f002 }]);
+    assert.deepEqual(replanned!.from, [{ projectId: project.id, id: "f0002", description: f002 }]);
   } finally {
     await server.stop();
     registry.close();

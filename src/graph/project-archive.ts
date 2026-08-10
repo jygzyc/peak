@@ -3,13 +3,18 @@ import { createReadStream, existsSync, lstatSync, readFileSync, readdirSync } fr
 import { join } from "node:path";
 import { create as createTar, extract as extractTar, list as listTar } from "tar";
 import {
-  requireCustomProfileDigest, requireDescription, requireFactDescription, requireIntentDescription, requireShortDescription, requireUuid,
+  hasUnsafeFilenameSegments, requireCustomProfileDigest, requireDescription, requireFactDescription, requireIntentDescription, requireShortDescription, requireUuid, UUID_PATTERN,
 } from "./api.js";
 import type { ArtifactRef, FactRef, ProjectGraph } from "./types.js";
 
+/** sha256 hex pattern; reused for artifact hash validation in this module. */
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+/** localTimestamp() output format; validates every persisted timestamp. */
+const LOCAL_TIMESTAMP_PATTERN = /^\d{8}T\d{6}\.\d{3}$/;
+
 export const PROJECT_ARCHIVE_FORMAT = "peak-project-archive";
 export const PROJECT_ARCHIVE_GRAPH = "graph.json";
-export const PROJECT_ARCHIVE_DATABASE = "analysis.db";
+export const PROJECT_ARCHIVE_DATABASE = "project.db";
 export const PROJECT_ARCHIVE_MANIFEST = "manifest.json";
 
 export interface BoardProjectBlock { id: string; source: string; goal: string }
@@ -90,7 +95,7 @@ export function validateProjectArchiveGraph(graph: ProjectGraph): void {
   const facts = new Map(graph.facts.map((fact) => [fact.id, fact]));
   if (facts.size !== graph.facts.length || !facts.has("origin") || !facts.has("goal")) throw new Error("Project archive has an invalid Fact set");
   for (const fact of graph.facts) {
-    if (fact.id !== "origin" && fact.id !== "goal" && !/^f\d{3,}$/.test(fact.id)) throw new Error(`invalid Fact id: ${fact.id}`);
+    if (fact.id !== "origin" && fact.id !== "goal" && !/^f\d{4,}$/.test(fact.id)) throw new Error(`invalid Fact id: ${fact.id}`);
     if (fact.id === "origin" || fact.id === "goal") {
       requireDescription(fact.description, `Fact ${fact.id}`);
       if (fact.artifact !== null) throw new Error(`reserved Fact ${fact.id} cannot have an Artifact`);
@@ -103,31 +108,31 @@ export function validateProjectArchiveGraph(graph: ProjectGraph): void {
   const intentIds = new Set<string>();
   let completions = 0;
   for (const intent of graph.intents) {
-    if (!/^i\d{3,}$/.test(intent.id) || intentIds.has(intent.id)) throw new Error(`invalid or duplicate Intent id: ${intent.id}`);
+    if (!/^i\d{4,}$/.test(intent.id) || intentIds.has(intent.id)) throw new Error(`invalid or duplicate Intent id: ${intent.id}`);
     intentIds.add(intent.id);
     if (!Array.isArray(intent.from) || intent.from.length === 0) throw new Error(`Intent ${intent.id} has no source`);
     const sourceKeys = new Set<string>();
     for (const ref of intent.from) {
       validateFactRef(ref, false);
-      const key = `${ref.projectId}/${ref.factId}`;
+      const key = `${ref.projectId}/${ref.id}`;
       if (sourceKeys.has(key)) throw new Error(`Intent ${intent.id} has duplicate sources`);
       sourceKeys.add(key);
-      if (ref.projectId === graph.project.id && facts.get(ref.factId)?.description !== ref.description) {
+      if (ref.projectId === graph.project.id && facts.get(ref.id)?.description !== ref.description) {
         throw new Error(`Intent ${intent.id} has a non-canonical local FactRef`);
       }
     }
     if (intent.to) {
       validateFactRef(intent.to, true);
-      if (intent.to.projectId !== graph.project.id || facts.get(intent.to.factId)?.description !== intent.to.description) {
+      if (intent.to.projectId !== graph.project.id || facts.get(intent.to.id)?.description !== intent.to.description) {
         throw new Error(`Intent ${intent.id} has an invalid target FactRef`);
       }
-      if (intent.to.factId === "goal") completions += 1;
+      if (intent.to.id === "goal") completions += 1;
     }
     if ((intent.customProfile === null) !== (intent.customProfileDigest === null)) throw new Error(`Intent ${intent.id} has incomplete custom profile metadata`);
     if (intent.customProfile !== null) requireShortDescription(intent.customProfile, "customProfile");
     if (intent.customProfileDigest !== null) requireCustomProfileDigest(intent.customProfileDigest);
     if (!Array.isArray(intent.hintIds) || new Set(intent.hintIds).size !== intent.hintIds.length) throw new Error(`Intent ${intent.id} has invalid Hint ids`);
-    for (const hintId of intent.hintIds) if (!/^h\d{3,}$/.test(hintId)) throw new Error(`invalid Hint id: ${hintId}`);
+    for (const hintId of intent.hintIds) if (!/^h\d{4,}$/.test(hintId)) throw new Error(`invalid Hint id: ${hintId}`);
     requireIntentDescription(intent.description);
     requireShortDescription(intent.createdBy, "createdBy");
     timestamp(intent.createdAt, `Intent ${intent.id}.createdAt`);
@@ -139,7 +144,7 @@ export function validateProjectArchiveGraph(graph: ProjectGraph): void {
   if (completions !== 1) throw new Error("completed Project archive must have exactly one Goal completion");
   const hintIds = new Set<string>();
   for (const hint of graph.hints) {
-    if (!/^h\d{3,}$/.test(hint.id) || hintIds.has(hint.id)) throw new Error(`invalid or duplicate Hint id: ${hint.id}`);
+    if (!/^h\d{4,}$/.test(hint.id) || hintIds.has(hint.id)) throw new Error(`invalid or duplicate Hint id: ${hint.id}`);
     hintIds.add(hint.id);
     requireShortDescription(hint.content, "hint.content");
     requireShortDescription(hint.creator, "hint.creator");
@@ -154,7 +159,7 @@ function parseProjectArchiveManifest(value: unknown): ProjectArchiveManifest {
   const manifest = record(value, "manifest");
   exact(manifest, ["format", "exportedAt", "project", "graph", "database", "artifacts"], "manifest");
   if (manifest.format !== PROJECT_ARCHIVE_FORMAT) throw new Error("unsupported Project archive format");
-  if (typeof manifest.exportedAt !== "string" || !/^\d{8}T\d{6}\.\d{3}$/.test(manifest.exportedAt)) {
+  if (typeof manifest.exportedAt !== "string" || !LOCAL_TIMESTAMP_PATTERN.test(manifest.exportedAt)) {
     throw new Error("invalid Project archive exportedAt");
   }
   if (manifest.graph !== PROJECT_ARCHIVE_GRAPH || manifest.database !== PROJECT_ARCHIVE_DATABASE) {
@@ -163,7 +168,7 @@ function parseProjectArchiveManifest(value: unknown): ProjectArchiveManifest {
   const project = record(manifest.project, "manifest.project");
   exact(project, ["id", "source", "goal"], "manifest.project");
   const id = string(project.id, "manifest.project.id");
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
+  if (!UUID_PATTERN.test(id)) {
     throw new Error("invalid Project archive id");
   }
   if (!Array.isArray(manifest.artifacts)) throw new Error("manifest.artifacts must be an array");
@@ -172,7 +177,7 @@ function parseProjectArchiveManifest(value: unknown): ProjectArchiveManifest {
     const item = record(value, `manifest.artifacts[${index}]`);
     exact(item, ["path", "sha256", "mediaType", "sizeBytes", "filename"], `manifest.artifacts[${index}]`);
     const sha256 = string(item.sha256, "artifact.sha256");
-    if (!/^[0-9a-f]{64}$/.test(sha256) || seen.has(sha256)) throw new Error("invalid or duplicate Project archive Artifact hash");
+    if (!SHA256_PATTERN.test(sha256) || seen.has(sha256)) throw new Error("invalid or duplicate Project archive Artifact hash");
     seen.add(sha256);
     if (item.path !== `artifacts/${sha256}`) throw new Error("invalid Project archive Artifact path");
     if (!Number.isSafeInteger(item.sizeBytes) || (item.sizeBytes as number) < 0) throw new Error("invalid Project archive Artifact size");
@@ -230,30 +235,27 @@ function archiveEntry(path: string, type: string): boolean {
 }
 
 function validateArtifact(artifact: ArtifactRef): void {
-  if (!/^[0-9a-f]{64}$/.test(artifact.sha256) || artifact.path !== `artifacts/${artifact.sha256}`) throw new Error("invalid Artifact reference");
+  if (!SHA256_PATTERN.test(artifact.sha256) || artifact.path !== `artifacts/${artifact.sha256}`) throw new Error("invalid Artifact reference");
   requireDescription(artifact.mediaType, "artifact.mediaType");
   if (!Number.isSafeInteger(artifact.sizeBytes) || artifact.sizeBytes < 0) throw new Error("invalid Artifact size");
   if (artifact.filename !== null) {
     requireShortDescription(artifact.filename, "artifact.filename");
-    if (artifact.filename.includes("\\") || artifact.filename.startsWith("/")
-      || artifact.filename.split("/").some((segment) => segment === "" || segment === "." || segment === ".." || segment.startsWith("."))) {
-      throw new Error("invalid Artifact filename");
-    }
+    if (hasUnsafeFilenameSegments(artifact.filename)) throw new Error("invalid Artifact filename");
   }
 }
 
 function validateFactRef(ref: FactRef, allowGoal: boolean): void {
   requireUuid(ref.projectId);
-  if (ref.factId === "goal") {
+  if (ref.id === "goal") {
     if (!allowGoal) throw new Error("Goal cannot be an Intent source");
-  } else if (ref.factId !== "origin" && !/^f\d{3,}$/.test(ref.factId)) {
-    throw new Error(`invalid FactRef Fact id: ${ref.factId}`);
+  } else if (ref.id !== "origin" && !/^f\d{4,}$/.test(ref.id)) {
+    throw new Error(`invalid FactRef Fact id: ${ref.id}`);
   }
   requireDescription(ref.description, "FactRef.description");
 }
 
 function timestamp(value: string, label: string): void {
-  if (!/^\d{8}T\d{6}\.\d{3}$/.test(value)) throw new Error(`invalid ${label}`);
+  if (!LOCAL_TIMESTAMP_PATTERN.test(value)) throw new Error(`invalid ${label}`);
 }
 
 function regularFile(path: string): boolean {

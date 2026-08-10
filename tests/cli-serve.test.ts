@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-test("peak run starts in the background, persists Projects, and exposes status", async () => {
+test("peak start starts in the background, persists Projects, and exposes status", async () => {
   const root = mkdtempSync(join(tmpdir(), "peak-board-"));
   const peakHome = join(root, "peak-home");
   const taskDir = join(root, "task");
@@ -22,7 +22,7 @@ test("peak run starts in the background, persists Projects, and exposes status",
     scheduler: { intervalMs: 60_000 },
   }));
   try {
-    const first = await runCli(["run", taskDir, "--peak-home", peakHome, "--port", "0", "--no-install-skills"]);
+    const first = await runCli(["start", taskDir, "--peak-home", peakHome, "--port", "0", "--no-install-skills"]);
     assert.equal(first.code, 0, first.stderr);
     const baseUrl = webUrl(first.stdout);
     const projects = await fetch(`${baseUrl}/api/projects`).then(async (response) => response.json()) as Array<{ id: string; title: string }>;
@@ -34,11 +34,12 @@ test("peak run starts in the background, persists Projects, and exposes status",
 
     const status = spawnSync(process.execPath, ["dist/cli.js", "status", "--peak-home", peakHome], { cwd: process.cwd(), encoding: "utf8" });
     assert.equal(status.status, 0, status.stderr);
-    assert.match(status.stdout, /server: running/);
+    assert.match(status.stdout, /task: board \(start, pid \d+\)/);
     assert.match(status.stdout, new RegExp(baseUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-    stop(peakHome);
+    const stopped = stop(peakHome);
+    assert.match(stopped.stdout, /stopped task: \d+/);
 
-    const second = await runCli(["run", taskDir, "--peak-home", peakHome, "--port", "0", "--no-install-skills"]);
+    const second = await runCli(["start", taskDir, "--peak-home", peakHome, "--port", "0", "--no-install-skills"]);
     assert.equal(second.code, 0, second.stderr);
     const reused = await fetch(`${webUrl(second.stdout)}/api/projects`).then(async (response) => response.json()) as Array<{ id: string }>;
     assert.deepEqual(reused.map((project) => project.id).sort(), projects.map((project) => project.id).sort());

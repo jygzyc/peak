@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Peak Tasks</title>
+<style>
+:root{--ink:#172033;--muted:#697386;--line:#dfe4ec;--bg:#f5f7fa;--blue:#4f46e5;--rose:#b4233b;--green:#15803d;--shadow:0 12px 34px rgba(30,41,59,.07)}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:var(--bg);color:var(--ink);font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.shell{min-height:100vh;display:grid;grid-template-rows:58px minmax(0,1fr)}
+header{display:flex;align-items:center;gap:12px;padding:0 18px;background:rgba(255,255,255,.94);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5;backdrop-filter:blur(12px)}
+header strong{font-size:15px}.spacer{flex:1}
+.btn{border:1px solid var(--line);border-radius:9px;background:#fff;padding:7px 10px;color:inherit;font:650 12px/1.4 inherit;text-decoration:none;cursor:pointer}
+.btn:hover{background:#f8fafc;border-color:#cbd3df}.btn.primary{color:#4338ca;border-color:#c7d2fe;background:#eef2ff}.btn.danger{color:var(--rose);border-color:#f1c2cb;background:#fff5f6}.btn:disabled{opacity:.45;cursor:not-allowed}
+main{padding:22px;max-width:1320px;margin:0 auto;width:100%;min-height:0}.workspace{display:grid;grid-template-columns:minmax(320px,.92fr) minmax(430px,1.08fr);gap:18px;align-items:start}
+.panel{border:1px solid var(--line);border-radius:16px;background:#fff;box-shadow:var(--shadow);overflow:hidden}.panel-head{padding:17px 18px 13px;border-bottom:1px solid #edf0f4}.panel-head h2{margin:0;font-size:15px}.panel-head p{margin:4px 0 0;color:var(--muted);font-size:12px}
+.browser{min-height:calc(100vh - 102px);display:grid;grid-template-rows:auto minmax(150px,1fr) auto}.task-list{padding:9px;display:grid;align-content:start;gap:5px;max-height:calc(100vh - 350px);overflow:auto}
+.task-option{width:100%;border:1px solid transparent;border-radius:12px;background:transparent;padding:12px;text-align:left;color:inherit;cursor:pointer}.task-option:hover{background:#f7f8fb}.task-option.selected{border-color:#cfd3ff;background:#f3f3ff;box-shadow:0 0 0 2px rgba(99,102,241,.07)}
+.task-head{display:flex;align-items:center;justify-content:space-between;gap:10px}.task-head strong{font-size:14px}.task-summary{margin-top:7px;color:var(--muted);font-size:11px}.task-summary code{font:10px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;display:block;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.badge{border-radius:999px;padding:2px 9px;font-size:10px;font-weight:750;letter-spacing:.05em;text-transform:uppercase;border:1px solid var(--line);color:var(--muted);white-space:nowrap}.badge.running{color:var(--green);border-color:#bfe6cb;background:#f0faf3}
+.selection{border-top:1px solid #edf0f4;padding:15px 18px;background:#fbfcfe}.selection h3{margin:0 0 4px;font-size:14px}.meta{color:var(--muted);font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}.projects{display:flex;gap:6px;flex-wrap:wrap;margin:11px 0}.actions{display:flex;gap:8px;flex-wrap:wrap}.message{color:var(--muted);padding:28px 20px;text-align:center}.message.error{color:var(--rose)}
+.create-body{padding:18px}.grid{display:grid;gap:12px}.grid.two{grid-template-columns:1fr 1fr}label{display:grid;gap:5px;font-size:12px;color:var(--muted);font-weight:650}input,textarea{width:100%;border:1px solid var(--line);border-radius:10px;padding:9px 11px;font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink);background:#fff;outline:none}input:focus,textarea:focus{border-color:#818cf8;box-shadow:0 0 0 3px rgba(99,102,241,.11)}textarea{min-height:142px;resize:vertical}.form-actions{display:flex;justify-content:flex-end;margin-top:14px}
+@media(max-width:860px){main{padding:14px}.workspace{grid-template-columns:1fr}.browser{min-height:auto}.task-list{max-height:420px}.grid.two{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="shell">
+  <header><strong>Peak Tasks</strong><span id="note" class="meta"></span><span class="spacer"></span><a class="btn" href="/">Graph</a><button id="refresh" class="btn">Refresh</button></header>
+  <main><div class="workspace">
+    <section class="panel browser" aria-labelledby="existing-title">
+      <div class="panel-head"><h2 id="existing-title">Existing tasks</h2><p>Select a task to inspect and control its runtime.</p></div>
+      <div id="list" class="task-list"><div class="message">Loading…</div></div>
+      <div id="selection" class="selection"><div class="message">Select a task from the list.</div></div>
+    </section>
+    <section class="panel" aria-labelledby="create-title">
+      <div class="panel-head"><h2 id="create-title">Create task</h2><p>Define a new board without leaving the task browser.</p></div>
+      <div class="create-body">
+        <div class="grid two">
+          <label>Task name<input id="name" placeholder="my-board" pattern="[A-Za-z0-9][A-Za-z0-9._-]*"></label>
+          <label>Skills (comma-separated, optional)<input id="skills" placeholder="review, security"></label>
+        </div>
+        <div class="grid" style="margin-top:12px">
+          <label>Projects (JSON array of {source, goal})<textarea id="projects" spellcheck="false" placeholder='[{"source":"Research inputs","goal":"research result"}]'></textarea></label>
+          <label>Workers (JSON array)<textarea id="workers" spellcheck="false" placeholder='[{"type":"pi","taskTypes":["plan","supervise","execute"],"maxRunning":1,"priority":1,"env":{}}]'></textarea></label>
+        </div>
+        <div class="form-actions"><button id="create" class="btn primary">Create task</button></div>
+      </div>
+    </section>
+  </div></main>
+</div>
+<script>
+const list=document.querySelector('#list'),selection=document.querySelector('#selection'),note=document.querySelector('#note');
+let tasks=[],selectedName=null;
+async function api(path,options={}){const headers={...(options.headers||{})};if(options.body)headers['content-type']='application/json';const response=await fetch(path,{...options,headers});if(!response.ok){let detail=await response.text();try{detail=JSON.parse(detail).error||detail}catch{}throw new Error(detail||`HTTP ${response.status}`)}return response.status===204?null:response.json()}
+function esc(value){const span=document.createElement('span');span.textContent=String(value);return span.innerHTML}
+function badge(text,cls=''){return `<span class="badge ${cls}">${esc(text)}</span>`}
+function runtimeText(task){return task.runtime?`${task.runtime.mode}${task.runtime.container?` · container ${task.runtime.container}`:task.runtime.pid?` · pid ${task.runtime.pid}`:''} · since ${task.runtime.startedAt}`:'not running'}
+function render(){
+  if(!tasks.length){selectedName=null;list.innerHTML='<div class="message">No managed tasks yet.</div>';selection.innerHTML='<div class="message">Create your first task on the right.</div>';return}
+  if(!tasks.some(task=>task.name===selectedName))selectedName=tasks[0].name;
+  list.replaceChildren(...tasks.map(task=>{const button=document.createElement('button');button.type='button';button.className=`task-option${task.name===selectedName?' selected':''}`;button.setAttribute('aria-pressed',String(task.name===selectedName));button.innerHTML=`<div class="task-head"><strong>${esc(task.name)}</strong>${badge(task.status,task.status==='running'?'running':'')}</div><div class="task-summary">${task.projects.length} project${task.projects.length===1?'':'s'}<code>${esc(task.boardDir)}</code></div>`;button.onclick=()=>{selectedName=task.name;render()};return button}));
+  const task=tasks.find(value=>value.name===selectedName);selection.replaceChildren();const title=document.createElement('h3');title.textContent=task.name;const runtime=document.createElement('div');runtime.className='meta';runtime.textContent=`${task.boardDir} · ${runtimeText(task)}`;const projects=document.createElement('div');projects.className='projects';projects.innerHTML=task.projects.map(project=>badge(`${project.title} · ${project.status}`)).join('')||'<span class="meta">No projects created yet</span>';const actions=document.createElement('div');actions.className='actions';const graph=document.createElement('a');graph.className='btn';graph.href=task.projects[0]?`/#${encodeURIComponent(task.projects[0].id)}`:'/';graph.textContent='Graph view';actions.append(graph,button('Start local',()=>start(task.name,'local'),'',task.status==='running'),button('Start docker',()=>start(task.name,'docker'),'',task.status==='running'),button('Stop',()=>act(`${task.name}/stop`,'POST'),'',task.status!=='running'),button('Delete',()=>remove(task.name),'danger'));selection.append(title,runtime,projects,actions)
+}
+function button(label,fn,cls='',disabled=false){const value=document.createElement('button');value.className=`btn ${cls}`;value.textContent=label;value.disabled=disabled;value.onclick=fn;return value}
+async function start(name,runtime){await act(`${name}/start`,'POST',{runtime})}
+async function act(suffix,method,body){try{await api(`/api/tasks/${suffix}`,{method,body:body?JSON.stringify(body):undefined});await load()}catch(error){alert(error.message)}}
+async function remove(name){if(!confirm(`Stop and delete task "${name}"? Project data is kept by default.`))return;const purge=confirm(`Also permanently delete this task's Project data (UUID directories)? This cannot be undone.`);if(purge&&!confirm(`Really purge ALL Project data of "${name}"?`))return;await act(`${name}${purge?'?purge=true':''}`,'DELETE')}
+async function load(){try{const data=await api('/api/tasks');tasks=data.tasks||[];note.textContent=`${tasks.length} task${tasks.length===1?'':'s'}`;render()}catch(error){list.innerHTML=`<div class="message error">${esc(error.message)}</div>`;selection.innerHTML='<div class="message">Task details unavailable.</div>'}}
+document.querySelector('#create').onclick=async()=>{const submit=document.querySelector('#create');try{submit.disabled=true;const name=document.querySelector('#name').value.trim(),projects=JSON.parse(document.querySelector('#projects').value),workers=JSON.parse(document.querySelector('#workers').value),skills=document.querySelector('#skills').value.split(',').map(value=>value.trim()).filter(Boolean);await api('/api/tasks',{method:'POST',body:JSON.stringify({name,projects,workers,...(skills.length?{skills}:{})})});selectedName=name;document.querySelector('#name').value='';await load()}catch(error){alert(error.message)}finally{submit.disabled=false}};
+document.querySelector('#refresh').onclick=load;load();setInterval(()=>{if(!document.hidden)load()},5000);
+</script>
+</body>
+</html>
