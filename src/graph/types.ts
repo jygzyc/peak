@@ -2,7 +2,6 @@ export type ProjectStatus = "active" | "stopped" | "completed";
 
 export interface FactRef { projectId: string; id: string; description: string }
 export interface PathAbstract { factRef: FactRef; pathOverview: string; verifiedCore: string[] }
-export interface ResolvedPathAbstract { factRef: FactRef; pathAbs: { inputPath: string; readOnly: true } }
 export interface ArtifactRef {
   path: string;         // Server-generated Project-relative path, fixed to artifacts/<sha256>
   sha256: string;
@@ -68,11 +67,11 @@ export function leafFacts(graph: ProjectGraph): Fact[] {
   return graph.facts.filter((fact) => fact.id !== "goal" && !superseded.has(fact.id));
 }
 
-/** One node of a broadcast Path: the Fact plus the Intent that produced it (null for roots such as origin). */
+/** One node of a Joint Plan Path: the Fact plus its producing Intent (null for roots such as origin). */
 export interface PathStep { fact: FactRef; viaIntent: { id: string; description: string } | null }
 
 /**
- * The broadcast unit of Federation: the full concluded ancestry of one leaf
+ * The Joint Plan unit: the full concluded ancestry of one leaf
  * Fact, split into segments. A segment extends through linear progressions
  * and breaks at merges (a Fact with multiple concluded sources) and forks (a
  * Fact feeding several concluded Intents). The Path's identity is the leaf
@@ -85,14 +84,14 @@ const MAX_PATH_SEGMENTS = 32;
 
 /**
  * Computes one Path per leaf Fact (or a single leaf when leafFactId is given):
- * the complete ancestor closure over concluded Intents, including the
- * completion hop to `goal` when the leaf feeds it. Open Intents form no
- * edges, so a Fact whose successor is still open is simply the current leaf.
- * Returns [] for a fresh Project without any concluded Intent.
+ * the complete ancestor closure over ordinary concluded Intents. Completion
+ * and `goal` are outside Joint Path analysis, so every Path ends at its
+ * ordinary leaf `fN`. Open Intents form no edges. Returns [] for a fresh
+ * Project without any ordinary concluded Intent.
  */
 export function computePaths(graph: ProjectGraph, leafFactId?: string): ProjectPath[] {
   const projectId = graph.project.id;
-  const concluded = graph.intents.filter((intent) => intent.to !== null);
+  const concluded = graph.intents.filter((intent) => intent.to !== null && intent.to.id !== "goal");
   if (concluded.length === 0) return [];
   const facts = new Map(graph.facts.map((fact) => [fact.id, fact]));
   const ref = (fact: Fact): FactRef => ({ projectId, id: fact.id, description: fact.description });
@@ -111,7 +110,7 @@ export function computePaths(graph: ProjectGraph, leafFactId?: string): ProjectP
     }
   }
   const terminals = leafFactId !== undefined
-    ? graph.facts.filter((fact) => fact.id === leafFactId)
+    ? graph.facts.filter((fact) => fact.id === leafFactId && fact.id !== "goal")
     : leafFacts(graph);
   const paths: ProjectPath[] = [];
   for (const leaf of terminals) {
@@ -145,13 +144,17 @@ function buildPath(
   }
   const step = (fact: Fact): PathStep => ({ fact: ref(fact), viaIntent: producing.get(fact.id) ?? null });
   const inClosurePreds = (id: string) => (predecessors.get(id) ?? []).filter((entry) => closure.has(entry.fromId));
-  const chainChildren = (id: string): Fact[] => {
-    const children: Fact[] = [];
-    for (const candidate of closure.values()) {
-      if (inClosurePreds(candidate.id).length === 1 && inClosurePreds(candidate.id)[0]!.fromId === id) children.push(candidate);
-    }
-    return children.sort(compareFacts);
-  };
+  // Chain children (exactly one in-closure predecessor) computed once as an
+  // adjacency map instead of rescanning the closure for every node.
+  const childrenOf = new Map<string, Fact[]>();
+  for (const candidate of closure.values()) {
+    const preds = inClosurePreds(candidate.id);
+    if (preds.length !== 1) continue;
+    const list = childrenOf.get(preds[0]!.fromId);
+    if (list) list.push(candidate); else childrenOf.set(preds[0]!.fromId, [candidate]);
+  }
+  for (const list of childrenOf.values()) list.sort(compareFacts);
+  const chainChildren = (id: string): Fact[] => childrenOf.get(id) ?? [];
   // Segment starts: roots (no in-closure predecessor) and merges (more than one).
   const starts = [...closure.values()].filter((fact) => inClosurePreds(fact.id).length !== 1).sort(compareFacts);
   const segments: PathStep[][] = [];
@@ -162,13 +165,6 @@ function buildPath(
     for (const child of children) walk([...acc, child]);
   };
   for (const start of starts) walk([start]);
-  // Completion hop: a leaf feeding goal gets `goal` appended to its final segment.
-  const goal = facts.get("goal");
-  const completion = (predecessors.get("goal") ?? []).find((entry) => entry.fromId === leaf.id && closure.has(leaf.id));
-  if (goal && completion) {
-    const final = segments.find((segment) => segment[segment.length - 1]!.fact.id === leaf.id);
-    if (final) final.push(step(goal));
-  }
   if (segments.length === 0) return null;
   segments.sort((a, b) => compareRefs(a[0]!.fact, b[0]!.fact));
   return { projectId, leaf: ref(leaf), segments, truncated };

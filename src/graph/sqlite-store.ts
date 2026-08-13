@@ -18,7 +18,11 @@ export class SqliteStore {
   constructor(projectDir: string) {
     this.projectDir = initializeProjectDirectory(projectDir);
     this.database = backend.open(join(this.projectDir, "project.db"));
-    this.database.exec("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;");
+    // WAL keeps concurrent readers live during writes; busy_timeout makes a
+    // writer wait instead of failing fast when another connection holds the
+    // write lock, so concurrent HTTP requests (parallel Execute workers,
+    // Plan/Supervise rounds) do not surface transient "database is locked".
+    this.database.exec("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=10000;");
     this.database.exec(SCHEMA);
     this.migrateSchema();
   }
@@ -84,22 +88,28 @@ export class SqliteStore {
 
   private intents(projectId: string): Intent[] {
     const rows = this.database.prepare("SELECT * FROM intents ORDER BY created_at,id").all();
-    const sources = this.database.prepare("SELECT * FROM intent_sources ORDER BY intent_id,position").all();
     const descriptions = new Map(this.database.prepare("SELECT id,description FROM facts").all()
       .map((row) => [text(row.id), text(row.description)]));
-    const consumedHints = this.database.prepare("SELECT id,consumed_by_intent_id FROM hints WHERE consumed_by_intent_id IS NOT NULL").all();
-    return rows.map((row) => ({
-      id: text(row.id),
-      from: sources.filter((source) => source.intent_id === row.id).map((source) => ({
+    const sources = new Map<string, FactRef[]>();
+    for (const source of this.database.prepare("SELECT * FROM intent_sources ORDER BY intent_id,position").all()) {
+      append(sources, text(source.intent_id), {
         projectId: text(source.source_project_id), id: text(source.source_fact_id),
         description: text(source.source_description),
-      })),
+      });
+    }
+    const consumedHints = new Map<string, string[]>();
+    for (const hint of this.database.prepare("SELECT id,consumed_by_intent_id FROM hints WHERE consumed_by_intent_id IS NOT NULL").all()) {
+      append(consumedHints, text(hint.consumed_by_intent_id), text(hint.id));
+    }
+    return rows.map((row) => ({
+      id: text(row.id),
+      from: sources.get(text(row.id)) ?? [],
       to: row.to_fact_id === null ? null : {
         projectId, id: text(row.to_fact_id), description: descriptions.get(text(row.to_fact_id))!,
       },
       customProfile: nullableNull(row.custom_profile),
       customProfileDigest: nullableNull(row.custom_profile_digest),
-      hintIds: consumedHints.filter((hint) => hint.consumed_by_intent_id === row.id).map((hint) => text(hint.id)),
+      hintIds: consumedHints.get(text(row.id)) ?? [],
       description: text(row.description), createdBy: text(row.created_by), createdAt: text(row.created_at),
       concludedBy: nullableNull(row.concluded_by), concludedAt: nullableNull(row.concluded_at),
     }));
@@ -385,6 +395,10 @@ function uniqueIds(values: string[], label: string): string[] {
   return result;
 }
 function text(value: unknown): string { return String(value); }
+function append<K, V>(map: Map<K, V[]>, key: K, value: V): void {
+  const list = map.get(key);
+  if (list) list.push(value); else map.set(key, [value]);
+}
 function nullable(value: unknown): string | undefined { return value === null || value === undefined ? undefined : String(value); }
 function nullableNull(value: unknown): string | null { return value === null || value === undefined ? null : String(value); }
 function number(value: unknown): number { return Number(value ?? 0); }

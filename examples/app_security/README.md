@@ -13,14 +13,17 @@
   - `decx-poc` — 由单条定稿漏洞记录构建 PoC。
 - PoC 验证门:每条漏洞必须构建 PoC,并在 adb 连接的设备(真机或模拟器)上实际运行验证,观察到真实证明信号(adb logcat 日志、返回数据、目标行为);Supervise 对未通过 PoC 验证的漏洞一律退回,不得作为已证实漏洞。
 - 报告包含三部分:已证实漏洞;按功能实现组织的风险地图(每个功能的实现对应的可能风险与当前已发现漏洞);潜在风险(存在代码级漏洞证据但现有利用条件不足、证据链有明确缺口的路径,逐项写明缺口与所需条件)。三部分口径严格分离,潜在风险不得作为已证实漏洞呈现。
-- Custom Profile 在攻击面收集、单路径跟踪、评级定稿、PoC 构建验证、潜在风险整理或报告组装时提供针对性指引。
+- `board.skills` 是 Task 级 Skill 安装/允许列表；每个 Custom Profile 用 `customProfile.skills` 只选择当前阶段所需的子集，在攻击面收集、单路径跟踪、评级定稿、PoC 构建验证、潜在风险整理或报告组装时提供针对性指引。所选名称会记录在本地 `graph-*.json` 的 `customProfile.skills` 下，但快照不包含顶层 Skills 或 Worker 配置。
 
-## 前置条件
+## 前置条件（`execution.mode: "docker"`）
 
-- 已安装 `decx` CLI,Worker 进程可直接调用。
-- 在 `task.json` 的 `source` 空位中填写应用信息:应用名称、包名、版本,以及 APK 本地路径或下载地址。
-- 具备编译/部署条件(Android SDK/Gradle),并通过 adb 连接真机或模拟器,用于部署运行 PoC 与观测证明信号。
-- Pi 已完成认证;两个 Worker 分别使用 `deepseek/deepseek-v4-flash`(Plan/Supervise)与 `minimax-cn/MiniMax-M3`(Execute)。
+本示例用 docker 执行后端：worker 在 per-project 容器内运行，decx / frida / adb / radare2 等工具预装在 `peak-task` 镜像里，无需宿主机单独安装。
+
+- **构建镜像**（docker 或 podman）：`docker build container/ -t peak-task:$(cat version)`
+- **Provider key**：docker 模式不挂载宿主机 CLI 配置目录，需在 `task.json` 的 `workers[].env` 填入各 Worker 的 provider key（opencode / pi 的 key，例如 `PI_API_KEY`）。
+- **Android 设备**：宿主机运行 `container/device-bridge.sh usb start` 接入真机或模拟器（容器经 `host.docker.internal` 复用宿主机 adb server，无需 USB 直通）。
+- 在 `task.json` 的 `source` 填写应用信息：应用名称、包名、版本，以及 APK 本地路径或下载地址。
+- 具备编译/部署条件（Android SDK/Gradle，镜像内已含 cmdline-tools）用于 PoC 构建部署。
 
 ## 预期结果
 
@@ -31,7 +34,10 @@
 
 ```bash
 npm run build
-node dist/cli.js run examples/app_security
+docker build container/ -t peak-task:$(cat version)   # 构建任务镜像
+container/device-bridge.sh usb start                       # 接入 Android 设备（宿主机）
+node dist/cli.js serve --port 8000                          # 独立 Graph Server
+node dist/cli.js start examples/app_security --graph-url http://127.0.0.1:8000
 ```
 
-项目的 `id` 初始为空,首次运行会把生成的 UUID 写回 `task.json`,后续运行复用。
+`start` 会先创建缺失 Project、写回完整 UUID 集，再启动后台 Dispatch；后续运行复用这些 UUID。`execution.mode: "docker"` 下容器引擎或镜像不可用时整个 Task 回退 `local`。完成后运行 `node dist/cli.js stop`。

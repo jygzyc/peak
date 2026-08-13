@@ -27,27 +27,25 @@ export function initializePeakPaths(override?: string): PeakPaths {
 }
 
 export function initializeProjectsDirectory(path: string): string {
-  const projectsDir = resolve(path);
-  mkdirSync(projectsDir, { recursive: true });
-  return projectsDir;
+  return initializeDirectory(path);
 }
 
 export function initializeProjectDirectory(path: string): string {
-  const projectDir = resolve(path);
-  mkdirSync(projectDir, { recursive: true });
-  return projectDir;
+  return initializeDirectory(path);
 }
 
 export function initializeArtifactDirectory(projectDir: string): string {
-  const artifactsDir = join(resolve(projectDir), "artifacts");
-  mkdirSync(artifactsDir, { recursive: true });
-  return artifactsDir;
+  return initializeDirectory(join(projectDir, "artifacts"));
 }
 
 export function initializeProjectLogsDirectory(projectDir: string): string {
-  const logsDir = join(resolve(projectDir), "logs");
-  mkdirSync(logsDir, { recursive: true });
-  return logsDir;
+  return initializeDirectory(join(projectDir, "logs"));
+}
+
+function initializeDirectory(path: string): string {
+  const directory = resolve(path);
+  mkdirSync(directory, { recursive: true });
+  return directory;
 }
 
 /** Name of the per-Project runtime scratch directory for transient worker files. */

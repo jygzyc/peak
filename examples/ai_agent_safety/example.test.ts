@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { loadTaskConfig } from "../../dist/utils/task-config.js";
 import { initializeTaskSkills } from "../../dist/utils/task-skill-installer.js";
-import { FederationBus } from "../../dist/graph/federation-bus.js";
 import { GraphClient } from "../../dist/graph/graph-client.js";
 import { GraphHttpServer } from "../../dist/graph/http-server.js";
 import { ProjectStoreRegistry } from "../../dist/graph/project-store-registry.js";
@@ -51,8 +50,7 @@ test("ai_agent_safety example: depth-first DAG lifecycle through HTTP + TaskExec
       goal: configured.goal,
     });
     const projectDir = join(projects, project.id);
-    const federation = new FederationBus();
-    federation.register(project.id, projectDir, project.scope);
+    const jointPlan = { paths: async () => [] };
 
     const researchDescription = "Use when assessing one AI safety research paper, official standard, or regulator publication.";
     const incidentDescription = "Use when investigating one documented AI or Agent safety incident.";
@@ -108,7 +106,7 @@ test("ai_agent_safety example: depth-first DAG lifecycle through HTTP + TaskExec
       { key: "project-1", ...configured },
       graph,
       worker,
-      federation,
+      jointPlan,
       projectDir,
     );
 
@@ -170,10 +168,16 @@ test("ai_agent_safety example: depth-first DAG lifecycle through HTTP + TaskExec
     assert.ok(logs.some((name) => /^graph-.*-supervise\.json$/.test(name)));
     const executeJsons = logs.filter((name) => /^graph-.*-execute\.json$/.test(name));
     assert.ok(executeJsons.length >= 7, "one execute snapshot per execution");
-    const executeSnapshots = executeJsons.map((name) => readFileSync(join(projectDir, "logs", name), "utf8"));
-    assert.ok(executeSnapshots.some((snapshot) => snapshot.includes(researchDescription)), "research profile in an execute snapshot");
-    assert.ok(executeSnapshots.some((snapshot) => /"artifact":null/.test(snapshot)), "null-Artifact sources in an execute snapshot");
-    assert.ok(executeSnapshots.every((snapshot) => !/"skills"|"workers"/.test(snapshot)), "snapshot never leaks skills/workers");
+    const executeSnapshots = executeJsons.map((name) => JSON.parse(readFileSync(join(projectDir, "logs", name), "utf8")) as {
+      context: unknown;
+      customProfile: null | { description: string; skills: string[]; digest: string };
+      [key: string]: unknown;
+    });
+    const researchSnapshot = executeSnapshots.find((snapshot) => snapshot.customProfile?.description === researchDescription);
+    assert.ok(researchSnapshot, "research profile in an execute snapshot");
+    assert.deepEqual(researchSnapshot.customProfile?.skills, ["ai-agent-safety"], "snapshot records only the selected profile Skills");
+    assert.ok(executeSnapshots.some((snapshot) => /"artifact":null/.test(JSON.stringify(snapshot))), "null-Artifact sources in an execute snapshot");
+    assert.ok(executeSnapshots.every((snapshot) => !("skills" in snapshot) && !("workers" in snapshot)), "snapshot has no top-level Skills or Worker configuration");
     assert.equal(logs.some((name) => name.includes("output")), false);
   } finally {
     await server.stop();

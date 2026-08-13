@@ -21,8 +21,12 @@ export class RuntimeScheduler {
       });
     };
     safeTick();
+    // The ref'd scheduler interval is the Dispatch keep-alive: worker
+    // subprocesses and their timers are the only other ref'd handles, and the
+    // process must survive idle gaps between phases. unref'ing it let the
+    // event loop drain after the last in-flight worker exited, silently
+    // killing the Dispatch; shutdown always goes through stop() instead.
     this.timer = setInterval(safeTick, this.config.scheduler.intervalMs);
-    this.timer.unref?.();
   }
 
   stop(): void {

@@ -1,8 +1,10 @@
 import type { ProjectGraph } from "./types.js";
+import { ApiError, localTimestamp, toJson } from "../utils/helpers.js";
 
-export class ApiError extends Error {
-  constructor(readonly status: number, message: string) { super(message); }
-}
+// Re-export the generic primitives for the public API surface: `ApiError`,
+// `localTimestamp` and `toJson` are owned by utils/helpers.js (shared with the
+// Runtime); the graph domain keeps only API-contract validators here.
+export { ApiError, localTimestamp, toJson };
 
 const MAX_DESCRIPTION_BYTES = 4 * 1024;
 const MAX_SHORT_DESCRIPTION_BYTES = 1024;
@@ -37,19 +39,12 @@ export function requireCustomProfileDigest(value: unknown, label = "customProfil
   return result;
 }
 
-export function localTimestamp(date = new Date()): string {
-  const pad = (value: number, width = 2): string => String(value).padStart(width, "0");
-  return `${pad(date.getFullYear(), 4)}${pad(date.getMonth() + 1)}${pad(date.getDate())}`
-    + `T${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`;
-}
-
 export const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export function requireUuid(value: string): string {
   if (!UUID_PATTERN.test(value)) throw new ApiError(400, "invalid project id");
   return value;
 }
-
 /**
  * True when a content-based Artifact filename would escape its directory:
  * backslash, absolute path, or any traversal segment (empty, `.`, `..`,
@@ -68,8 +63,4 @@ export function toTimeline(graphs: ProjectGraph | ProjectGraph[]): unknown[] {
     ...graph.intents.map((intent) => ({ at: intent.createdAt, projectId: graph.project.id, type: "intent", value: intent })),
     ...graph.hints.map((hint) => ({ at: hint.createdAt, projectId: graph.project.id, type: "hint", value: hint })),
   ]).sort((left, right) => left.at.localeCompare(right.at));
-}
-
-export function toJson(value: unknown): string {
-  return `${JSON.stringify(value)}\n`;
 }

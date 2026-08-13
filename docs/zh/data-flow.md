@@ -1,438 +1,113 @@
-# Peak 数据流说明
+# Peak 数据流
 
-本文描述 Peak 中所有「数据与契约」如何定义、持久化与流转：Graph 数据模型与不变量、持久化布局、Graph HTTP API、任务协议 JSON 合同、调度/Worker 接口、Board 配置 schema，以及各操作的端到端数据流。架构边界与设计原理见 [architecture.md](architecture.md)。
+本文描述数据如何进入 Peak、经过 Runtime 和 Worker、写入 Graph，并在 Project 之间形成只读引用。架构边界见 [架构](architecture.md)。
 
-## 1. 数据模型与不变量
-
-每个 Project 有且只有一张持久化 Graph，实体只有 Fact、Intent、Hint、Project 四种。
-
-### 1.1 类型定义
+## 1. 核心数据
 
 ```typescript
 type ProjectStatus = "active" | "stopped" | "completed";
 
 interface FactRef {
-  projectId: string;       // 源 Project UUID，超链接地址的一部分
-  id: string;          // 源 Fact id，超链接地址的一部分
-  description: string;     // 源 Fact 的规范、不可变摘要
-}
-
-interface ArtifactRef {
-  path: string;       // Server 生成的 Project-relative 路径，固定为 artifacts/<sha256>
-  sha256: string;
-  mediaType: string;
-  sizeBytes: number;
-  filename: string | null; // 可选内容化输出名；非空时完成阶段物化到 Project out/ 目录
+  projectId: string;
+  id: string;
+  description: string;
 }
 
 interface Fact {
-  id: string;                     // origin | goal | f0001...
-  description: string;            // 普通 Fact <= 1 KiB；origin/goal <= 4 KiB
-  artifact: ArtifactRef | null;   // 可选的单文件不可变详细内容
+  id: string;
+  description: string;
+  artifact: ArtifactRef | null;
   createdAt: string;
 }
 
 interface Intent {
-  id: string;                     // i0001...
+  id: string;
   from: FactRef[];
-  to: FactRef | null;             // null = open, 非 null = concluded
-  customProfile: string | null;   // 被选中 Execute profile 的 description
-  customProfileDigest: string | null; // SHA-256(description + "#" + prompt) 前 16 位
-  hintIds: string[];              // 创建该 Intent 时原子消费的 Hint
-  description: string;            // 必填，trim 后非空，UTF-8 <= 2 KiB
-  createdBy: string;               // 创建 actor，例如 plan:<execution-id>
-  createdAt: string;               // 创建时间，本地 YYYYMMDDTHHMMSS.XXX
-  concludedBy: string | null;      // open 时 null；成功 actor，例如 execute:/finalize:<execution-id>
-  concludedAt: string | null;      // open 时 null；conclude 的本地墙上时间
+  to: FactRef | null;
+  description: string;
+  hintIds: string[];
+  customProfile: string | null;
+  customProfileDigest: string | null;
 }
 
 interface Hint {
-  id: string;                     // h0001...
+  id: string;
   content: string;
   creator: string;
-  createdAt: string;
   consumedByIntentId: string | null;
-  consumedAt: string | null;
 }
 
-interface ResolvedFactSource {
-  ref: FactRef;
-  fact: Omit<Fact, "artifact"> & {
-    artifact: (Omit<ArtifactRef, "path"> & {
-      inputPath: string;           // Graph Server 返回的规范本地绝对路径
-      readOnly: true;
-    }) | null;
-  };
-}
-
-interface ProjectMeta {
-  id: string;                     // UUID，不可修改
-  title: string;                  // 可修改
-  status: ProjectStatus;
-  scope?: string;
-  createdAt: string;
+interface PathAbstract {
+  factRef: FactRef;
+  pathOverview: string;
+  verifiedCore: string[];
 }
 ```
 
-- Project ID 使用 UUID；普通 Fact、Intent、Hint 分别使用 shard 内单调计数生成的 `fN`、`iN`、`hN`。
-- Project title 可修改；UUID 不可修改。
+主要不变量：
 
-### 1.2 不变量
+- Fact 不可修改；普通 Fact description 必填且不超过 UTF-8 1 KiB。
+- FactRef 三个字段必须完整，description 必须与源 Fact 相同。
+- Intent source 必须是当前 Project 的当前本地 leaf，不能是 `goal`。
+- 一个普通 Intent 只产生一个新 Fact；一个 Project 最多一个 completion Intent。
+- Hint 不参与因果边，可在创建 Intent 或 completion 时原子消费。
+- Fact 最多绑定一个不可变单文件 Artifact；Artifact 不能替代 Fact description。
 
-- 普通 Intent 至少有一个 source；
-- source 必须存在且不能是任何 Project 的 `goal`；
-- 每个 FactRef 必须完整包含 `projectId`、`id`、`description`，且 description 必须与源不可变 Fact 完全一致；
-- FactRef 是目标 Graph 中可独立展示的超链接节点，由 `projectId/id` 追溯源 Fact，description 作为其不可变链接摘要；
-- source 必须是当前 Project 的本地 Fact（跨 Project FactRef 在 Server 边界直接拒绝；历史 Graph 中的旧跨 Project 记录仍可读取展示）；
-- source 不重复，顺序稳定；
-- Intent 的 `customProfile` 与 `customProfileDigest` 必须同时为 null 或同时存在；Fact、Hint、FactRef 不得包含 profile；
-- 每个普通 Intent 表示一次朝 Goal 前进的原子 DAG 转换：可从一个当前 Leaf 分叉或无状态更新，也可把多个当前 Leaf 合并，但只能产生一个新 Fact；只组合已有 Leaf Facts 且不继续采集证据的单结果综合仍可视为原子任务；
-- Intent 和 completion 创建时的全部 source 必须是当前 Project 的当前本地 Leaf；历史非 Leaf FactRef 返回 `409`；已经合法创建的 open Intent 可在兄弟分支先完成后继续 conclude；
-- 普通 Fact description 必须存在、trim 后非空且不超过 UTF-8 1 KiB，只承载可独立理解的简明摘要；保留的 `origin` 和 `goal` description 使用最大的 UTF-8 4 KiB 上限；
-- Intent description 必须存在、trim 后非空且不超过 UTF-8 2 KiB；Hint content、Project title 和 actor 标签等持久化短文本不超过 UTF-8 1 KiB；
-- Fact 可以不带 Artifact；需要文件承载详细分析、证据、表格或报告时最多绑定一个单文件 Artifact，且 Artifact 不能替代必填的 Fact 摘要；
-- Execute 只能创建当前 Project 的 Fact；
-- concluded Intent 不可修改；
-- 每个 Project 最多一个 completion Intent；
-- completion 的 target 是当前 Project `goal`。
-
-## 2. 持久化布局
-
-默认 Peak Home 为 `~/.peak`，可通过 `PEAK_HOME` 或 CLI `--peak-home` 覆盖。
+## 2. 持久化
 
 ```text
-~/.peak/projects/<uuid>/
+~/.peak/projects/<projectId>/
 ├── project.db
 ├── artifacts/
-│   └── <sha256>
-├── out/                  # 物化的最终 Goal 交付物（内容化文件名）；不入归档（可由 artifacts/ 重现）
+│   ├── <sha256>
+│   └── path_abs_<factId>
+├── out/
 ├── logs/
 │   ├── main.log
-│   └── graph-<YYYYMMDDTHHMMSS.XXX>-<8-hex-execution-id>-<plan|supervise|execute|finalize>.json
-└── .tmp/                 # Worker cwd 与临时 runtime scratch（含 CLI session 缓存）；不入归档，Project 不再 active 后清理
+│   └── graph-<timestamp>-<executionId>-<phase>.json
+└── .tmp/
 ```
 
-每个 UUID 目录都是独立 shard。Peak Home 另有后台进程控制文件 `server.pid`、`server.json` 和 `server.log`，供 `peak status/stop` 使用，不属于 Graph。Board 目录没有 workspace，也不接收交付物；最终 Goal 交付物只物化到 Project shard 的 `out/` 目录。
+- `project.db` 保存 Project、Fact、Intent、source、Hint、Artifact 元数据和计数器。
+- `artifacts/<sha256>` 保存内容寻址的 Artifact body。
+- `artifacts/path_abs_<factId>` 保存结构化 Path Abstract。
+- `out/` 保存 completed Project 的最终交付物，可由 Artifact 重建。
+- `logs/main.log` 是验证后 Graph operation、Federation 事件和 Runtime 事件（`worker_started`/`worker_completed`/`worker_timeout`/`worker_failed`/`worker_cancelled`、`execution_target_released`、phase 重试与失败）的 NDJSON 日志。
+- `graph-*.json` 是不可变阶段上下文快照；其中用 `{description,skills,digest}` 记录已选 profile，但不保存顶层 Skills、Worker 配置、完整渲染 Prompt 或 Worker 输出。
+- `.tmp/` 是 Worker 唯一临时读写目录，不进入归档，Project 不再 active 后清理。
 
-### 2.1 SQLite 表
-
-`project.db` 仅包含：
-
-```text
-project, artifacts, facts, intents, intent_sources, hints, counters
-```
-
-SQLite 启用 foreign key 和 WAL。`artifacts` 只保存 `sha256, path, media_type, size_bytes, filename, created_at`；`facts.artifact_sha256` 可空；`facts.description` 和 `intents.description` 必须 `NOT NULL`，服务层额外校验 trim 后非空和 UTF-8 byte length。SQLite 不保存 Artifact 正文或大 BLOB。
-
-Intent 的 source 在目标 Project 的 `intent_sources` 中保存完整 FactRef `{source_project_id, source_fact_id, source_description}`。`source_description` 是源 Fact 不可变摘要，使引用成为可独立显示、可追溯的超链接节点；不复制源 Fact 实体或 Artifact。新写入的 source 一律为本地 Fact（`source_project_id` 等于当前 Project）；历史 Graph 中可能存在的跨 Project 记录仍可读取展示。`intent_sources` 定义：
-
-```sql
-CREATE TABLE intent_sources (
-  intent_id          TEXT NOT NULL,
-  position           INTEGER NOT NULL,
-  source_project_id  TEXT NOT NULL,
-  source_fact_id     TEXT NOT NULL,
-  source_description TEXT NOT NULL,
-  PRIMARY KEY (intent_id, position),
-  UNIQUE (intent_id, source_project_id, source_fact_id)
-);
-```
-
-### 2.2 Artifact
-
-Artifact body 以 SHA-256 为文件名保存到当前 Project 的 `artifacts/`，SQLite 只保存 hash、相对路径、media type、大小、可选内容化输出文件名和创建时间。
-
-Workers 不被分配 workspace、不写文件：需要文件的结果由 Execute 在合同中内联返回 `{filename, mediaType, content}`，Runtime 流式上传（POST `/api/projects/{id}/artifacts`，可选 `x-artifact-filename` 头）。上传流式计算 hash 并执行大小限制；可选高级配置 `phase.execute.maxArtifactBytes` 默认不写入 `task.json`，省略时限制为 10 MiB。`filename` 必须是基于内容的相对输出名（不超过 1 KiB，拒绝绝对路径、`\`、`.`/`..`/空段/隐藏段），绝不包含 i0001/f0001 等图节点编号；只有它非空时，完成阶段才把该 Artifact 物化到 Project shard 的 `out/` 目录。
-
-Server 启动时清理超过 24 小时安全窗口且没有 Fact 引用的 Artifact。下载前必须校验 64 位小写十六进制 hash、普通文件和非 symlink。
-
-### 2.3 日志与 Graph context
-
-`main.log` 是追加式 NDJSON，记录经 Server 验证后的 Graph operation，以及 Federation 的 `send_path_reference` / `receive_path_reference`。`graph-*.json` 只记录执行时的图上下文，不保存 Worker 原始输出。
-
-每次阶段执行前生成一个不可变 JSON snapshot。写入采用临时文件加原子 rename。execution ID 由 `randomBytes(4)` 生成八位小写十六进制字符串，并在内存 `ExecutionRegistry` 中检查冲突；Finalize 复用其绑定 Execute 的 ID。时间使用本地墙上时间，格式固定为 `YYYYMMDDTHHMMSS.XXX`，不携带时区。
-
-Runtime 先通过 `GraphClient` 组装阶段接口，再由纯格式化逻辑放入英文 Prompt 和 snapshot。每个阶段 Graph view 都使用固定 256 KiB UTF-8 budget、稳定顺序和显式 `truncated/omitted` 元数据。Plan 的 `projects[projectId]` 包裹当前 Project 的 `source`、`goal`、`leafFacts`、`openIntents`、`unconsumedHints`；`external` 单独保存其他 Project 广播的完整 leaf FactRef 与只读 `path_abs_<factId>` 绝对路径。Supervise 包含 Project、Facts、Intents、Hints；Execute/Finalize 包含 Intent 与 resolved sources。Execute source 不下载、不复制；Graph Server 直接返回规范本地 `inputPath` 和 `readOnly: true`，Runtime 在 worker 前后校验普通文件、size 和 SHA-256。
+每个 Project 是独立 Graph shard，不共享 Project SQLite。Server 在不进入归档的 `.projects.json` 中保存 Project 调度租约及 heartbeat/expiry；其余 Runtime 状态、进程、session、reservation 和 cooldown 不持久化。
 
 ## 3. Graph HTTP API
 
-HTTP 方法具有标准语义，不限制为 POST。主要路由：
-
-```text
-GET    /                                      Dashboard shell
-GET    /preview.html                          Artifact 预览页 shell
-GET    /api/projects
-POST   /api/projects
-GET    /api/projects/:id
-DELETE /api/projects/:id
-PUT    /api/projects/:id/status               # 仅 active <-> stopped
-GET    /api/projects/:id/facts/:factId
-GET    /api/projects/:id/path-abstracts/:factId
-POST   /api/projects/:id/path-abstracts/:factId
-POST   /api/fact-refs/resolve
-POST   /api/projects/:id/hints
-POST   /api/projects/:id/intents
-POST   /api/projects/:id/intents/:intentId/conclude
-POST   /api/projects/:id/complete
-POST   /api/projects/:id/reopen
-POST   /api/projects/:id/artifacts
-GET    /api/projects/:id/artifacts/:sha256
-HEAD   /api/projects/:id/artifacts/:sha256
-GET    /api/projects/:id/export?format=json|timeline|archive
-GET    /api/runtime/status
-GET    /api/runtime/projects/:id/executions
-```
-
-所有 JSON 输入都严格拒绝 unknown/missing field。普通 JSON body 上限为 1 MiB；Artifact 使用独立流式上传限制。API 响应不应被缓存。Graph API 公开访问，Peak 不增加 token 或鉴权层。`completed` 只能由 complete endpoint 设置；恢复只能调用 reopen。`GET /api/projects/:id` 返回完整 `ProjectGraph`：`{ project: ProjectMeta, facts: Fact[], intents: Intent[], hints: Hint[] }`；`GET /api/projects` 返回 `ProjectMeta[]`。`PUT /api/projects/:id/status` 的 body 为 `{ "status": "active" | "stopped" }`，completed Project 必须先 reopen。`GraphClient` 是 Runtime 和 Node 客户端的薄 HTTP 封装，负责 JSON 请求、Artifact stream 上传/下载以及导出，不包含 Graph 业务旁路。
-
-最后两个 Runtime route 由组合根通过通用 `apiExtensions` 注入；裸 `GraphHttpServer` 和 `peak serve` 不注入，因而返回 404。`status` 返回 `{runtimeId, startedAt, heartbeatAt, sequence, schedulerRunning, heartbeatWindowMs}`；`executions` 返回指定 Project 的当前内存快照，不进入 Graph export。
-
-Project 的 `format=archive` 只允许 completed 状态，返回 gzip tarball：`manifest.json`（归档格式标识、导出时间、可直接用于 `board.projects` 的 `{id,source,goal}` JSON 区块和 Artifact 清单）、`graph.json`、SQLite 在线备份得到的 `project.db`，以及 `artifacts/<sha256>`。导入时必须校验规范目录、SQLite 完整性与表集合、Graph JSON/数据库一致性、Artifact 元数据/大小/SHA-256，并拒绝覆盖相同 UUID。归档不复制或改写跨 Project `FactRef` 所指向的外部 Project。
-
-### 3.1 Project
-
-```json
-// POST /api/projects
-{ "title": "...", "target": "...", "goal": "...", "scope": "optional" }
-```
-
-创建时在同一 shard 生成 `origin`（来自 `target`）和 `goal`（来自 `goal`）Fact。
-
-### 3.2 FactRef resolve
-
-```json
-// POST /api/fact-refs/resolve
-{
-  "targetProjectId": "...",
-  "refs": [{ "projectId": "...", "id": "f0001", "description": "源 Fact 的不可变摘要" }]
-}
-```
-
-Server 先校验每个 ref 的三个字段与源 Fact 完全一致，再返回对应的 Fact。没有 Artifact 时返回 `artifact: null`；否则返回带只读 `inputPath` 的 Artifact 元数据。Artifact 正文不进入响应，也不复制到目标 Project。
-
-### 3.3 Hint
-
-```json
-// POST /api/projects/{id}/hints
-{
-  "content": "对当前 Graph 的具体建议",
-  "creator": "supervise:<executionId>"
-}
-```
-
-Server 校验 Project 存在、content 非空且不超过 UTF-8 1 KiB；与已有 Hint trim 后完全相同则返回 `409`。外部调用可以给任意状态的 Project 添加 Hint，但只有 active Project 会运行 Supervisor/Plan。
-
-### 3.4 Intent
-
-```json
-// POST /api/projects/{id}/intents
-{
-  "from": [{ "projectId": "...", "id": "f0001", "description": "源 Fact 的不可变摘要" }],
-  "customProfile": "Use for independent verification.",
-  "customProfileDigest": "0123456789abcdef",
-  "hintIds": ["h0001"],
-  "description": "需要执行或证明的具体事项",
-  "createdBy": "plan:<executionId>"
-}
-```
-
-`hintIds` 可省略或为空数组；提供时按顺序原子消费这些未消费 Hint，已被消费或不存在则返回冲突。创建 Intent 时，`customProfile` 与 `customProfileDigest` 必须同时存在或同时为 null；digest 必须是 16 位小写十六进制。
-
-```json
-// POST /api/projects/{id}/intents/{intentId}/conclude
-{
-  "description": "结论或摘要",
-  "artifact": { "path": "artifacts/<sha256>", "sha256": "...", "mediaType": "text/markdown", "sizeBytes": 123 },
-  "concludedBy": "execute:<executionId>"
-}
-```
-
-Conclude transaction：Project 必须 active；Intent 必须 open；校验 Fact description 必填、trim 后非空且不超过 UTF-8 1 KiB；`artifact` 字段必须存在，但值可以是 `null` 或一个已注册的规范 ArtifactRef（`path`/`sha256`/`mediaType`/`sizeBytes` 必须与已注册索引完全一致）；创建不含 profile 的本地 Fact；更新 Intent.to；返回 Fact 和 Intent。并发 conclude 只有第一个成功，其余返回 `409`。
-
-### 3.5 Complete
-
-```json
-// POST /api/projects/{id}/complete
-{
-  "from": [{ "projectId": "...", "id": "f0001", "description": "源 Fact 的不可变摘要" }],
-  "hintIds": ["h0001"],
-  "description": "Goal 证明",
-  "completedBy": "plan:<executionId>"
-}
-```
-
-`hintIds` 可省略或为空数组；提供时在同一 transaction 内原子消费。
-
-同一 transaction：校验 FactRef（字段完整、description 与源 Fact 完全一致、存在、无重复、不引用 `goal`、是本 Project 当前本地 Leaf）；创建 `FactRef[] -> currentProject/goal` completion Intent；将 Project 标记为 completed；返回该 completion Intent。完成不等待其他 Project、广播、pending reference 或活动 Worker。晚到 conclude 返回冲突。
-
-### 3.6 Reopen
-
-```json
-// POST /api/projects/{id}/reopen
-{
-  "description": "外部反馈，作为新的不可变本地 Fact",
-  "creator": "human:web"
-}
-```
-
-只允许显式调用，且只适用于 completed Project：同一 transaction 内删除当前 completion Intent（并解除其消费的 Hint），以当前全部本地 Leaf Facts 为 source 写描述为 `External feedback` 的 concluded Intent 和反馈 Fact，然后恢复 active。Hint 和 Federation 消息不能 reopen，反馈不得重新从历史非 Leaf `origin` 出发。`description` 使用 Fact description 规则（trim 后非空、UTF-8 <= 1 KiB），`creator` 使用短文本规则。
-
-### 3.7 Artifact
-
-```text
-POST /api/projects/{id}/artifacts        流式上传（可选 x-artifact-filename 头）
-GET  /api/projects/{id}/artifacts/{sha256}
-HEAD /api/projects/{id}/artifacts/{sha256}
-```
-
-上传流程：streaming 写临时文件 → 计算 SHA-256 → 原子 rename 到 `artifacts/<sha256>` → 写 `artifacts` 索引 → 返回 ArtifactRef。客户端不能指定最终 path；拒绝 absolute path、`..`、symlink escape；上传和下载不把完整文件读入内存；未被 Fact 引用的 Artifact 按安全窗口 GC。
-
-## 4. 任务协议
-
-所有 worker 输出统一为严格 JSON 合同。解析优先接受最后一个 fenced JSON block，否则提取最外层 `{...}`（括号配平，忽略尾随散文）。解析后严格拒绝 unknown field、missing field、空 FactRef 列表、缺少任一 `projectId`/`id`/`description` 的 FactRef、被改写的 FactRef description、空描述、超过 1 KiB 的普通 Fact description/Hint content，以及超过 2 KiB 的 Intent description。不能放宽 Plan、Supervise、Execute 的 typed shape。
-
-拒绝的输入形式：无法提取单一 JSON 对象的内容、缺失或未知字段、缺失或空白的 Intent/Fact description、context 外 FactRef、非法 Artifact 路径、过长 description。允许在 prose 中提取最外层对象，或采用最后一个 fenced JSON block。Fact description 必须能独立表达结论；详细内容需要文件时才返回 Artifact。
-
-### 4.1 Plan
-
-决定下一步证明结构，三选一：
-
-```json
-{ "kind": "intents", "intents": [{ "from": [{ "projectId": "...", "id": "f0001", "description": "源 Fact 的不可变摘要" }], "hintIds": ["h0001"], "customProfile": "Use for independent verification.", "description": "..." }] }
-```
-
-```json
-{ "kind": "complete", "from": [{ "projectId": "...", "id": "f0001", "description": "源 Fact 的不可变摘要" }], "hintIds": ["h0001"], "description": "..." }
-```
-
-```json
-{ "kind": "noop" }
-```
-
-`intents` 数量为 `1..executeCapacity`（支持 execute 的 Worker 的 `maxRunning` 之和），这也是 Runtime 的 Execute 并发上限。Intent 只能引用当前 `PlanGraphView.projects[projectId].leafFacts` 中可见的完整 FactRef（即本地当前 Leaf；视图中的 `external` 是纯参考信息，不能作为 source）。Plan 根据视图中的 open Intents、未消费 Hints 和 `truncated/omitted` 避免重复并判断信息是否充分；`hintIds` 可省略或为空，同一 Hint 只能被一个 Intent/complete 消费。每个 Intent 只能产出一个 Fact，禁止捆绑无关转换、survey、matrix、多文件或多事件。Plan 必须原样返回 FactRef；Server 再次拒绝已变成历史非 Leaf 的 source。`customProfile` 可省略或为 null，非 null 时必须精确匹配可用 Execute profile description；`goal` 永远不是 source Leaf。
-
-Plan AI 自主决定分支、深化、合并与完成；Runtime 不注入固定推理策略，只校验可见 source、原子单 Fact 转换、严格输出 shape 和 Intent 数量上限。
-
-### 4.2 Supervise
-
-独立审视当前 Graph，只提出改进 Hint，二选一：
-
-```json
-{ "kind": "hint", "content": "当前证明缺少对……的验证，建议……" }
-```
-
-```json
-{ "kind": "noop" }
-```
-
-只对 active Project 运行；每轮最多一个 Hint；content 必填、trim 后非空、UTF-8 不超过 1 KiB；与已有 Hint trim 后完全相同则不写入；不创建 Intent/Fact，不完成或 reopen Project。
-
-### 4.3 Execute
-
-执行一个原子 open Intent 并产出一个 Fact。Fact 必须提供不超过 UTF-8 1 KiB、无需附件即可理解的 description。结果不需要文件时返回：
-
-```json
-{ "kind": "fact", "description": "可独立理解的结论", "artifact": null }
-```
-
-详细结果需要文件时返回恰好一个文件：
-
-```json
-{
-  "kind": "fact",
-  "description": "摘要",
-  "artifact": {
-    "filename": "reports/report.md",
-    "mediaType": "text/markdown",
-    "content": "完整文件正文（内联返回）"
-  }
-}
-```
-
-`artifact` 字段不可省略，但可以为 `null`。非 null 时返回恰好一个文件的内容：`{filename, mediaType, content}`——`filename` 是基于内容的相对输出名（绝不使用 i0001/f0001 等图节点编号，如 report.md），`content` 是完整文件正文。Worker 可读输入并只在当前 Project `.tmp/` 中产生临时文件；只有合同内联内容会由 Runtime 上传到 Project `artifacts/` 后再 conclude。输出不能包含 `customProfile`；profile 只属于 phase/Intent，不传播到 Fact。
-
-### 4.4 Finalize
-
-不是任务类型，只在 Execute 已启动、不是外部取消、Project/Intent 仍 active/open、返回可恢复 session，且 Execute 失败、timeout 或格式无效时运行一次。Finalize 复用相同 execution ID、session、Graph view、profile 和 Execute Fact contract，并在 snapshot 中记录 bound Execute；它只整理已进行工作的最终严格结果，不创建新的 Graph operation。
-
-## 5. 调度与 Worker 接口
-
-### 5.1 ExecutionRegistry（内存）
-
-```typescript
-interface ActiveExecution {
-  executionId: string;
-  projectId: string;
-  kind: TaskType;            // "plan" | "supervise" | "execute"
-  intentId?: string;
-  workerName?: string;
-  processId?: number;
-  startedAt: number;
-  deadlineAt?: number;
-  controller: AbortController;
-}
-```
-
-ExecutionRegistry 仅在内存：每个 Project 最多一个 Plan；每个 Project 最多一个 Supervise；每个 Intent 最多一个 Execute；不同 Intent 可并发；Runtime 重启后 open Intent 重新可调度。公开 DTO 把时间格式化为本地 `YYYYMMDDTHHMMSS.XXX`，并把可选字段规范为 `null`；不暴露 controller、prompt、argv、env、输出或 session。
-
-`executionId` 使用 `randomBytes(4).toString("hex")` 生成，并在 registry 内重试冲突，因此是八位小写十六进制；Finalize 不生成新 ID。
-
-### 5.2 Plan checkpoint
-
-内存 checkpoint 为 `{facts, hints, open, federation}`。首次观察、Fact/Hint 增加、open Intent 从非零变为零或 pending Federation 数变化时触发 Plan。
-
-### 5.3 WorkerProtocol 合同
-
-```typescript
-interface WorkerProtocol {
-  readonly type: WorkerType;
-  readonly canResume: boolean;
-  build(call: WorkerCall, session: SessionRef | undefined): ProcessSpec;
-  prepareSession?(call: WorkerCall): SessionRef | undefined;
-  parse(result: ProcessResult): { text: string; session?: SessionRef };
-}
-```
-
-配置层保留 `taskTypes` 路由信息；Runtime `WorkerPool` 负责候选选择、Execute 容量、reservation 与 cooldown。选出 workerName 后，`WorkerRuntime` 只接收剥离路由字段的 `{type,model?,env}` 定义，构造 `WorkerCall`，经 `ProcessRunner` 调起 CLI，再用 protocol 组装 `WorkerResult`。`WorkerRuntime` 不接收 TaskType。`SessionRef` 只包含 Worker type 和不透明值，只能交回相同 type 且 `canResume` 的 protocol，不进入 Graph 或 Project 恢复状态。
-
-### 5.4 Worker 选择排序
-
-```mermaid
-flowchart LR
-  A["taskTypes"] --> B["execute? maxRunning"] --> C["health retry-after"] --> D["priority"] --> E["execute load"] --> F["name"]
-```
-
-Plan/Supervise/Analyze 每次 dispatch 最多 3 次 CLI round-trip，固定间隔 2 秒，仅重试已启动且非外部取消的 provider failure、timeout 或 malformed output。Execute 不普通重试；满足恢复条件时只调用一次 Finalize，Finalize 不重试。固定 timeout 为 Plan 5 分钟、Supervise 5 分钟、Execute 10 分钟、Finalize 2 分钟、Analyze 5 分钟。
-
-## 6. Board 配置 schema
-
-CLI 参数指向包含 `task.json` 的 Board 目录。Board 只是 Project 集合和共享运行资源，没有 description、Goal、Graph 或完成状态。
-
-```text
-my-board/
-├── task.json
-└── skills/                 # 仅在配置 Board-local Skill 时需要
-    └── <name>/SKILL.md
-```
-
-顶层字段只能是 `board, workers, optional scheduler, optional phase`：
+HTTP 是唯一在线 Graph 协议。主要路由：
+
+| 领域 | 路由 |
+| --- | --- |
+| Project | `GET/POST /api/projects`、`GET/DELETE /api/projects/:id`、`PUT /api/projects/:id/status` |
+| Fact | `GET /api/projects/:id/facts/:factId`、`POST /api/fact-refs/resolve` |
+| Intent | `POST /api/projects/:id/intents`、`POST .../intents/:intentId/conclude` |
+| Hint | `POST /api/projects/:id/hints` |
+| Lifecycle | `POST /api/projects/:id/complete`、`POST /api/projects/:id/reopen` |
+| Artifact | `POST /api/projects/:id/artifacts`、`GET/HEAD .../artifacts/:sha256` |
+| Path Abstract | `GET/POST /api/projects/:id/path-abstracts/:factId` |
+| Federation | `POST /api/federation/publish|pending|consume` |
+| Project lease | `POST/PUT/DELETE /api/projects/:id/registration`（领取/心跳/释放） |
+| Export | `GET /api/projects/:id/export?format=json|timeline|archive` |
+
+所有 JSON 输入严格拒绝 unknown/missing field。普通 JSON body 上限为 1 MiB；Artifact 单独流式限额。Graph API 不包含 token 校验。
+
+`GraphClient` 只是 HTTP client，不提供绕过 Server 校验的本地路径。Dispatch 的短期 execution 状态只存在于自身内存，不伪装成 Server Graph API。
+
+## 4. Board 配置流
 
 ```json
 {
   "board": {
-    "name": "ai-agent-safety",
-    "skills": ["ai-agent-safety"],
+    "name": "example",
+    "skills": ["example-skill"],
     "projects": [
-      {
-        "id": "",
-        "source": "Latest AI Safety Intelligence",
-        "goal": "Collect and analyze current AI safety evidence."
-      },
-      {
-        "id": "",
-        "source": "AI Agent Guardrail Design",
-        "goal": "Produce an actionable AI Agent guardrail construction plan."
-      }
+      { "id": "", "source": "Input", "goal": "Expected outcome" }
     ]
   },
   "workers": [
@@ -450,150 +125,180 @@ my-board/
       "taskTypes": ["execute"],
       "maxRunning": 2,
       "priority": 1,
-      "env": { "PI_MODEL": "openai-codex/gpt-5.1" }
+      "env": {}
     }
+  ]
+}
+```
+
+加载过程：
+
+1. `loadTaskConfig()` 严格校验并冻结配置；Task 不携带 Server 地址。
+2. Dispatch 通过 `--graph-url` 连接独立 `peak serve`。
+3. 完整 Task Dispatch 可顺序创建缺失 Project 并回写 UUID；`--project` 分片启动要求所有 UUID 已固定。
+4. 第一个 Project lease 把 Task 的完整 UUID 集合固定到 `.projects.json`，后续成员集合不一致会被拒绝。
+5. `id` 已存在时附加原 Project并校验 goal；Runtime 为每个所领取 Project 建立独立 `ProjectLoop`。
+
+`taskTypes`、`maxRunning` 和 `priority` 只供 Runtime `WorkerPool` 路由。进入 Worker 模块的配置只有 `{type,model?,env}`。
+
+## 5. 阶段上下文与输出合同
+
+所有阶段先生成 256 KiB 内的只读上下文和 `graph-*.json` 快照，再把它渲染进 Prompt。快照包含阶段与 execution 溯源、预算内 context、配置和渲染 Prompt 的摘要，以及当前 profile 的 `{description,skills,digest}` 元数据；`skills` 不会成为顶层字段，`workers[]` 的路由配置也不会复制进快照。Worker 返回的最后一个 fenced JSON 或最外层 JSON 对象会被提取，随后进行严格 shape 校验。
+
+### 5.1 Plan
+
+输入：
+
+```typescript
+{
+  projects: {
+    [currentProjectId]: {
+      source,
+      goal,
+      leafFacts,
+      openIntents,
+      unconsumedHints
+    }
+  },
+  external: [
+    { factRef: { projectId, id, description }, pathOverview, verifiedCore }
   ],
-  "phase": {
-    "plan": {
-      "customProfile": {
-        "description": "Use to keep planning bounded and independently verifiable.",
-        "prompt": "Prefer non-overlapping atomic Intents."
-      }
-    },
-    "supervise": {
-      "intervalMs": 90000,
-      "customProfile": {
-        "description": "Use to audit proof quality and missing evidence.",
-        "prompt": "Independently check proof quality and missing evidence."
-      }
-    },
-    "execute": {
-      "customProfile": [
-        { "description": "Use for primary-source research.", "prompt": "Collect primary evidence." },
-        { "description": "Use for independent verification.", "prompt": "Independently verify selected claims." }
-      ]
-    }
+  truncated,
+  omitted
+}
+```
+
+输出三选一：
+
+```json
+{ "kind": "intents", "intents": [{ "from": [{ "projectId": "...", "id": "f0001", "description": "..." }], "hintIds": [], "customProfile": null, "description": "..." }] }
+```
+
+```json
+{ "kind": "complete", "from": [{ "projectId": "...", "id": "f0001", "description": "..." }], "hintIds": [], "description": "..." }
+```
+
+```json
+{ "kind": "noop" }
+```
+
+Plan 只能原样引用当前 Project 的可见 leaf FactRef；`external` 不能进入 `from`。写入前 Runtime 重读前沿，Server 再次校验 leaf。并发导致 source 过期时最多重新 Plan 一轮。
+
+### 5.2 Supervise
+
+输入为当前 Project、Facts、Intents、Hints 和截断元数据。输出：
+
+```json
+{ "kind": "hint", "content": "..." }
+```
+
+或 `{ "kind": "noop" }`。每轮最多新增一个非重复 Hint。
+
+### 5.3 Execute 与 Finalize
+
+Execute 输入当前 Project、一个 open Intent 和已解析 sources。source Artifact 以规范绝对 `inputPath` 和 `readOnly:true` 提供；Runtime 在执行前后校验文件类型、大小和 SHA-256。
+
+输出：
+
+```json
+{ "kind": "fact", "description": "...", "artifact": null }
+```
+
+或：
+
+```json
+{
+  "kind": "fact",
+  "description": "...",
+  "artifact": {
+    "filename": "report.md",
+    "mediaType": "text/markdown",
+    "content": "..."
   }
 }
 ```
 
-约束与持久化语义：
+Worker 可在 Project `.tmp/` 中读写，但最终只接受合同中的一个内联 Artifact。Runtime 上传内容后调用 conclude，原子创建一个 Fact 并更新 `Intent.to`。
 
-- `board.projects` 必须为非空数组；每项只能包含 `id`、`source`、`goal`；source 必须非空且在 Board 内唯一，并直接成为 immutable `origin` description；Board 没有 workspace；
-- `id` 可省略或为空字符串；首次 `start` 成功创建 Project 后，Peak 以原子替换方式把生成的 UUID 写回该数组项；
-- 非空 `id` 必须是 UUID，同一 Board 内不能重复；Runtime 按 id 附加原 Project并校验其 immutable Goal，不创建副本；
-- 另一个 Board 可以配置相同 UUID 来复用同一 Project Graph、Facts 与 Artifacts；同一 active Project 不得被多个 Runtime 进程并发调度；
-- `workers` 是非空数组；每项字段恰好为 `{type, model?, taskTypes, maxRunning, priority, env}`，Peak 生成内部 Worker identity；`taskTypes/maxRunning/priority` 仅为配置层到 Runtime WorkerPool 的路由/调度数据，不进入 WorkerRuntime；空 `model` 表示使用 Agent 工具默认模型；`env` 是传给 CLI 子进程的字符串 map，不允许 free-form `args`；至少一个 Worker 必须支持 `supervise`，且至少一个必须支持 `execute`；
-- `phase.plan.customProfile` 和 `phase.supervise.customProfile` 各自可选且最多一项；`phase.execute.customProfile` 是可多选的数组，默认为空，description 必须唯一；
-- 每个 profile 只能是 `{description,prompt}`；description 是供 AI 判断是否注入的短说明，必填且不超过 UTF-8 1 KiB；prompt 必填且不超过 UTF-8 8 KiB；
-- Worker type 只能是 `opencode`、`codex`、`pi`、`claude-code`；task type 只能是 `plan`、`supervise`、`execute`；
-- `priority` 数值越小越优先，可为 0；其余计数/间隔必须为正整数；
-- unknown field 在所有层级都被拒绝；字符串 trim 后必须非空（`id` 和 `model` 的显式空字符串除外）；加载结果递归 freeze；
-- `loadTaskConfig()` 只解析和验证；成功创建后的 UUID 回写由独立的原子 config 操作完成。
+Execute 已启动但失败、超时或输出不合法时，可在满足 session 恢复条件的情况下运行一次 Finalize。Finalize 使用相同 worker、execution ID、上下文和输出合同。
 
-新建 Project 使用根据 name 生成的 immutable origin 和自己的 goal；按 id 附加时保留原 Project 的 title/origin 并校验 goal。各 Project 的状态、Graph、Artifact 与完成条件彼此独立，Project 配置不声明跨 Project 依赖。Worker 只接收当前 phase 所需的 Graph view。Board 内已注册 Project 之间广播当前 leaf 的完整 FactRef 与 `artifacts/path_abs_<factId>` 路径，接收端校验并解析为只读绝对路径后放入 Plan 的 `external`；外部 leaf 不能作为 `intent.from` source，目标 Graph 不复制源 Fact 或路径抽象文件。
+### 5.4 Analyze
 
-### 6.1 Skill 解析与生命周期
+Analyze 输入当前 Fact，以及每个直接前驱的完整 FactRef 和已解析 Path Abstract DTO。输出：
 
-Board customization 只能通过 `board.skills`，配置时只允许名称（匹配小写字母、数字和连字符规则）。发现目录：
+```json
+{
+  "pathOverview": "从 origin 到当前 Fact 的路径概述",
+  "verifiedCore": ["已经验证的核心内容"]
+}
+```
+
+结果原子写入 `artifacts/path_abs_<factId>`。已有结果直接复用；Worker 连续失败时写入结构化降级结果。
+
+## 6. 端到端流转
+
+### 6.1 Plan 到 Fact
+
+```mermaid
+flowchart LR
+  A["GraphClient 读取当前前沿"] --> B["组装 Plan context + snapshot"]
+  B --> C["Worker 输出 intents / complete / noop"]
+  C --> D["Runtime 重读前沿"]
+  D --> E["Graph Server 校验并写 Intent"]
+  E --> F["Execute 解析 sources"]
+  F --> G["Worker 输出 Fact contract"]
+  G --> H["可选 Artifact 上传"]
+  H --> I["conclude: 新 Fact + Intent.to"]
+```
+
+Execute 失败不会创建伪 Fact；Intent 保持 open，后续 tick 可再次调度。
+
+### 6.2 Artifact
 
 ```text
-OpenCode / Pi -> ~/.agents/skills/<name>/SKILL.md
-Claude Code   -> ~/.claude/skills/<name>/SKILL.md
-Codex         -> 不安装 Skill
-Board fallback -> <board-dir>/skills/<name>/SKILL.md
+inline content
+-> GraphClient 流式上传
+-> Server 计算 SHA-256
+-> artifacts/<sha256>
+-> ArtifactRef 绑定 Fact
+-> completion 时按 filename 物化到 out/
 ```
 
-本地模式：目标位置已有合法全局 Skill 时直接使用，Board-local 同名 Skill 不覆盖它；目标不存在时才把 Board-local Skill 以 symlink/junction 临时链接过去；不覆盖真实文件、目录或其他链接；多个 Runtime 共享同一个 Peak 管理链接时使用内存引用计数；Runtime shutdown 时仅删除 Peak 创建且仍指向原 source 的临时链接。Docker 模式不在容器内安装：全局目录和 Board 均只读挂载，缺少的 Board-local Skill 直接只读 overlay 到对应发现路径，并以 `--no-install-skills` 启动。`peak init` 不创建 `skills/` 目录。除成功创建 Project 后原子回写 UUID 外，Runtime 不修改配置文件。
+客户端不能指定最终 Artifact path。Server 拒绝绝对路径、路径逃逸和 symlink。
 
-## 7. 端到端数据流
-
-### 7.1 Board Project 集合
-
-`load board.projects` → id 为空时 `POST /api/projects` 并原子回写 UUID，id 已有时读取 Project 并校验 Goal → 打开 `projects/<uuid>/project.db` → 注册 ProjectLoop 和候选叶 FactRef → 启动 Scheduler。
-
-### 7.2 Plan
+### 6.3 Federation
 
 ```mermaid
 flowchart LR
-  G["GET Project Graph<br/>Source + Goal + 当前前沿<br/>+ truncated/omitted"] --> J["graph-&lt;timestamp&gt;-plan.json"]
-  F["external 外部 leaf<br/>{factRef, pathAbs} 只读"] --> J
-  J --> W["Worker 严格 JSON"]
-  W --> R["写入前重读当前前沿"]
-  R --> V["Server 重新校验每个 source<br/>仍是当前叶 FactRef"]
-  V --> O["POST Intent(s) / complete / noop<br/>stale leaf 时最多重做一轮 Plan"]
+  A["Plan pre-hook: Joint Plan"] --> B["HTTP joint-plan"]
+  B --> C["Server 计算同 Task 其他 Projects 的 leaf Paths"]
+  C --> D["递归复用或补齐 Path Abstract"]
+  D --> E["Plan external: PathAbstract DTO"]
 ```
 
-### 7.3 Supervise
+Task 的 Project 列表是固定 Federation 边界：Joint Plan 必须读取同 Task 全部其他 Projects 的当前 Paths，不存在开关或动态成员管理。不同 Dispatch 进程之间不直接传播数据，也不存在发布、恢复或消费队列；每次 Plan 都通过 Server HTTP 读取最新 frontier。
 
-```mermaid
-flowchart LR
-  A["poll active Graph"] --> J["graph-&lt;timestamp&gt;-supervise.json"]
-  J --> W["Worker hint / noop"]
-  W --> H["POST /hints"]
-  H --> P["新 Hint 触发 Plan"]
+Completed Project Archive 同时携带 Graph、SQLite、内容 Artifact 和全部当前 leaf 的 `path_abs_<factId>`。导入后 Joint Plan 使用 `computePaths()` 与已有 Path Abstract 直接构建上下文；Path Abstract 已存在就终止递归，只有缺失项才执行 Analyze。
+
+### 6.4 Complete 与 Reopen
+
+```text
+complete: current local leaves -> completion Intent -> goal -> status=completed
+reopen: remove completion -> external feedback Fact -> status=active
 ```
 
-### 7.4 Execute
+两者都由 Server 在事务内完成。Hint 或 Joint Plan 输入不会自动 reopen。
 
-```mermaid
-flowchart LR
-  A["open Intent + 已解析 source Facts"] --> J["graph-&lt;timestamp&gt;-execute.json"]
-  J --> W["Worker fact JSON<br/>（内联 filename/mediaType/content）"]
-  W --> U["（可选）内容流 → POST /artifacts<br/>x-artifact-filename 头"]
-  U --> C["POST /intents/&lt;id&gt;/conclude"]
-  C --> F["创建一个不可变本地 Fact<br/>source 成为历史，结果成为新叶"]
-  F --> P["下次 Plan 前 syncPaths 补齐摘要<br/>→ FederationBus.publishPath"]
-```
+## 7. 运行时策略
 
-失败、malformed 或 timed-out 的 Execute 可通过 Finalize resume 同一 worker session 一次。Finalize 写自己的 Graph JSON 并返回相同 Fact 合同。完成时，带 `filename` 的 completion source Artifact 被物化到 Project shard 的 `out/` 目录（最终 Goal 交付物）。
+| 阶段 | 超时 | 重试 |
+| --- | ---: | --- |
+| Plan | 5 分钟 | 最多 3 次；stale leaf 另允许重做一轮 Plan |
+| Supervise | 5 分钟 | 最多 3 次 |
+| Execute | 10 分钟 | 不普通重试；可 Finalize 一次 |
+| Finalize | 2 分钟 | 不重试 |
+| Analyze | 5 分钟 | 最多 3 次，最终降级 |
 
-### 7.5 Artifact
+Plan、Supervise 和 Analyze 只重试已启动且非外部取消的 provider failure、timeout 或 malformed output，间隔 2 秒。
 
-Execute 内联 `{filename, mediaType, content}` → `GraphClient` 流式上传 → Server 计算 SHA-256 并写入 `artifacts/<sha256>` 与元数据 → Fact 绑定 `artifact_sha256` → 完成时仅将带 filename 的 proof Artifact 物化到 Project shard 的 `out/` 目录。Artifact 只承载可选的单文件详情；Fact description 始终必填且可独立理解。
-
-### 7.6 Federation
-
-```mermaid
-flowchart LR
-  A["leaf 链路 + 分析摘要<br/>{leaf, summary, segments}"] --> B["source main.log<br/>send_path_reference"]
-  B --> C["FederationBus 内存 pending 队列"]
-  C --> D["target Plan 视图为 external<br/>完整 FactRef + path_abs, 不作 source"]
-  D --> E["target Plan 写盘成功"]
-  E --> F["target main.log<br/>receive_path_reference"]
-  F --> G["markPathsHandled"]
-```
-
-广播单元是当前 leaf 的完整 FactRef 与相对 `artifacts/path_abs_<factId>` 路径。Analyze 对 Fact n 读取当前 Fact 与直接前驱 Fact n-1 的路径描述，严格生成 `{pathOverview, verifiedCore}` 并原子落盘；合并节点读取全部直接前驱。`syncPaths` 在 Runtime 启动和每次 Plan dispatch 前递归补齐当前 leaf 所需文件。接收端只把经项目注册、规范路径、普通文件和非 symlink 校验后的绝对只读路径放入 Plan；不写目标 Graph。leaf 被新 conclusion 消费后，其旧广播在 send event 中以 `retires` 记录并从目标 pending 队列退休。FederationBus 无数据库，只从 `main.log` 恢复。失败时不 mark handled。旧的 `send_fact_reference` 事件不再解析。
-
-### 7.7 Completion 与 Reopen
-
-```mermaid
-flowchart LR
-  A["POST /complete"] --> B["校验 FactRef 三字段与本地 Leaf"]
-  B --> C["创建指向 goal 的 completion Intent"]
-  C --> D["同一事务标记 Project completed"]
-  D --> E["物化最终交付物到 Project out/ 目录<br/>+ 取消剩余内存执行"]
-```
-
-```mermaid
-flowchart LR
-  A["POST /reopen"] --> B["删除当前 completion Intent"]
-  B --> C["写 external feedback Fact<br/>+ 从当前全部本地 Leaf 出发"]
-  C --> D["恢复 active"]
-```
-
-完成是 Project-local 且即时；只有显式 `/reopen` 才能恢复。
-
-### 7.8 Runtime 运行态 overlay
-
-```mermaid
-flowchart LR
-  P["ProcessRunner spawn/exit"] --> E["ExecutionRegistry（内存）"]
-  T["RuntimeStatus 定时 heartbeat"] --> A["/api/runtime/*"]
-  E --> A
-  A --> U["Dashboard 合并 Graph + execution overlay"]
-  U --> S["concluded / running / open<br/>心跳过期则 runtime offline"]
-```
-
-`peak serve` 没有该 overlay；Dashboard 收到 404 时清除 execution 数据并继续使用 Graph API。
+Execute 并发容量为所有 `taskTypes` 包含 `execute` 的 Worker 的 `maxRunning` 之和。Runtime 重启后，Graph 中仍 open 的 Intent 会重新进入调度；任何运行态都不会伪装成持久化 Graph 状态。

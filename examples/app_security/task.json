@@ -15,6 +15,10 @@
       }
     ]
   },
+  "execution": {
+    "mode": "docker",
+    "networkMode": "host"
+  },
   "workers": [
     {
       "type": "opencode",

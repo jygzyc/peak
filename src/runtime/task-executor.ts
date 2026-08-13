@@ -2,21 +2,19 @@ import { createHash, randomBytes } from "node:crypto";
 import { createReadStream, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { writeProjectLog } from "../utils/helpers.js";
+import { localTimestamp, toJson, writeProjectLog } from "../utils/helpers.js";
 import { initializeProjectLogsDirectory, projectOutDir, projectTmpDir } from "../utils/paths.js";
 import { executeCapacity } from "../utils/task-config.js";
 import {
   customProfileDigest, type CustomProfileDefinition, type ResolvedTaskConfig, type TaskProjectConfig, type TaskType,
 } from "../utils/types.js";
-import { localTimestamp, toJson } from "../graph/api.js";
-import { FederationBus } from "../graph/federation-bus.js";
+import type { JointPlan } from "../graph/joint-plan.js";
 import { GraphClient, GraphClientError } from "../graph/graph-client.js";
-import { pathAbstractPath, pathAbstractRelativePath } from "../graph/path-abstract.js";
 import {
-  computePaths, leafFacts, type Fact, type FactRef, type Hint, type Intent, type PathAbstract, type ProjectMeta, type ResolvedFactSource,
-  type ResolvedPathAbstract,
+  leafFacts, type Fact, type FactRef, type Hint, type Intent, type PathAbstract, type ProjectMeta, type ResolvedFactSource,
 } from "../graph/types.js";
 import type { SessionRef, WorkerResult } from "../worker/types.js";
+import type { PlacedSource } from "./execution-backend.js";
 import { parseAnalyze, parseExecute, parsePlan, parseSupervise } from "./contracts.js";
 import { EMBEDDED_PROMPTS } from "../generated/assets.js";
 
@@ -41,7 +39,7 @@ export interface TaskWorkers {
     cwd: string,
     signal?: AbortSignal,
     session?: SessionRef,
-    options?: { tmpDir?: string; onSpawn?: (pid: number) => void },
+    options?: { tmpDir?: string },
   ): Promise<WorkerResult>;
 }
 
@@ -59,8 +57,8 @@ interface PlanProjectView {
 }
 interface PlanGraphView extends GraphViewBudget {
   projects: Record<string, PlanProjectView>;
-  /** Same-scope leaf FactRefs with their read-only Path Abstract files. */
-  external: ResolvedPathAbstract[];
+  /** Path Abstract DTOs fetched from the central Server for same-Task leaves. */
+  external: PathAbstract[];
 }
 interface ExecuteGraphView extends GraphViewBudget { project: ProjectMeta; intent: Intent; sources: ResolvedFactSource[] }
 interface SuperviseGraphView extends GraphViewBudget {
@@ -70,7 +68,7 @@ interface SuperviseGraphView extends GraphViewBudget {
   hints: Hint[];
 }
 interface RenderedPrompt { text: string; templateDigest: string }
-interface ProfileValue { description: string; prompt: string; digest: string }
+interface ProfileValue { description: string; prompt: string; skills: string[]; digest: string }
 
 export const GRAPH_VIEW_MAX_BYTES = 256 * 1024;
 
@@ -92,11 +90,14 @@ export class TaskExecutor {
     _projectConfig: TaskProjectConfig,
     private readonly graph: GraphClient,
     private readonly workers: TaskWorkers,
-    private readonly federation: FederationBus,
+    private readonly jointPlan: JointPlan,
     readonly projectDir: string,
     private readonly onComplete: () => void = () => undefined,
-    private readonly tmpDir?: string,
-    private readonly reportSpawn?: (executionId: string, pid: number) => void,
+    private workspace?: {
+      tmpDir?: string;
+      cleanup?: (dir: string) => void;
+      placeArtifact?: (artifact: { sha256: string; filename: string | null }, content: Buffer) => Promise<PlacedSource>;
+    },
   ) { validatePromptTemplates(); }
 
   /** Appends a runtime event to this Project's logs/main.log (e.g. retries, failures, crashes). */
@@ -104,24 +105,85 @@ export class TaskExecutor {
     writeProjectLog(this.projectDir, type, data);
   }
 
+  /**
+   * Replaces the execution workspace after a Project re-enters active state
+   * inside the same Runtime (its Docker container was removed on the inactive
+   * transition and re-created by `ensureWorkspace`). Only the owning
+   * ProjectLoop calls this, between executions.
+   */
+  updateWorkspace(workspace: {
+    tmpDir?: string;
+    cleanup?: (dir: string) => void;
+    placeArtifact?: (artifact: { sha256: string; filename: string | null }, content: Buffer) => Promise<PlacedSource>;
+  }): void {
+    this.workspace = workspace;
+  }
+
+  /** Reports Plan FactRefs whose descriptions were paraphrased and rewritten to the authoritative values. */
+  private logNormalizedRefs(projectId: string, executionId: string, normalized: number): void {
+    process.stderr.write(`[peak] plan normalized ${normalized} inexact FactRef description(s) to the authoritative values\n`);
+    this.logEvent("factref_normalized", { projectId, executionId, normalized });
+  }
+
+  /**
+   * Runs one worker round-trip and records it in the Project audit log:
+   * `worker_started` before the spawn, and exactly one terminal event after —
+   * `worker_completed` (exit 0), `worker_timeout` (the phase deadline killed
+   * the worker), `worker_cancelled` (external abort), or `worker_failed`
+   * (non-zero exit, with a stderr preview). Every attempt of a retried phase
+   * gets its own event pair, so timeouts and flaky runs stay auditable. Each
+   * event carries `projectId`, `phase`, `executionId` and (for Execute /
+   * Finalize) `intentId`, pinpointing which Project's which step the worker
+   * was running.
+   *
+   * A plain (non-async) function: `workers.execute` is invoked synchronously,
+   * so a synchronous routing error propagates exactly as it did at the call
+   * sites before (reservation release semantics unchanged).
+   */
+  private runWorker(
+    projectId: string,
+    phase: Phase,
+    executionId: string,
+    worker: string,
+    taskType: TaskType,
+    prompt: string,
+    timeoutMs: number,
+    signal?: AbortSignal,
+    session?: SessionRef,
+    options?: { tmpDir?: string },
+    intentId?: string,
+  ): Promise<WorkerResult> {
+    const startedAt = Date.now();
+    this.logEvent("worker_started", {
+      projectId, phase, executionId, worker, taskType, timeoutMs, intentId: intentId ?? null, sessionId: session?.value ?? null,
+    });
+    const running = this.workers.execute(worker, taskType, prompt, timeoutMs, this.prepareWorkerTmp(), signal, session, options);
+    return running.then((result) => {
+      const base = {
+        projectId, phase, executionId, worker, taskType, timeoutMs, intentId: intentId ?? null,
+        durationMs: Date.now() - startedAt, returncode: result.returncode, started: result.started,
+      };
+      if (result.timedOut) this.logEvent("worker_timeout", base);
+      else if (result.cancelled) this.logEvent("worker_cancelled", base);
+      else if (result.returncode !== 0) this.logEvent("worker_failed", { ...base, stderr: preview(result.stderr) });
+      else this.logEvent("worker_completed", base);
+      return result;
+    });
+  }
+
   reserveWorker(taskType: TaskType): string | undefined {
     return this.workers.pick(taskType);
   }
 
   /**
-   * Plan phase: assembles a read-only frontier view (current leaves, open
-   * Intents, unconsumed Hints, pending Federation Paths), asks the Worker for
-   * the next Intents or completion, validates the write against a freshly
-   * re-read Graph, and retries the whole dispatch when a concurrent Execute
-   * consumed a source leaf in the meantime. Runs the path-abstract hook first
-   * so every concluded Fact carries its `path_abs_<factId>` artifact and
-   * current leaf Paths are broadcast before the Plan view is assembled.
+   * Joint Plan phase: recursively completes missing Path Abstracts for the
+   * current Project and every same-Task peer, injects their current leaf Paths
+   * into one read-only context, and validates the result against a fresh Graph.
    */
   async plan(projectId: string, executionId: string, signal?: AbortSignal, reservedWorker?: string): Promise<void> {
     const worker = reservedWorker ?? this.requireWorker("plan");
     let handedOff = false;
     try {
-      await this.syncPaths(projectId, signal);
       // Plan reads a Graph view, asks the worker for the next Intents, then
       // writes them. A concurrent Execute can conclude an Intent while the
       // worker is thinking, consuming a source leaf the Plan reasoned over.
@@ -130,14 +192,15 @@ export class TaskExecutor {
       // when a source has been superseded.
       for (let attempt = 1; attempt <= PLAN_DISPATCH_ATTEMPTS; attempt += 1) {
         const project = await this.graph.getProject(projectId);
-        const pending = this.federation.pendingPathsFor(projectId);
+        const external = await this.prepareJointPlan(projectId, signal);
         const facts = leafFacts(project);
         const source = project.facts.find((fact) => fact.id === "origin");
         const goal = project.facts.find((fact) => fact.id === "goal");
         if (!source || !goal) throw new Error("Project source or goal Fact is missing");
         const refs = facts.map((fact) => factRef(projectId, fact));
         const resolvedLeaves = await this.graph.resolveFactRefs(projectId, refs);
-        await verifySources(resolvedLeaves);
+        const placedLeaves = await this.materializeSources(resolvedLeaves);
+        await this.verifySources(resolvedLeaves, placedLeaves);
         const current: PlanProjectView = {
           source: factRef(projectId, source),
           goal: factRef(projectId, goal),
@@ -149,26 +212,30 @@ export class TaskExecutor {
         const graph = budgetPlanGraphView(
           projectId,
           current,
-          pending.map((path) => this.federation.resolvePath(path)),
+          external,
         );
         const planProfile = profileValue(this.config.phase.plan.customProfile);
-        // Inject raw {description,prompt} definitions only: the digest is
-        // internal integrity metadata, and showing it to the Plan AI invites
-        // it to select the digest instead of the description.
+        // Profile selection happens by short digest token: descriptions are
+        // long natural-language text the Plan AI frequently paraphrases, while
+        // a 16-hex-char digest copies reliably.
         const executeProfiles = this.config.phase.execute.customProfile;
         const capacity = executeCapacity(this.config);
         const rendered = renderPrompt("plan", {
-          customProfile: json(planProfile), skills: json(this.config.board.skills),
-          graph: json(graph), executeCustomProfiles: json(executeProfiles),
+          customProfile: json(promptProfile(planProfile)), skills: json(planProfile?.skills ?? []),
+          graph: json(graph), executeCustomProfiles: json(executeProfiles.map((profile) => ({
+            description: profile.description, prompt: profile.prompt, digest: customProfileDigest(profile),
+          }))),
           maxIntents: String(capacity),
           contract: planContract(capacity, executeProfiles.length > 0),
         });
         this.snapshot("plan", executionId, graph, planProfile, rendered);
         const output = await withPhaseRetries("plan", MAX_PHASE_ATTEMPTS, async () => {
-          const result = await this.workers.execute(worker, "plan", rendered.text, PHASE_TIMEOUT_MS.plan, this.prepareWorkerTmp(), signal, undefined, this.workerOptions(executionId));
+          const result = await this.runWorker(projectId, "plan", executionId, worker, "plan", rendered.text, PHASE_TIMEOUT_MS.plan, signal, undefined, this.workerOptions());
           handedOff = true;
           requireSuccess(result, "plan");
-          return phaseParse(() => parsePlan(result.text, executeCapacity(this.config), executeProfiles.map((profile) => profile.description)));
+          return phaseParse(() => parsePlan(result.text, executeCapacity(this.config), executeProfiles.map((profile) => ({
+            description: profile.description, digest: customProfileDigest(profile),
+          }))));
         }, signal, (attempt, attempts, message) => this.logEvent("phase_retry", { projectId, phase: "plan", executionId, attempt, attempts, message }));
         // Re-read immediately before writing so a source leaf consumed by a
         // concurrent Execute is caught under the latest leaf frontier, not the
@@ -178,18 +245,20 @@ export class TaskExecutor {
         const unconsumedHints = latest.hints.filter((hint) => hint.consumedByIntentId === null);
         try {
           if (output.kind === "complete") {
-            validateVisible(output.from, visible);
+            const normalized = validateVisible(output.from, visible);
             validateHints(output.hintIds, unconsumedHints);
             await this.graph.complete(projectId, {
               from: output.from, hintIds: output.hintIds, description: output.description, completedBy: `plan:${executionId}`,
             });
             await this.materializeDeliverables(projectId, output.from);
             this.onComplete();
+            if (normalized > 0) this.logNormalizedRefs(projectId, executionId, normalized);
           } else if (output.kind === "intents") {
+            let normalized = 0;
             for (const intent of output.intents) {
-              validateVisible(intent.from, visible);
+              normalized += validateVisible(intent.from, visible);
               validateHints(intent.hintIds, unconsumedHints);
-              const selected = intent.customProfile === null ? null : this.executeProfile(intent.customProfile);
+              const selected = intent.customProfileDigest === null ? null : this.executeProfileByDigest(intent.customProfileDigest);
               await this.graph.createIntent(projectId, {
                 from: intent.from, hintIds: intent.hintIds, description: intent.description,
                 customProfile: selected?.description ?? null,
@@ -197,8 +266,8 @@ export class TaskExecutor {
                 createdBy: `plan:${executionId}`,
               });
             }
+            if (normalized > 0) this.logNormalizedRefs(projectId, executionId, normalized);
           }
-          if (pending.length) this.federation.markPathsHandled(projectId, pending);
           return;
         } catch (error) {
           if (!isStaleLeafConflict(error) || attempt === PLAN_DISPATCH_ATTEMPTS || signal?.aborted) throw error;
@@ -229,11 +298,11 @@ export class TaskExecutor {
       }, ["facts", "intents", "hints"]);
       const selected = profileValue(this.config.phase.supervise.customProfile);
       const rendered = renderPrompt("supervise", {
-        customProfile: json(selected), graph: json(graph), contract: SUPERVISE_CONTRACT,
+        customProfile: json(promptProfile(selected)), skills: json(selected?.skills ?? []), graph: json(graph), contract: SUPERVISE_CONTRACT,
       });
       this.snapshot("supervise", executionId, graph, selected, rendered);
       const output = await withPhaseRetries("supervise", MAX_PHASE_ATTEMPTS, async () => {
-        const result = await this.workers.execute(worker, "supervise", rendered.text, PHASE_TIMEOUT_MS.supervise, this.prepareWorkerTmp(), signal, undefined, this.workerOptions(executionId));
+        const result = await this.runWorker(projectId, "supervise", executionId, worker, "supervise", rendered.text, PHASE_TIMEOUT_MS.supervise, signal, undefined, this.workerOptions());
         handedOff = true;
         requireSuccess(result, "supervise");
         return phaseParse(() => parseSupervise(result.text));
@@ -263,16 +332,17 @@ export class TaskExecutor {
     try {
       const project = await this.graph.getProject(projectId);
       const sources = await this.graph.resolveFactRefs(projectId, intent.from);
-      await verifySources(sources);
+      const placedSources = await this.materializeSources(sources);
+      await this.verifySources(sources, placedSources);
       const selected = this.resolveExecuteProfile(intent);
       const graph: ExecuteGraphView = completeGraphView(
         { project: project.project, intent, sources }, ["sources"],
       );
       const rendered = renderPrompt("execute", {
-        customProfile: json(selected), skills: json(this.config.board.skills), graph: json(graph), contract: EXECUTE_CONTRACT,
+        customProfile: json(promptProfile(selected)), skills: json(selected?.skills ?? []), graph: json(graph), contract: EXECUTE_CONTRACT,
       });
       const executeSnapshot = this.snapshot("execute", executionId, graph, selected, rendered);
-      const running = this.workers.execute(worker, "execute", rendered.text, PHASE_TIMEOUT_MS.execute, this.prepareWorkerTmp(), signal, undefined, this.workerOptions(executionId));
+      const running = this.runWorker(projectId, "execute", executionId, worker, "execute", rendered.text, PHASE_TIMEOUT_MS.execute, signal, undefined, this.workerOptions(), intent.id);
       handedOff = true;
       const first = await running;
       let output: ReturnType<typeof parseExecute>;
@@ -284,41 +354,45 @@ export class TaskExecutor {
         if (!first.started || first.cancelled || !first.session || signal?.aborted) throw error;
         const current = await this.graph.getProject(projectId);
         if (current.project.status !== "active" || !current.intents.some((item) => item.id === intent.id && item.to === null)) throw error;
-        output = await this.finalize(worker, projectId, executionId, graph, selected, executeSnapshot, first.session, signal);
+        output = await this.finalize(worker, projectId, executionId, graph, selected, executeSnapshot, first.session, signal, intent.id);
         finalized = true;
       }
-      await verifySources(sources);
+      await this.verifySources(sources, placedSources);
       const artifact = output.artifact
         ? await this.uploadContent(projectId, output.artifact.filename, output.artifact.mediaType, output.artifact.content)
         : null;
       await this.graph.conclude(projectId, intent.id, {
         description: output.description, artifact, concludedBy: `${finalized ? "finalize" : "execute"}:${executionId}`,
       });
-      // Path abstracts and Federation broadcast are NOT generated here: the
-      // pre-Plan hook (syncPaths) owns them so Execute stays a single Worker
-      // round-trip and analysis happens synchronously before the next Plan.
+      // Path Abstracts are NOT generated here: Joint Plan recursively owns
+      // them before the next Plan Worker call, keeping Execute one round-trip.
     } finally {
       if (!handedOff) this.workers.release(worker, "execute");
     }
   }
 
   /**
-   * Pre-Plan Federation hook, also run once per Project at Runtime startup.
-   * Ensures every current leaf has an incremental `path_abs_<factId>` artifact,
-   * recursively filling a missing predecessor first, then broadcasts the leaf
-   * FactRef and Path Abstract path to every same-scope Project.
+   * Runs immediately before every local Plan attempt. It first completes the
+   * current Project's entire leaf PathAbstract frontier, then builds the Joint
+   * Plan context from same-Task leaves. Analyze is recursive and incremental:
+   * a cached `path_abs_fN` terminates recursion; otherwise all direct
+   * predecessor abstracts are completed before Fact N.
    */
-  async syncPaths(projectId: string, signal?: AbortSignal): Promise<void> {
-    const graph = await this.graph.getProject(projectId);
-    for (const fact of leafFacts(graph)) {
-      if (fact.id !== "origin") await this.ensurePathAbstract(projectId, graph, fact.id, signal, new Set());
+  async prepareJointPlan(projectId: string, signal?: AbortSignal): Promise<PathAbstract[]> {
+    const local = await this.graph.getProject(projectId);
+    for (const fact of leafFacts(local)) {
+      if (fact.id !== "origin") await this.ensurePathAbstract(projectId, local, fact.id, signal, new Set());
     }
-    for (const path of computePaths(graph)) {
-      this.federation.publishPath({
-        projectId, leaf: path.leaf, pathAbs: pathAbstractRelativePath(path.leaf.id),
-        segments: path.segments.map((segment) => segment.map((step) => step.fact)),
-      });
+    const external: PathAbstract[] = [];
+    for (const path of await this.jointPlan.paths(projectId)) {
+      const source = await this.graph.getProject(path.projectId);
+      const abstract = await this.ensurePathAbstract(path.projectId, source, path.leaf.id, signal, new Set());
+      if (JSON.stringify(abstract.factRef) !== JSON.stringify(path.leaf)) {
+        throw new Error(`Joint Plan PathAbstract FactRef mismatch: ${path.projectId}/${path.leaf.id}`);
+      }
+      external.push(abstract);
     }
+    return external;
   }
 
   private async cachedPathAbstract(projectId: string, factId: string): Promise<PathAbstract | null> {
@@ -344,37 +418,44 @@ export class TaskExecutor {
   ): Promise<PathAbstract> {
     const cached = await this.cachedPathAbstract(projectId, factId);
     if (cached) return cached;
-    if (visiting.has(factId)) throw new Error(`PathAbstract dependency cycle at ${factId}`);
-    visiting.add(factId);
+    const key = `${projectId}/${factId}`;
+    if (visiting.has(key)) throw new Error(`PathAbstract dependency cycle at ${key}`);
+    visiting.add(key);
     try {
       const fact = graph.facts.find((item) => item.id === factId);
       const producer = graph.intents.find((intent) => intent.to?.projectId === projectId && intent.to.id === factId);
       if (!fact || !producer) throw new Error(`PathAbstract source is missing: ${projectId}/${factId}`);
-      const previous: Array<{ factRef: FactRef; pathAbs: ResolvedPathAbstract["pathAbs"] | null; abstract: PathAbstract | null }> = [];
-      for (const ref of producer.from.filter((item) => item.projectId === projectId)) {
+      const previous: Array<{ factRef: FactRef; abstract: PathAbstract | null }> = [];
+      for (const ref of producer.from) {
         const abstract = ref.id === "origin"
           ? null
-          : await this.ensurePathAbstract(projectId, graph, ref.id, signal, visiting);
+          : await this.ensurePathAbstract(
+            ref.projectId,
+            ref.projectId === projectId ? graph : await this.graph.getProject(ref.projectId),
+            ref.id,
+            signal,
+            visiting,
+          );
         previous.push({
           factRef: ref,
-          pathAbs: abstract ? { inputPath: pathAbstractPath(this.projectDir, ref.id), readOnly: true } : null,
           abstract,
         });
       }
       const [current] = await this.graph.resolveFactRefs(projectId, [factRef(projectId, fact)]);
       if (!current) throw new Error(`Fact could not be resolved: ${projectId}/${factId}`);
-      await verifySources([current]);
+      const placedCurrent = await this.materializeSources([current]);
+      await this.verifySources([current], placedCurrent);
       const output = await this.analyzePath(projectId, current, previous, signal);
       return await this.graph.putPathAbstract(projectId, factId, { factRef: current.ref, ...output });
     } finally {
-      visiting.delete(factId);
+      visiting.delete(key);
     }
   }
 
   private async analyzePath(
     projectId: string,
     current: ResolvedFactSource,
-    previous: Array<{ factRef: FactRef; pathAbs: ResolvedPathAbstract["pathAbs"] | null; abstract: PathAbstract | null }>,
+    previous: Array<{ factRef: FactRef; abstract: PathAbstract | null }>,
     signal?: AbortSignal,
   ): Promise<Omit<PathAbstract, "factRef">> {
     const executionId = `analyze-${current.ref.id}`;
@@ -385,12 +466,12 @@ export class TaskExecutor {
     } else {
       const context = { current, previous };
       const rendered = renderPrompt("analyze", {
-        skills: json(this.config.board.skills), context: json(context), contract: ANALYZE_CONTRACT,
+        context: json(context), contract: ANALYZE_CONTRACT,
       });
       this.snapshot("analyze", executionId, context, null, rendered);
       try {
         output = await withPhaseRetries("analyze", MAX_PHASE_ATTEMPTS, async () => {
-          const result = await this.workers.execute(worker, "plan", rendered.text, PHASE_TIMEOUT_MS.analyze, this.prepareWorkerTmp(), signal, undefined, this.workerOptions(executionId));
+          const result = await this.runWorker(projectId, "analyze", executionId, worker, "plan", rendered.text, PHASE_TIMEOUT_MS.analyze, signal, undefined, this.workerOptions());
           requireSuccess(result, "analyze");
           return phaseParse(() => parseAnalyze(result.text));
         }, signal, (attempt, attempts, message) => this.logEvent("phase_retry", { projectId, phase: "analyze", executionId, attempt, attempts, message }));
@@ -412,14 +493,15 @@ export class TaskExecutor {
     executeSnapshot: string,
     session: SessionRef,
     signal?: AbortSignal,
+    intentId?: string,
   ): Promise<ReturnType<typeof parseExecute>> {
     const boundExecution = { executionId, snapshotPath: executeSnapshot };
     const rendered = renderPrompt("execute-finalize", {
-      customProfile: json(selected), skills: json(this.config.board.skills), graph: json(graph),
+      customProfile: json(promptProfile(selected)), skills: json(selected?.skills ?? []), graph: json(graph),
       boundExecution: json(boundExecution), contract: EXECUTE_CONTRACT,
     });
     this.snapshot("finalize", executionId, graph, selected, rendered, executionId);
-    const result = await this.workers.execute(worker, "execute", rendered.text, PHASE_TIMEOUT_MS.finalize, this.prepareWorkerTmp(), signal, session, this.workerOptions(executionId));
+    const result = await this.runWorker(projectId, "finalize", executionId, worker, "execute", rendered.text, PHASE_TIMEOUT_MS.finalize, signal, session, this.workerOptions(), intentId);
     requireSuccess(result, `finalize ${projectId}`);
     return parseExecute(result.text);
   }
@@ -427,6 +509,12 @@ export class TaskExecutor {
   private executeProfile(description: string): ProfileValue {
     const definition = this.config.phase.execute.customProfile.find((profile) => profile.description === description);
     if (!definition) throw new Error(`unknown customProfile: ${description}`);
+    return profileValue(definition);
+  }
+
+  private executeProfileByDigest(digest: string): ProfileValue {
+    const definition = this.config.phase.execute.customProfile.find((profile) => customProfileDigest(profile) === digest);
+    if (!definition) throw new Error(`unknown customProfile digest: ${digest}`);
     return profileValue(definition);
   }
 
@@ -450,10 +538,71 @@ export class TaskExecutor {
   ): string {
     return writeGraphContext(this.projectDir, phase, executionId, {
       phase, templateVersion: rendered.templateDigest, context,
-      customProfile: profile ? { description: profile.description, digest: profile.digest } : null,
+      customProfile: profile ? { description: profile.description, skills: profile.skills, digest: profile.digest } : null,
       configDigest: sha256(json(this.config)), renderedPromptSha256: sha256(rendered.text),
       executionId, at: localTimestamp(), boundExecutionId,
     });
+  }
+
+  /**
+   * Materializes every source Artifact body into the execution substrate and
+   * rewrites `artifact.inputPath` to the worker-visible copy. Content is taken
+   * from the local Projects root when present (single-host deployments) and
+   * otherwise fetched from the Graph server over HTTP, so Serve and Dispatch
+   * may live on different hosts or use different Project roots. The returned
+   * map is empty when the workspace cannot place Artifacts (direct legacy
+   * execution): callers then verify the server-provided host paths as before.
+   */
+  private async materializeSources(sources: ResolvedFactSource[]): Promise<Map<string, PlacedSource>> {
+    const placed = new Map<string, PlacedSource>();
+    if (!this.workspace?.placeArtifact) return placed;
+    for (const source of sources) {
+      const artifact = source.fact.artifact;
+      if (!artifact) continue;
+      let content: Buffer;
+      try {
+        content = readFileSync(artifact.inputPath);
+      } catch {
+        // No local body: the Server owns the canonical bytes (remote dispatch
+        // or a different Projects root). Fetch them over the Graph API.
+        content = Buffer.from(await this.graph.artifactContent(source.ref.projectId, artifact.sha256), "utf8");
+      }
+      if (content.length !== artifact.sizeBytes) throw new Error(`Artifact size mismatch: ${artifact.sha256}`);
+      if (sha256Bytes(content) !== artifact.sha256) throw new Error(`Artifact hash mismatch: ${artifact.sha256}`);
+      const entry = await this.workspace.placeArtifact({ sha256: artifact.sha256, filename: artifact.filename }, content);
+      artifact.inputPath = entry.inputPath;
+      placed.set(artifact.sha256, entry);
+    }
+    return placed;
+  }
+
+  /**
+   * Verifies every source Artifact. Placed copies are hashed through the
+   * workspace's host-side read handle (so tampering inside a docker container
+   * is detected by pulling the file back out); without a placing workspace
+   * the server-provided host paths are lstat + stream-hashed as before.
+   */
+  private async verifySources(sources: ResolvedFactSource[], placed: Map<string, PlacedSource>): Promise<void> {
+    for (const source of sources) {
+      const artifact = source.fact.artifact;
+      if (artifact === null) continue;
+      if (artifact.readOnly !== true) throw new Error(`invalid Artifact input path: ${source.ref.id}`);
+      const entry = placed.get(artifact.sha256);
+      if (entry) {
+        const content = await entry.read();
+        if (content.length !== artifact.sizeBytes) throw new Error(`Artifact size or type mismatch: ${artifact.sha256}`);
+        if (sha256Bytes(content) !== artifact.sha256) throw new Error(`Artifact hash mismatch: ${artifact.sha256}`);
+        continue;
+      }
+      if (!isAbsolute(artifact.inputPath)) throw new Error(`invalid Artifact input path: ${source.ref.id}`);
+      const stat = lstatSync(artifact.inputPath);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== artifact.sizeBytes) {
+        throw new Error(`Artifact size or type mismatch: ${artifact.sha256}`);
+      }
+      const hash = createHash("sha256");
+      for await (const chunk of createReadStream(artifact.inputPath)) hash.update(chunk as Buffer);
+      if (hash.digest("hex") !== artifact.sha256) throw new Error(`Artifact hash mismatch: ${artifact.sha256}`);
+    }
   }
 
   private async uploadContent(projectId: string, filename: string | null, mediaType: string, content: string) {
@@ -499,19 +648,16 @@ export class TaskExecutor {
   }
 
   private runtimeTmpDir(): string {
-    return this.tmpDir ?? projectTmpDir(this.projectDir);
+    return this.workspace?.tmpDir ?? projectTmpDir(this.projectDir);
   }
 
   /**
    * Per-execute options shared by every phase dispatch: the Project-scoped
-   * runtime scratch directory (`.tmp`, also used as the subprocess cwd and by
-   * resumable CLI protocols for session caches) and a spawn callback that lets
-   * Runtime record the child PID. Finalize reuses the Execute execution id.
+   * runtime scratch directory (`.tmp`, also used as the SDK session cwd and
+   * for pi session files). Finalize reuses the Execute execution id.
    */
-  private workerOptions(executionId: string): { tmpDir: string; onSpawn?: (pid: number) => void } {
-    const options: { tmpDir: string; onSpawn?: (pid: number) => void } = { tmpDir: this.runtimeTmpDir() };
-    if (this.reportSpawn) options.onSpawn = (pid: number) => this.reportSpawn!(executionId, pid);
-    return options;
+  private workerOptions(): { tmpDir: string } {
+    return { tmpDir: this.runtimeTmpDir() };
   }
 
   /**
@@ -522,8 +668,10 @@ export class TaskExecutor {
    * active; idempotent and safe to retry every tick while it stays inactive.
    */
   cleanupRuntimeTmp(): void {
+    const dir = this.runtimeTmpDir();
+    if (this.workspace?.cleanup) { this.workspace.cleanup(dir); return; }
     try {
-      rmSync(this.runtimeTmpDir(), { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
     } catch (error) {
       process.stderr.write(`[peak] failed to clean up runtime tmp: ${(error as Error).message}\n`);
     }
@@ -556,27 +704,17 @@ function validatePromptTemplates(): void {
     customProfile: "null", skills: "[]", graph: "{}",
     executeCustomProfiles: "[]", maxIntents: "3", contract: "contract",
   });
-  renderPrompt("supervise", { customProfile: "null", graph: "{}", contract: "contract" });
+  renderPrompt("supervise", { customProfile: "null", skills: "[]", graph: "{}", contract: "contract" });
   renderPrompt("execute", { customProfile: "null", skills: "[]", graph: "{}", contract: "contract" });
   renderPrompt("execute-finalize", {
     customProfile: "null", skills: "[]", graph: "{}", boundExecution: "{}", contract: "contract",
   });
-  renderPrompt("analyze", { skills: "[]", context: "{}", contract: "contract" });
+  renderPrompt("analyze", { context: "{}", contract: "contract" });
 }
 
-async function verifySources(sources: ResolvedFactSource[]): Promise<void> {
-  for (const source of sources) {
-    const artifact = source.fact.artifact;
-    if (artifact === null) continue;
-    if (artifact.readOnly !== true || !isAbsolute(artifact.inputPath)) throw new Error(`invalid Artifact input path: ${source.ref.id}`);
-    const stat = lstatSync(artifact.inputPath);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== artifact.sizeBytes) {
-      throw new Error(`Artifact size or type mismatch: ${artifact.sha256}`);
-    }
-    const hash = createHash("sha256");
-    for await (const chunk of createReadStream(artifact.inputPath)) hash.update(chunk as Buffer);
-    if (hash.digest("hex") !== artifact.sha256) throw new Error(`Artifact hash mismatch: ${artifact.sha256}`);
-  }
+/** Sha256 hex of raw bytes (Artifact bodies may be binary). */
+function sha256Bytes(content: Buffer): string {
+  return createHash("sha256").update(content).digest("hex");
 }
 
 function profileValue(profile: CustomProfileDefinition): ProfileValue;
@@ -584,12 +722,16 @@ function profileValue(profile: CustomProfileDefinition | undefined): ProfileValu
 function profileValue(profile: CustomProfileDefinition | undefined): ProfileValue | null {
   return profile ? { ...profile, digest: customProfileDigest(profile) } : null;
 }
+/** Keeps profile routing metadata out of the Worker instruction block. */
+function promptProfile(profile: ProfileValue | null): Pick<ProfileValue, "description" | "prompt"> | null {
+  return profile ? { description: profile.description, prompt: profile.prompt } : null;
+}
 
 /** Applies the shared byte budget without flattening the public Plan shape. */
 function budgetPlanGraphView(
   projectId: string,
   current: PlanProjectView,
-  external: ResolvedPathAbstract[],
+  external: PathAbstract[],
 ): PlanGraphView {
   const project = {
     ...current,
@@ -597,23 +739,41 @@ function budgetPlanGraphView(
     openIntents: [...current.openIntents],
     unconsumedHints: [...current.unconsumedHints],
   };
-  const output: PlanGraphView = {
-    projects: { [projectId]: project }, external: [...external], truncated: false,
-    omitted: { leafFacts: 0, openIntents: 0, unconsumedHints: 0, external: 0 },
-  };
-  if (Buffer.byteLength(json(output), "utf8") <= GRAPH_VIEW_MAX_BYTES) return output;
+  const view = { projects: { [projectId]: project }, external: [...external] };
+  // Removal priority: peer PathAbstracts are drained first, then Hints, open
+  // Intents, and the local leaf frontier last.
+  return applyBudget(view, [
+    { key: "external", values: view.external },
+    { key: "unconsumedHints", values: project.unconsumedHints },
+    { key: "openIntents", values: project.openIntents },
+    { key: "leafFacts", values: project.leafFacts },
+  ]);
+}
+
+interface BudgetList { key: string; values: unknown[] }
+
+/**
+ * Shared Graph view byte budget: pops one entry at a time from the first
+ * non-empty list until the serialized view fits GRAPH_VIEW_MAX_BYTES. The
+ * list order is the removal priority (the first list is drained first). The
+ * input is never mutated; list arrays are supplied by the caller (cloned
+ * where needed) and belong to the returned view.
+ */
+function applyBudget<T extends Record<string, unknown>>(view: T, lists: BudgetList[]): T & GraphViewBudget {
+  const output = { ...view } as T & GraphViewBudget;
+  const omitted: Record<string, number> = {};
+  for (const { key } of lists) omitted[key] = 0;
+  output.omitted = omitted;
+  output.truncated = false;
+  let size = Buffer.byteLength(json(output), "utf8");
+  if (size <= GRAPH_VIEW_MAX_BYTES) return output;
   output.truncated = true;
-  const lists: Array<[keyof PlanGraphView["omitted"], unknown[]]> = [
-    ["external", output.external],
-    ["unconsumedHints", project.unconsumedHints],
-    ["openIntents", project.openIntents],
-    ["leafFacts", project.leafFacts],
-  ];
-  while (Buffer.byteLength(json(output), "utf8") > GRAPH_VIEW_MAX_BYTES) {
-    const entry = lists.find(([, values]) => values.length > 0);
+  while (size > GRAPH_VIEW_MAX_BYTES) {
+    const entry = lists.find(({ values }) => values.length > 0);
     if (!entry) throw new Error(`Graph view exceeds ${GRAPH_VIEW_MAX_BYTES} byte budget`);
-    entry[1].pop();
-    output.omitted[entry[0]] += 1;
+    entry.values.pop();
+    omitted[entry.key]! += 1;
+    size = Buffer.byteLength(json(output), "utf8");
   }
   return output;
 }
@@ -622,33 +782,17 @@ export function budgetGraphView<T extends Record<string, unknown>>(
   view: T,
   listKeys: Array<keyof T>,
 ): T & GraphViewBudget {
-  const output = { ...view } as T & GraphViewBudget;
-  const mutable = output as Record<string, unknown>;
-  const omitted: Record<string, number> = {};
+  const output = { ...view } as Record<string, unknown>;
+  const lists: BudgetList[] = [];
   for (const key of listKeys) {
     const value = view[key];
     if (!Array.isArray(value)) throw new Error(`Graph view budget field is not an array: ${String(key)}`);
-    mutable[String(key)] = [...value];
-    omitted[String(key)] = 0;
+    const values = [...value];
+    output[String(key)] = values;
+    lists.push({ key: String(key), values });
   }
-  output.truncated = false;
-  output.omitted = omitted;
-  if (Buffer.byteLength(json(output), "utf8") <= GRAPH_VIEW_MAX_BYTES) return output;
-  output.truncated = true;
-  const removalOrder = [...listKeys].reverse();
-  while (Buffer.byteLength(json(output), "utf8") > GRAPH_VIEW_MAX_BYTES) {
-    let removed = false;
-    for (const key of removalOrder) {
-      const values = mutable[String(key)] as unknown[];
-      if (!values.length) continue;
-      values.pop();
-      omitted[String(key)]! += 1;
-      removed = true;
-      if (Buffer.byteLength(json(output), "utf8") <= GRAPH_VIEW_MAX_BYTES) break;
-    }
-    if (!removed) throw new Error(`Graph view exceeds ${GRAPH_VIEW_MAX_BYTES} byte budget`);
-  }
-  return output;
+  // Removal priority: the last declared list is drained first.
+  return applyBudget(output as T, lists.reverse()) as T & GraphViewBudget;
 }
 function completeGraphView<T extends Record<string, unknown>>(
   view: T,
@@ -732,12 +876,24 @@ function factRef(projectId: string, fact: { id: string; description: string }): 
 function visibleRefs(projectId: string, facts: Array<{ id: string; description: string }>): Map<string, string> {
   return new Map(facts.map((fact): [string, string] => [`${projectId}/${fact.id}`, fact.description]));
 }
-function validateVisible(refs: FactRef[], visible: Map<string, string>): void {
+/**
+ * Validates that every ref points at a currently visible leaf Fact. Facts are
+ * immutable, so a mismatched description is never a data race — it is the
+ * Plan AI paraphrasing the text it was shown. The id is the identity: rewrite
+ * such descriptions to the authoritative values instead of failing the round
+ * (an inexact copy must not deadlock the Project), and report how many refs
+ * were normalized so the caller can surface it. Missing keys are genuine
+ * stale-leaf conflicts and keep throwing.
+ */
+function validateVisible(refs: FactRef[], visible: Map<string, string>): number {
+  let normalized = 0;
   for (const ref of refs) {
     const key = `${ref.projectId}/${ref.id}`;
-    if (!visible.has(key)) throw new Error(`FactRef is not visible: ${key}`);
-    if (visible.get(key) !== ref.description) throw new Error(`FactRef description mismatch: ${key}`);
+    const authoritative = visible.get(key);
+    if (authoritative === undefined) throw new Error(`FactRef is not visible: ${key}`);
+    if (ref.description !== authoritative) { ref.description = authoritative; normalized += 1; }
   }
+  return normalized;
 }
 
 /**
@@ -760,12 +916,12 @@ function validateHints(ids: string[], hints: Array<{ id: string }>): void {
 }
 
 const planContract = (maxIntents: number, hasProfiles: boolean): string => [
-  `intents: {"kind":"intents","intents":[{"from":[{"projectId":"...","id":"...","description":"..."}],"hintIds":[]${hasProfiles ? ',"customProfile":null' : ""},"description":"..."}]} (1-${maxIntents})`,
+  `intents: {"kind":"intents","intents":[{"from":[{"projectId":"...","id":"...","description":"..."}],"hintIds":[]${hasProfiles ? ',"customProfileDigest":"<digest>"|null' : ""},"description":"..."}]} (1-${maxIntents})`,
   'complete: {"kind":"complete","from":[{"projectId":"...","id":"...","description":"..."}],"hintIds":[],"description":"..."}',
   'noop: {"kind":"noop"}',
-  'Copy FactRefs exactly. Use no undeclared fields. Each Intent is one atomic transition to one Fact.',
+  `Copy FactRefs exactly and select customProfileDigest by copying the exact 16-character digest listed in the Execute profiles${hasProfiles ? "" : " (no Execute profiles are configured; omit customProfileDigest)"}. Use no undeclared fields. Each Intent is one atomic transition to one Fact.`,
 ].join("\n");
-const SUPERVISE_CONTRACT = '{"kind":"hint","content":"..."} or {"kind":"noop"}; no undeclared fields.';
+const SUPERVISE_CONTRACT = '{"kind":"hint","content":"..."} or {"kind":"noop"}; content is at most 1 KiB UTF-8; no undeclared fields.';
 const ANALYZE_CONTRACT = '{"pathOverview":"...","verifiedCore":["..."]}; 1-16 verifiedCore items; no undeclared fields.';
 
 function fallbackAbstract(

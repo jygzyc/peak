@@ -5,7 +5,7 @@ import type { FactRef } from "../graph/types.js";
 
 type PlanOutput =
   | { kind: "complete"; from: FactRef[]; hintIds: string[]; description: string }
-  | { kind: "intents"; intents: Array<{ from: FactRef[]; customProfile: string | null; hintIds: string[]; description: string }> }
+  | { kind: "intents"; intents: Array<{ from: FactRef[]; customProfile: string | null; customProfileDigest: string | null; hintIds: string[]; description: string }> }
   | { kind: "noop" };
 type SuperviseOutput = { kind: "hint"; content: string } | { kind: "noop" };
 type AnalyzeOutput = { pathOverview: string; verifiedCore: string[] };
@@ -15,12 +15,12 @@ type ExecuteOutput = {
   artifact: { filename: string | null; mediaType: string; content: string } | null;
 };
 
-export function parsePlan(text: string, maxIntents: number, availableCustomProfiles: string[] = []): PlanOutput {
+export function parsePlan(text: string, maxIntents: number, availableCustomProfiles: Array<{ description: string; digest: string }> = []): PlanOutput {
   const value = record(text);
   if (value.kind === "noop") { exact(value, ["kind"]); return { kind: "noop" }; }
   if (value.kind === "complete") {
-    exactOptional(value, ["kind", "from", "hintIds", "description"], ["hintIds"]);
-    return { kind: "complete", from: refs(value.from), hintIds: ids(value.hintIds), description: intentDescription(value.description) };
+    exact(value, ["kind", "from", "hintIds", "description"], ["hintIds"]);
+    return { kind: "complete", from: refs(value.from), hintIds: ids(value.hintIds), description: requireIntentDescription(value.description) };
   }
   if (value.kind === "intents") {
     exact(value, ["kind", "intents"]);
@@ -29,11 +29,27 @@ export function parsePlan(text: string, maxIntents: number, availableCustomProfi
     }
     return { kind: "intents", intents: value.intents.map((item) => {
       const intent = asRecord(item, "intent");
-      exactOptional(intent, ["from", "customProfile", "hintIds", "description"], ["customProfile", "hintIds"]);
-      const customProfile = intent.customProfile === undefined || intent.customProfile === null
-        ? null : description(intent.customProfile, "customProfile");
-      if (customProfile && !availableCustomProfiles.includes(customProfile)) throw new Error(`unknown customProfile: ${customProfile}`);
-      return { from: refs(intent.from), customProfile, hintIds: ids(intent.hintIds), description: intentDescription(intent.description) };
+      exact(intent, ["from", "customProfile", "customProfileDigest", "hintIds", "description"], ["customProfile", "customProfileDigest", "hintIds"]);
+      // Profiles are selected by their short digest token (a 16-hex-char string
+      // the Plan AI can copy reliably); the full description is also accepted
+      // for compatibility with older Plan workers. When both are present the
+      // digest wins.
+      const digest = nullableDescription(intent.customProfileDigest, "customProfileDigest");
+      const legacy = nullableDescription(intent.customProfile, "customProfile");
+      const resolved = digest !== null
+        ? availableCustomProfiles.find((profile) => profile.digest === digest)
+        : legacy !== null
+          ? availableCustomProfiles.find((profile) => profile.description === legacy)
+          : null;
+      if (digest !== null && !resolved) throw new Error(`unknown customProfileDigest: ${digest}`);
+      if (digest === null && legacy !== null && !resolved) throw new Error(`unknown customProfile: ${legacy}`);
+      return {
+        from: refs(intent.from),
+        customProfile: resolved?.description ?? null,
+        customProfileDigest: resolved?.digest ?? null,
+        hintIds: ids(intent.hintIds),
+        description: requireIntentDescription(intent.description),
+      };
     }) };
   }
   throw new Error("invalid plan kind");
@@ -46,8 +62,8 @@ export function parseAnalyze(text: string): AnalyzeOutput {
     throw new Error("verifiedCore must contain 1-16 items");
   }
   return {
-    pathOverview: description(value.pathOverview, "pathOverview"),
-    verifiedCore: value.verifiedCore.map((item) => shortDescription(item, "verifiedCore")),
+    pathOverview: requireDescription(value.pathOverview, "pathOverview"),
+    verifiedCore: value.verifiedCore.map((item) => requireShortDescription(item, "verifiedCore")),
   };
 }
 
@@ -56,23 +72,27 @@ export function parseSupervise(text: string): SuperviseOutput {
   if (value.kind === "noop") { exact(value, ["kind"]); return { kind: "noop" }; }
   if (value.kind === "hint") {
     exact(value, ["kind", "content"]);
-    return { kind: "hint", content: shortDescription(value.content, "content") };
+    return { kind: "hint", content: requireShortDescription(value.content, "content") };
   }
   throw new Error("invalid supervise kind");
 }
 
 export function parseExecute(text: string): ExecuteOutput {
   const value = record(text);
-  exact(value, ["kind", "description", "artifact"]);
+  // `artifact` defaults to null when the model omits it: weaker models
+  // routinely drop optional-looking fields, and a Fact without an Artifact
+  // is always valid — nothing else in the contract is relaxed.
+  exact(value, ["kind", "description", "artifact"], ["artifact"]);
   if (value.kind !== "fact") throw new Error("invalid execute kind");
-  const artifact = value.artifact === null ? null : asRecord(value.artifact, "artifact");
-  if (artifact) exactOptional(artifact, ["filename", "mediaType", "content"], ["filename"]);
+  const artifact = (value.artifact === undefined || value.artifact === null) ? null : asRecord(value.artifact, "artifact");
+  if (artifact) exact(artifact, ["filename", "mediaType", "content"], ["filename"]);
   return {
     kind: "fact",
-    description: factDescription(value.description),
+    description: requireFactDescription(value.description),
     artifact: artifact && {
-      filename: artifact.filename === undefined || artifact.filename === null ? null : shortDescription(artifact.filename, "artifact.filename"),
-      mediaType: description(artifact.mediaType, "artifact.mediaType"),
+      filename: artifact.filename === undefined || artifact.filename === null
+        ? null : requireShortDescription(artifact.filename, "artifact.filename"),
+      mediaType: requireDescription(artifact.mediaType, "artifact.mediaType"),
       content: content(artifact.content),
     },
   };
@@ -139,13 +159,7 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
   return value as Record<string, unknown>;
 }
-function exact(value: Record<string, unknown>, allowed: string[]): void {
-  const keys = Object.keys(value);
-  const invalid = keys.find((key) => !allowed.includes(key));
-  const missing = allowed.find((key) => !(key in value));
-  if (invalid || missing) throw new Error(invalid ? `unknown field: ${invalid}` : `missing field: ${missing}`);
-}
-function exactOptional(value: Record<string, unknown>, allowed: string[], optional: string[]): void {
+function exact(value: Record<string, unknown>, allowed: string[], optional: string[] = []): void {
   const keys = Object.keys(value);
   const invalid = keys.find((key) => !allowed.includes(key));
   const missing = allowed.find((key) => !optional.includes(key) && !(key in value));
@@ -154,7 +168,7 @@ function exactOptional(value: Record<string, unknown>, allowed: string[], option
 function ids(value: unknown): string[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw new Error("hintIds must be an array");
-  const result = value.map((item) => description(item, "hintId"));
+  const result = value.map((item) => requireDescription(item, "hintId"));
   if (new Set(result).size !== result.length) throw new Error("hintIds contains duplicates");
   return result;
 }
@@ -164,25 +178,12 @@ function refs(value: unknown): FactRef[] {
     const ref = asRecord(item, "FactRef");
     exact(ref, ["projectId", "id", "description"]);
     return {
-      projectId: description(ref.projectId, "projectId"),
-      id: description(ref.id, "id"),
-      description: description(ref.description),
+      projectId: requireDescription(ref.projectId, "projectId"),
+      id: requireDescription(ref.id, "id"),
+      description: requireDescription(ref.description),
     };
   });
 }
-function description(value: unknown, label = "description"): string {
-  try { return requireDescription(value, label); }
-  catch (error) { throw new Error((error as Error).message); }
-}
-function shortDescription(value: unknown, label = "description"): string {
-  try { return requireShortDescription(value, label); }
-  catch (error) { throw new Error((error as Error).message); }
-}
-function factDescription(value: unknown): string {
-  try { return requireFactDescription(value); }
-  catch (error) { throw new Error((error as Error).message); }
-}
-function intentDescription(value: unknown): string {
-  try { return requireIntentDescription(value); }
-  catch (error) { throw new Error((error as Error).message); }
+function nullableDescription(value: unknown, label: string): string | null {
+  return value === undefined || value === null ? null : requireDescription(value, label);
 }

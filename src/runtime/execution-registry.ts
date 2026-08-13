@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { TaskType } from "../utils/types.js";
-import { localTimestamp } from "../graph/api.js";
+import { localTimestamp } from "../utils/helpers.js";
 
 export interface ActiveExecution {
   executionId: string;
@@ -8,7 +8,6 @@ export interface ActiveExecution {
   kind: TaskType;
   intentId?: string;
   workerName?: string;
-  processId?: number;
   startedAt: number;
   deadlineAt?: number;
   controller: AbortController;
@@ -17,7 +16,7 @@ export interface ActiveExecution {
 /**
  * Immutable public DTO for an in-flight execution. Excludes the AbortController
  * and every internal handle so the Registry never leaks cancellation, prompts,
- * outputs, argv, env, or Worker objects to API consumers.
+ * outputs, or Worker objects to API consumers.
  */
 export interface ExecutionSnapshot {
   executionId: string;
@@ -25,7 +24,6 @@ export interface ExecutionSnapshot {
   kind: TaskType;
   intentId: string | null;
   workerName: string | null;
-  processId: number | null;
   startedAt: string;
   deadlineAt: string | null;
 }
@@ -39,11 +37,6 @@ export class ExecutionRegistry {
     do executionId = randomBytes(4).toString("hex");
     while (this.values.has(executionId));
     return executionId;
-  }
-  /** Backfills the child PID once the CLI subprocess has spawned. */
-  setProcessId(executionId: string, pid: number): void {
-    const execution = this.values.get(executionId);
-    if (execution) execution.processId = pid;
   }
   count(projectId?: string, kind?: TaskType): number {
     return [...this.values.values()].filter((item) => (!projectId || item.projectId === projectId)
@@ -62,7 +55,6 @@ export class ExecutionRegistry {
         kind: item.kind,
         intentId: item.intentId ?? null,
         workerName: item.workerName ?? null,
-        processId: item.processId ?? null,
         startedAt: localTimestamp(new Date(item.startedAt)),
         deadlineAt: item.deadlineAt !== undefined ? localTimestamp(new Date(item.deadlineAt)) : null,
       }));
@@ -71,7 +63,7 @@ export class ExecutionRegistry {
     for (const execution of this.values.values()) if (execution.projectId === projectId) execution.controller.abort();
   }
   cancelAll(): void { for (const execution of this.values.values()) execution.controller.abort(); }
-  /** Waits for cancelled dispatch promises to finish their ProcessRunner cleanup. */
+  /** Waits for cancelled dispatch promises to finish their cleanup. */
   async waitForEmpty(timeoutMs = 10_000): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     while (this.values.size > 0) {

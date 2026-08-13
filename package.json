@@ -21,8 +21,16 @@
   "scripts": {
     "clean": "node scripts/build.mjs clean",
     "build": "node scripts/build.mjs",
+    "build:ui": "node scripts/build.mjs build-ui",
+    "build:all": "node scripts/build.mjs build-all",
+    "bundle-ui": "node scripts/bundle-ui.mjs",
     "copy-assets": "node scripts/build.mjs copy-assets",
-    "typecheck": "tsc --noEmit",
+    "copy-ui": "node scripts/build.mjs copy-ui",
+    "typecheck": "node scripts/embed-assets.mjs && tsc --noEmit",
+    "typecheck:ui": "tsc -p src/ui/app",
+    "typecheck:all": "npm run typecheck && npm run typecheck:ui",
+    "preview:ui": "npm run build:ui && node scripts/mock-server.mjs",
+    "preview:ui:serve": "node scripts/mock-server.mjs",
     "test": "npm run build && node --test \"tests/**/*.test.ts\"",
     "test:example": "npm run build && node --test \"examples/**/*.test.ts\"",
     "smoke": "node tests/smoke.mjs",
@@ -31,12 +39,14 @@
     "pack:binary": "node scripts/pack.mjs binary"
   },
   "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.1",
     "commander": "^15.0.0",
     "tar": "^7.5.22"
   },
   "devDependencies": {
     "@types/node": "^26.0.0",
     "esbuild": "^0.28.1",
+    "lit": "^3.3.3",
     "typescript": "^7.0.2"
   },
   "engines": {

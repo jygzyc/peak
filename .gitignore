@@ -36,6 +36,51 @@ examples/*.apk
 .zcode
 .agents/
 
+# Debug & logs
+*.log
+*.tmp
+*.temp
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Core dumps & crash dumps
+core
+core.*
+*.dmp
+*.dump
+
+# Profiling & tracing artifacts (Node/V8)
+*.cpuprofile
+*.heapsnapshot
+*.profile
+*.trace
+*.tsbuildinfo
+.vscode-test/
+
+# Windows debug symbols
+*.pdb
+*.exp
+*.lib
+*.ilk
+
+# Editor debug state
+*.swp
+*.swo
+*~
+
+# Test reports & coverage
+coverage/
+.nyc_output/
+playwright-report/
+test-results/
+reports/
+
 # Test root created by scripts/run-example.mjs
 .peak_test/
 examples/app_security/base.apk
+
+# Personal-image build seeds (keys, decx jar, APK targets)
+container/seed/

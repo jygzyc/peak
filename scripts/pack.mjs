@@ -86,7 +86,9 @@ try {
   });
 
   if (doPrepare) await step("typecheck", () => {
-    const npm = npmInvocation(["run", "typecheck"]);
+    // Core first (regenerates embedded assets on a fresh checkout), then the
+    // UI app under its own tsconfig: releases must validate both.
+    const npm = npmInvocation(["run", "typecheck:all"]);
     const result = spawnSync(npm.command, npm.args, {
       cwd: root,
       stdio: "inherit",

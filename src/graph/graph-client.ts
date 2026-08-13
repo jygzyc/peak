@@ -6,6 +6,7 @@ import type {
   AddHintInput, ArtifactRef, CompleteInput, ConcludeInput, CreateIntentInput, CreateProjectInput,
   Fact, FactRef, Hint, Intent, PathAbstract, ProjectGraph, ProjectMeta, ProjectStatus, ReopenInput, ResolvedFactSource,
 } from "./types.js";
+import type { JointPlanPath, TaskFederationContext } from "./joint-plan.js";
 
 export interface GraphClientOptions {
   /**
@@ -19,6 +20,7 @@ export interface GraphClientOptions {
 /** Registration payload accepted by the Server's Project ownership registry. */
 export interface ProjectRegistrationInput {
   taskName: string;
+  projectIds: string[];
   boardDir: string;
   mode: "start" | "resume";
   runtimeId: string;
@@ -26,6 +28,13 @@ export interface ProjectRegistrationInput {
   container?: string | null;
   graphUrl?: string | null;
   webUrl?: string | null;
+}
+
+export interface ProjectLease {
+  projectId: string;
+  runtimeId: string;
+  heartbeatAt: string;
+  expiresAt: string;
 }
 
 export class GraphClient {
@@ -65,9 +74,18 @@ export class GraphClient {
   complete(id: string, input: CompleteInput): Promise<Intent> { return this.request("POST", `/api/projects/${id}/complete`, input); }
   reopen(id: string, input: ReopenInput): Promise<ProjectGraph> { return this.request("POST", `/api/projects/${id}/reopen`, input); }
 
+  /** Discovers the current peer Project Paths for a Task-scoped Joint Plan. */
+  jointPlanPaths(context: TaskFederationContext, targetProjectId: string): Promise<JointPlanPath[]> {
+    return this.request("POST", "/api/federation/joint-plan", { ...context, targetProjectId });
+  }
+
   /** Server-authoritative Project ownership registration (409 on conflict); used by external/container task launchers. */
-  async registerProject(id: string, input: ProjectRegistrationInput): Promise<void> {
-    await this.request("POST", `/api/projects/${id}/registration`, input);
+  registerProject(id: string, input: ProjectRegistrationInput): Promise<ProjectLease> {
+    return this.request("POST", `/api/projects/${id}/registration`, input);
+  }
+
+  heartbeatProject(id: string, runtimeId: string): Promise<ProjectLease> {
+    return this.request("PUT", `/api/projects/${id}/registration`, { runtimeId });
   }
 
   /** Best-effort deregistration; a missing record is not an error. */

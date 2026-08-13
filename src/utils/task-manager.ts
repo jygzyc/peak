@@ -2,14 +2,16 @@ import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, 
 import { spawn } from "node:child_process";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
-import { ApiError } from "../graph/api.js";
+import { ApiError } from "./helpers.js";
 import type { ApiExtension } from "../graph/http-server.js";
 import type { ProjectStoreRegistry } from "../graph/project-store-registry.js";
-import { DockerImageUnavailableError, dockerContainerState, dockerStop, launchDockerTask } from "./docker.js";
+import { GraphClient } from "../graph/graph-client.js";
+import { dockerContainerState, dockerStop } from "./docker.js";
 import { bodyObject, exact, json } from "./helpers.js";
-import { deregisterRuntime, listProjectRegistrations } from "./project-registry.js";
+import { deregisterRuntime, listProjectRegistrations, removeTaskFederation } from "./project-registry.js";
 import { isProcessAlive, terminateProcess } from "./server-process.js";
 import { loadTaskConfig } from "./task-config.js";
+import { prepareTaskProjects } from "./task-preparer.js";
 
 export interface TaskRuntimeInfo {
   mode: string;
@@ -34,7 +36,6 @@ export interface TaskManagerContext {
   cliEntry: string;
   /** Loopback URL of this serve process, handed to spawned task Runtimes. */
   serveUrl: string;
-  version: string;
 }
 
 export class TaskManagerError extends Error {
@@ -72,14 +73,13 @@ export function listTasks(context: Pick<TaskManagerContext, "peakHome" | "regist
   for (const entry of registrations) names.add(entry.taskName);
   return [...names].sort().map((name) => {
     const entries = registrations.filter((entry) => entry.taskName === name);
-    const running = entries.filter((entry) => (entry.pid !== null && isProcessAlive(entry.pid)) || entry.container !== null);
-    const first = running[0] ?? entries[0];
-    const projectIds = taskProjectIds(context.peakHome, name);
-    for (const entry of entries) if (!projectIds.includes(entry.projectId)) projectIds.push(entry.projectId);
+    const running = entries.find((entry) => (entry.pid !== null && isProcessAlive(entry.pid)) || entry.container !== null);
+    const first = running ?? entries[0];
+    const projectIds = [...new Set([...taskProjectIds(context.peakHome, name), ...entries.map((entry) => entry.projectId)])];
     return {
       name,
       boardDir: first?.boardDir ?? join(root, name),
-      status: running.length > 0 ? "running" : "stopped",
+      status: running ? "running" : "stopped",
       runtime: first
         ? { mode: first.mode, pid: first.pid, container: first.container, startedAt: first.startedAt }
         : null,
@@ -97,6 +97,7 @@ export interface CreateTaskInput {
   projects: Array<{ source: string; goal: string }>;
   workers: Array<Record<string, unknown>>;
   skills?: string[];
+  execution?: { mode: "local" | "docker"; networkMode?: string };
 }
 
 /**
@@ -118,6 +119,7 @@ export function createTask(peakHome: string, input: CreateTaskInput): TaskSummar
         ...(input.skills && input.skills.length > 0 ? { skills: input.skills } : {}),
         projects: input.projects.map((project) => ({ id: "", source: project.source, goal: project.goal })),
       },
+      execution: input.execution ?? { mode: "local" },
       workers: input.workers,
     }, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
     loadTaskConfig(dir); // strict schema validation; throws on any violation
@@ -130,37 +132,22 @@ export function createTask(peakHome: string, input: CreateTaskInput): TaskSummar
 }
 
 /**
- * Starts a managed task. `local` spawns `peak start --foreground --graph-url`
- * attached to this serve; `docker` reuses the `peak start --docker` two-phase
- * launch. An already running task is a 409 (registry conflict semantic).
+ * Starts a managed task by spawning the independent `peak dispatch --graph-url`
+ * attached to this serve. The execution backend is read exclusively from the
+ * managed task.json. An already running task is a 409.
  */
-export async function startTask(context: TaskManagerContext, name: string, mode: "local" | "docker"): Promise<void> {
+export async function startTask(context: TaskManagerContext, name: string): Promise<void> {
   requireTaskName(name);
   const dir = join(tasksDir(context.peakHome), name);
   if (!existsSync(join(dir, "task.json"))) throw new TaskManagerError(404, `task not found: ${name}`);
   const running = listProjectRegistrations(context.peakHome)
-    .filter((entry) => entry.taskName === name)
-    .filter((entry) => (entry.pid !== null && isProcessAlive(entry.pid)) || (entry.container !== null && dockerContainerState(entry.container) === "running"));
-  if (running.length > 0) throw new TaskManagerError(409, `task is already running: ${name}`);
-  if (mode === "docker") {
-    try {
-      await launchDockerTask(dir, {
-        peakHome: context.peakHome,
-        graphUrl: context.serveUrl,
-        version: context.version,
-      });
-    } catch (error) {
-      // The API caller explicitly chose docker; an unavailable image is a
-      // readable 409-style conflict, not a silent local fallback.
-      if (error instanceof DockerImageUnavailableError) throw new TaskManagerError(400, error.message);
-      throw error;
-    }
-    return;
-  }
+    .some((entry) => entry.taskName === name && entry.pid !== null && isProcessAlive(entry.pid));
+  if (running) throw new TaskManagerError(409, `task is already running: ${name}`);
+  await prepareTaskProjects(loadTaskConfig(dir), new GraphClient(context.serveUrl));
   const logPath = join(dir, "task.log");
   const log = openSync(logPath, "a");
   const args = [
-    context.cliEntry, "start", dir, "--foreground",
+    context.cliEntry, "dispatch", dir,
     "--graph-url", context.serveUrl,
     "--projects-root", context.projectsDir,
     "--peak-home", context.peakHome,
@@ -219,6 +206,7 @@ export async function deleteTask(context: TaskManagerContext, name: string, purg
       }
     }
   }
+  removeTaskFederation(context.peakHome, name);
   rmSync(dir, { recursive: true, force: true });
 }
 
@@ -240,7 +228,7 @@ function taskProjectIds(peakHome: string, name: string): string[] {
  * Routes:
  *   GET    /api/tasks                 list tasks (definitions + runtime state)
  *   POST   /api/tasks                 scaffold + strictly validate a new Board
- *   POST   /api/tasks/{name}/start    body {runtime: "local"|"docker"}; 409 when running
+ *   POST   /api/tasks/{name}/start    body {}; execution comes from task.json; 409 when running
  *   POST   /api/tasks/{name}/stop     stop processes/containers and deregister
  *   DELETE /api/tasks/{name}          stop + delete Board dir; ?purge=true also removes Project shards
  */
@@ -262,12 +250,13 @@ export function taskManagerExtension(context: TaskManagerContext): ApiExtension 
         }
         if (parts.length === 2 && request.method === "POST") {
           const body = await bodyObject(request);
-          exact(body, ["name", "projects", "workers", "skills"], ["skills"]);
+          exact(body, ["name", "projects", "workers", "skills", "execution"], ["skills", "execution"]);
           const input: CreateTaskInput = {
             name: body.name as string,
             projects: projects(body.projects),
             workers: workers(body.workers),
             skills: optionalStrings(body.skills),
+            execution: optionalExecution(body.execution),
           };
           json(response, createTask(context.peakHome, input), 201);
           return true;
@@ -275,10 +264,10 @@ export function taskManagerExtension(context: TaskManagerContext): ApiExtension 
         const name = parts[2]!;
         if (parts.length === 4 && parts[3] === "start") {
           const body = await bodyObject(request);
-          exact(body, ["runtime"]);
-          if (body.runtime !== "local" && body.runtime !== "docker") throw new ApiError(400, "runtime must be local or docker");
-          await startTask(context, name, body.runtime);
-          json(response, { name, status: "running", runtime: body.runtime });
+          exact(body, []);
+          const execution = loadTaskConfig(join(tasksDir(context.peakHome), name)).execution.mode;
+          await startTask(context, name);
+          json(response, { name, status: "running", execution });
           return true;
         }
         if (parts.length === 4 && parts[3] === "stop") {
@@ -322,6 +311,21 @@ function optionalStrings(value: unknown): string[] | undefined {
   if (value === undefined) return undefined;
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) throw new ApiError(400, "skills must be a string array");
   return value as string[];
+}
+
+function optionalExecution(value: unknown): CreateTaskInput["execution"] {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new ApiError(400, "execution must be an object");
+  const execution = value as Record<string, unknown>;
+  exact(execution, ["mode", "networkMode"], ["networkMode"]);
+  if (execution.mode !== "local" && execution.mode !== "docker") throw new ApiError(400, "execution.mode must be local or docker");
+  if (execution.networkMode !== undefined && (typeof execution.networkMode !== "string" || execution.networkMode.trim().length === 0)) {
+    throw new ApiError(400, "execution.networkMode must be a non-empty string");
+  }
+  return {
+    mode: execution.mode,
+    ...(execution.networkMode === undefined ? {} : { networkMode: execution.networkMode as string }),
+  };
 }
 
 function requireString(value: unknown, label: string): string {

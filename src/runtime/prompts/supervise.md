@@ -7,6 +7,9 @@ A Hint is a specific discrepancy, gap, or misdirection in the current proof that
 Optional profile:
 {customProfile}
 
+Available Skills:
+{skills}
+
 Current Graph view:
 {graph}
 

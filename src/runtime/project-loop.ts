@@ -5,7 +5,22 @@ import type { ProjectGraph } from "../graph/types.js";
 import { ExecutionRegistry } from "./execution-registry.js";
 import { PHASE_TIMEOUT_MS, TaskExecutor } from "./task-executor.js";
 
-interface Checkpoint { facts: number; hints: number; open: number; federation: number }
+interface Checkpoint { facts: number; hints: number; open: number; jointPlan: string }
+
+/**
+ * Lifecycle hooks the Runtime wires to the execution backend. `onInactive`
+ * releases the per-Project execution target (the Docker container) the moment
+ * the Project leaves active state — completed and stopped Projects must not
+ * keep long-lived containers around while the Task keeps running. `onActivated`
+ * re-establishes the target (idempotent `ensureWorkspace`) when a Project
+ * re-enters active state inside the same Runtime, e.g. a dashboard
+ * stop/resume round-trip, so the executor never runs against a removed
+ * container.
+ */
+export interface ProjectLoopHooks {
+  onInactive?: (status: "completed" | "stopped") => void;
+  onActivated?: () => Promise<void>;
+}
 
 /**
  * In-memory supervise timer. Pure `due/mark` cycle on the supervise interval;
@@ -23,13 +38,17 @@ export class ProjectLoop {
   private checkpoint?: Checkpoint;
   private readonly supervisor: SuperviseTimer;
 
+  /** Previous tick's Project status; undefined until the first tick. */
+  private lastStatus?: string;
+
   constructor(
     readonly projectId: string,
     private readonly config: ResolvedTaskConfig,
     private readonly graph: GraphClient,
     private readonly executor: TaskExecutor,
     private readonly executions: ExecutionRegistry,
-    private readonly pendingCount: () => number,
+    private readonly jointPlanVersion: () => string | Promise<string>,
+    private readonly hooks: ProjectLoopHooks = {},
   ) {
     this.supervisor = new SuperviseTimer(config.phase.supervise.intervalMs);
   }
@@ -43,11 +62,28 @@ export class ProjectLoop {
    */
   async tick(): Promise<number> {
     const project = await this.graph.getProject(this.projectId);
-    if (project.project.status !== "active") {
-      this.executions.cancelProject(this.projectId);
-      this.executor.cleanupRuntimeTmp();
+    const status = project.project.status;
+    if (status !== "active") {
+      // Cancel in-flight work, drop the scratch dir, and release the
+      // execution target exactly once per entry into non-active state. The
+      // guard also fires on the first tick against an already-finished
+      // Project, removing a container the Runtime created at startup.
+      if (this.lastStatus !== status) {
+        this.executions.cancelProject(this.projectId);
+        this.executor.cleanupRuntimeTmp();
+        this.hooks.onInactive?.(status as "completed" | "stopped");
+      }
+      this.lastStatus = status;
       return 0;
     }
+    // Re-establish the execution target after a stop/resume round-trip inside
+    // this Runtime; skipped on the first tick when the Project is already
+    // active (registerProject established the workspace). A failure leaves
+    // lastStatus unchanged so the next tick retries.
+    if (this.lastStatus !== undefined && this.lastStatus !== "active") {
+      await this.hooks.onActivated?.();
+    }
+    this.lastStatus = "active";
     // Supervise channel (independent of Execute capacity): at most one active
     // supervise per Project, gated only by its interval and Worker availability.
     if (this.supervisor.due() && !this.executions.has(this.projectId, "supervise")) {
@@ -59,10 +95,11 @@ export class ProjectLoop {
     }
     // Plan channel (independent of Execute capacity): at most one active plan
     // per Project, gated only by whether Plan is needed and Worker availability.
-    if (this.planNeeded(project) && !this.executions.has(this.projectId, "plan")) {
+    const jointPlan = await this.jointPlanVersion();
+    if (this.planNeeded(project, jointPlan) && !this.executions.has(this.projectId, "plan")) {
       const worker = this.executor.reserveWorker("plan");
       if (worker) {
-        this.checkpoint = checkpoint(project, this.pendingCount());
+        this.checkpoint = checkpoint(project, jointPlan);
         this.dispatch("plan", worker, (signal, executionId) => this.executor.plan(this.projectId, executionId, signal, worker), () => { this.checkpoint = undefined; });
       }
     }
@@ -87,11 +124,11 @@ export class ProjectLoop {
     this.executions.cancelProject(this.projectId);
   }
 
-  private planNeeded(project: ProjectGraph): boolean {
-    const current = checkpoint(project, this.pendingCount());
+  private planNeeded(project: ProjectGraph, jointPlan: string): boolean {
+    const current = checkpoint(project, jointPlan);
     if (!this.checkpoint) return true;
     return current.facts !== this.checkpoint.facts || current.hints !== this.checkpoint.hints
-      || (this.checkpoint.open > 0 && current.open === 0) || current.federation !== this.checkpoint.federation;
+      || (this.checkpoint.open > 0 && current.open === 0) || current.jointPlan !== this.checkpoint.jointPlan;
   }
 
   private dispatch(
@@ -117,6 +154,6 @@ export class ProjectLoop {
   }
 }
 
-function checkpoint(project: ProjectGraph, federation: number): Checkpoint {
-  return { facts: project.facts.length, hints: project.hints.length, open: project.intents.filter((item) => item.to === null).length, federation };
+function checkpoint(project: ProjectGraph, jointPlan: string): Checkpoint {
+  return { facts: project.facts.length, hints: project.hints.length, open: project.intents.filter((item) => item.to === null).length, jointPlan };
 }

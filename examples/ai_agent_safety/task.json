@@ -17,6 +17,9 @@
       }
     ]
   },
+  "execution": {
+    "mode": "local"
+  },
   "workers": [
     {
       "type": "pi",
@@ -42,34 +45,55 @@
       "intervalMs": 90000,
       "customProfile": {
         "description": "Use when reviewing AI safety evidence or AI Agent guardrail engineering work.",
-        "prompt": "For intelligence work, identify only concrete defects in primary-source traceability, dates, separation of confirmed facts from uncertainty, or support for stated implications. For guardrail work, identify only concrete gaps in threat coverage, enforcement behavior, telemetry, ownership, or measurable tests. Name the exact missing or contradictory item; do not request generic expansion or a separate review report."
+        "prompt": "For intelligence work, identify only concrete defects in primary-source traceability, dates, separation of confirmed facts from uncertainty, or support for stated implications. For guardrail work, identify only concrete gaps in threat coverage, enforcement behavior, telemetry, ownership, or measurable tests. Name the exact missing or contradictory item; do not request generic expansion or a separate review report.",
+        "skills": [
+          "ai-agent-safety"
+        ]
       }
     },
     "execute": {
       "customProfile": [
         {
           "description": "Use when assessing one AI safety research paper, official standard, or regulator publication.",
-          "prompt": "Verify the exact title, issuing organization, version or publication date, and canonical URL. Extract only claims directly supported by the document, distinguish normative requirements from recommendations, record material limitations, and state one concrete engineering or governance implication. Do not substitute summaries, reposts, or marketing pages for the primary document."
+          "prompt": "Verify the exact title, issuing organization, version or publication date, and canonical URL. Extract only claims directly supported by the document, distinguish normative requirements from recommendations, record material limitations, and state one concrete engineering or governance implication. Do not substitute summaries, reposts, or marketing pages for the primary document.",
+          "skills": [
+            "ai-agent-safety"
+          ]
         },
         {
           "description": "Use when investigating one documented AI or Agent safety incident.",
-          "prompt": "Use an official disclosure, security advisory, incident report, or vendor postmortem as the primary record. Separate observed behavior, affected assets, impact, contributing conditions, causal hypotheses, remediation, and unresolved uncertainty. Preserve the event date and canonical disclosure URL; do not turn an unverified anecdote into a confirmed incident."
+          "prompt": "Use an official disclosure, security advisory, incident report, or vendor postmortem as the primary record. Separate observed behavior, affected assets, impact, contributing conditions, causal hypotheses, remediation, and unresolved uncertainty. Preserve the event date and canonical disclosure URL; do not turn an unverified anecdote into a confirmed incident.",
+          "skills": [
+            "ai-agent-safety"
+          ]
         },
         {
           "description": "Use when modeling threats to an HTTP-native, tool-using AI Agent.",
-          "prompt": "Define the protected asset, attacker capability, entry point, trust boundary crossed, abuse path, preconditions, impact, and risk priority. Cover the assigned threat only and make assumptions explicit. Prefer concrete paths involving delegated identity, tool arguments, retrieved content, credentials, network egress, filesystem access, or subprocess execution over generic threat labels."
+          "prompt": "Define the protected asset, attacker capability, entry point, trust boundary crossed, abuse path, preconditions, impact, and risk priority. Cover the assigned threat only and make assumptions explicit. Prefer concrete paths involving delegated identity, tool arguments, retrieved content, credentials, network egress, filesystem access, or subprocess execution over generic threat labels.",
+          "skills": [
+            "ai-agent-safety"
+          ]
         },
         {
           "description": "Use when specifying one enforceable AI Agent security control.",
-          "prompt": "Map the control to a concrete threat and specify its enforcement point, decision inputs, allow and deny behavior, least-privilege boundary, failure mode, required audit fields, operating owner, and an automated test with a measurable threshold. For tool, data, sandbox, or policy controls, state exactly which request, credential, network, filesystem, or process action is blocked or permitted."
+          "prompt": "Map the control to a concrete threat and specify its enforcement point, decision inputs, allow and deny behavior, least-privilege boundary, failure mode, required audit fields, operating owner, and an automated test with a measurable threshold. For tool, data, sandbox, or policy controls, state exactly which request, credential, network, filesystem, or process action is blocked or permitted.",
+          "skills": [
+            "ai-agent-safety"
+          ]
         },
         {
           "description": "Use when editing the final AI safety intelligence brief.",
-          "prompt": "Apply the intelligence-brief structure and evidence rules in the installed Skill. Include only findings with complete primary-source records, keep uncertainty visible, and derive each cross-cutting trend from named findings. If required evidence is missing, report the precise gap instead of inventing a citation or completing unsupported prose."
+          "prompt": "Apply the intelligence-brief structure and evidence rules in the installed Skill. Include only findings with complete primary-source records, keep uncertainty visible, and derive each cross-cutting trend from named findings. If required evidence is missing, report the precise gap instead of inventing a citation or completing unsupported prose.",
+          "skills": [
+            "ai-agent-safety"
+          ]
         },
         {
           "description": "Use when assembling the final AI Agent guardrail blueprint.",
-          "prompt": "Apply the blueprint structure and control specification in the installed Skill. Ensure every prioritized threat maps to an enforcement control, telemetry, an accountable owner, and a measurable release test. Reconcile conflicting assumptions and leave unresolved risks explicit instead of masking them with generic best practices."
+          "prompt": "Apply the blueprint structure and control specification in the installed Skill. Ensure every prioritized threat maps to an enforcement control, telemetry, an accountable owner, and a measurable release test. Reconcile conflicting assumptions and leave unresolved risks explicit instead of masking them with generic best practices.",
+          "skills": [
+            "ai-agent-safety"
+          ]
         }
       ]
     }
