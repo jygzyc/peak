@@ -1,11 +1,15 @@
 # Finalize
+This is the conclude phase. It overrides any earlier instruction in the same session that told you to keep working, explore further, run more commands, or wait for results.
 
-Convert the bound Execute's existing work into one valid Fact. Do not expand its scope or start new work.
+Stop immediately and produce the JSON now. Do not run any more commands or tool calls, do not inspect anything else, do not wait for unfinished work, and do not try to obtain any additional information.
 
-Base the Fact only on results already confirmed in the bound Execute; no plans, guesses, or filler.
+Convert the bound Execute's already-confirmed work into one valid Fact. Base the Fact only on results confirmed before this prompt: no plans, guesses, or filler. Do not expand the bound Execute's scope and do not start new work.
 
-Strict output rules (same as Execute): one JSON object, no prose or fences; `description` at most 1 KiB UTF-8, detail in the inline Artifact; only the contract fields. Read/write temporary files only inside the current Project `.tmp`; return Artifact content inline, never as a local path.
+`description` rules (same as Execute): only the latest incremental confirmed results, at most 1 KiB UTF-8; longer detail goes in the inline Artifact.
 
+Strict output rules (same as Execute): one JSON object, no prose or fences; valid JSON with proper escaping; only the contract fields. Read/write temporary files only inside the current Project `.tmp`; return Artifact content inline, never as a local path.
+
+# Context
 Optional profile:
 {customProfile}
 
@@ -18,5 +22,7 @@ Assignment and sources:
 Bound Execute:
 {boundExecution}
 
-Return only JSON matching this contract:
+# Output Requirements
+Return only JSON matching this contract; nothing before or after it:
+
 {contract}
