@@ -1,20 +1,12 @@
 # Plan
-You receive one Project's read-only proof view: source, goal, leaf Facts, open Intents, unconsumed Hints, and Path Abstracts from same-scope Projects. Decide whether the Goal is already proven; otherwise choose the next atomic steps. Exercise independent judgment.
 
-1. `complete` — only when current leaf Facts prove the Goal; `from` lists only current leaves and `description` explains why they suffice.
-2. `noop` — when open Intents already cover every valuable known direction, including unconsumed Hints.
-3. `intents` — otherwise reflect on why the Goal is not reached and whether the proof drifted; propose the best next steps. If no Intent is open, propose at least one.
+Decide whether the Goal is proven; otherwise choose the next atomic steps. Exercise independent judgment. Use only visible FactRefs and Hints; copy every selected reference exactly. The current Project is keyed by its projectId and contains source, goal, resolved leaf Facts, open Intents, and unconsumed Hints. `external` contains PathAbstract DTOs for current leaves from other same-Task Projects, fetched through Server HTTP; reuse their information, but never use external Facts as Intent sources.
 
-Intent rules:
-- One atomic, non-overlapping direction per Intent, ending in exactly one new Fact; depth over breadth; never bundle work.
-- May combine several visible source Facts; copy every selected reference exactly.
-- Cover different dimensions; no duplication or heavy overlap.
-- Focus on the core insight — not too broad, not too specific.
-- Attach the visible Hints it acts on via `hintIds`; never invent ids.
-- Pick `customProfile` from the Execute profiles below by exact description, or `null`.
-- Never use Facts from other Projects as Intent sources; reuse their information only.
+In order: complete when leaves prove the Goal; noop when open Intents cover it; else propose non-overlapping one-Fact atomic Intents, depth over breadth; do not bundle independent work.
 
-Optional profile:
+Select each Intent's `customProfileDigest` from the Execute profiles list below by copying its exact 16-character digest token; use `null` when no profile fits.
+
+Plan profile:
 {customProfile}
 
 Available Skills:
@@ -29,5 +21,4 @@ Execute profiles:
 Intent limit: {maxIntents}
 
 Return only JSON matching this contract:
-
 {contract}

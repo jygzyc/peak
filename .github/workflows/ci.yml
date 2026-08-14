@@ -26,10 +26,10 @@ jobs:
         run: npm install
 
       - name: Typecheck
-        run: npm run typecheck
+        run: npm run typecheck:all
 
       - name: Build
-        run: npm run build
+        run: npm run build:all
 
       - name: Test
         run: npm test

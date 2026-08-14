@@ -18,6 +18,7 @@ export const PROJECT_ARCHIVE_DATABASE = "project.db";
 export const PROJECT_ARCHIVE_MANIFEST = "manifest.json";
 
 export interface BoardProjectBlock { id: string; source: string; goal: string }
+export interface ArchivedPathAbstract { factId: string; path: string; sha256: string; sizeBytes: number }
 
 export interface ProjectArchiveManifest {
   format: typeof PROJECT_ARCHIVE_FORMAT;
@@ -26,6 +27,7 @@ export interface ProjectArchiveManifest {
   graph: typeof PROJECT_ARCHIVE_GRAPH;
   database: typeof PROJECT_ARCHIVE_DATABASE;
   artifacts: ArtifactRef[];
+  pathAbstracts: ArchivedPathAbstract[];
 }
 
 /** Packs an already validated staging directory into one portable gzip tarball. */
@@ -157,7 +159,7 @@ export function validateProjectArchiveGraph(graph: ProjectGraph): void {
 
 function parseProjectArchiveManifest(value: unknown): ProjectArchiveManifest {
   const manifest = record(value, "manifest");
-  exact(manifest, ["format", "exportedAt", "project", "graph", "database", "artifacts"], "manifest");
+  exact(manifest, ["format", "exportedAt", "project", "graph", "database", "artifacts", "pathAbstracts"], "manifest");
   if (manifest.format !== PROJECT_ARCHIVE_FORMAT) throw new Error("unsupported Project archive format");
   if (typeof manifest.exportedAt !== "string" || !LOCAL_TIMESTAMP_PATTERN.test(manifest.exportedAt)) {
     throw new Error("invalid Project archive exportedAt");
@@ -192,6 +194,21 @@ function parseProjectArchiveManifest(value: unknown): ProjectArchiveManifest {
     validateArtifact(artifact);
     return artifact;
   });
+  if (!Array.isArray(manifest.pathAbstracts)) throw new Error("manifest.pathAbstracts must be an array");
+  const pathFactIds = new Set<string>();
+  const pathAbstracts = manifest.pathAbstracts.map((value, index): ArchivedPathAbstract => {
+    const item = record(value, `manifest.pathAbstracts[${index}]`);
+    exact(item, ["factId", "path", "sha256", "sizeBytes"], `manifest.pathAbstracts[${index}]`);
+    const factId = string(item.factId, "pathAbstract.factId");
+    if (!/^f\d{4,}$/.test(factId) || pathFactIds.has(factId)) throw new Error("invalid or duplicate PathAbstract Fact id");
+    pathFactIds.add(factId);
+    const path = string(item.path, "pathAbstract.path");
+    if (path !== `artifacts/path_abs_${factId}`) throw new Error("invalid Project archive PathAbstract path");
+    const sha256 = string(item.sha256, "pathAbstract.sha256");
+    if (!SHA256_PATTERN.test(sha256)) throw new Error("invalid Project archive PathAbstract hash");
+    if (!Number.isSafeInteger(item.sizeBytes) || (item.sizeBytes as number) < 0) throw new Error("invalid Project archive PathAbstract size");
+    return { factId, path, sha256, sizeBytes: item.sizeBytes as number };
+  });
   const source = string(project.source, "manifest.project.source");
   const goal = string(project.goal, "manifest.project.goal");
   requireDescription(source, "manifest.project.source");
@@ -203,6 +220,7 @@ function parseProjectArchiveManifest(value: unknown): ProjectArchiveManifest {
     graph: PROJECT_ARCHIVE_GRAPH,
     database: PROJECT_ARCHIVE_DATABASE,
     artifacts,
+    pathAbstracts,
   };
 }
 
@@ -218,7 +236,10 @@ function validateExtractedTree(stagingDir: string, manifest: ProjectArchiveManif
   const artifactsDir = join(stagingDir, "artifacts");
   const artifactsStat = lstatSync(artifactsDir);
   if (!artifactsStat.isDirectory() || artifactsStat.isSymbolicLink()) throw new Error("invalid Project archive artifacts directory");
-  const expectedArtifacts = new Set(manifest.artifacts.map((artifact) => artifact.sha256));
+  const expectedArtifacts = new Set([
+    ...manifest.artifacts.map((artifact) => artifact.sha256),
+    ...manifest.pathAbstracts.map((item) => `path_abs_${item.factId}`),
+  ]);
   const actualArtifacts = readdirSync(artifactsDir);
   if (actualArtifacts.some((name) => !expectedArtifacts.has(name)) || [...expectedArtifacts].some((name) => !actualArtifacts.includes(name))) {
     throw new Error("Project archive Artifact set does not match its manifest");
@@ -231,7 +252,7 @@ function validateExtractedTree(stagingDir: string, manifest: ProjectArchiveManif
 function archiveEntry(path: string, type: string): boolean {
   if (path === PROJECT_ARCHIVE_MANIFEST || path === PROJECT_ARCHIVE_GRAPH || path === PROJECT_ARCHIVE_DATABASE) return type === "File";
   if (path === "artifacts" || path === "artifacts/") return type === "Directory";
-  return /^artifacts\/[0-9a-f]{64}$/.test(path) && type === "File";
+  return (/^artifacts\/[0-9a-f]{64}$/.test(path) || /^artifacts\/path_abs_f\d{4,}$/.test(path)) && type === "File";
 }
 
 function validateArtifact(artifact: ArtifactRef): void {

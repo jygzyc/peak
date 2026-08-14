@@ -6,13 +6,31 @@
 import { appendFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
-import { ApiError, localTimestamp } from "../graph/api.js";
 import { initializeProjectLogsDirectory } from "./paths.js";
+
+/**
+ * Generic HTTP/serialization primitives shared by the Graph server, the
+ * Runtime, and the server-side control-plane extensions. They live in utils
+ * (not graph/) so the Runtime never imports a server module for them.
+ */
+export class ApiError extends Error {
+  constructor(readonly status: number, message: string) { super(message); }
+}
+
+export function localTimestamp(date = new Date()): string {
+  const pad = (value: number, width = 2): string => String(value).padStart(width, "0");
+  return `${pad(date.getFullYear(), 4)}${pad(date.getMonth() + 1)}${pad(date.getDate())}`
+    + `T${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`;
+}
+
+export function toJson(value: unknown): string {
+  return `${JSON.stringify(value)}\n`;
+}
 
 /**
  * Appends one JSON line to a Project's `logs/main.log` in the same format as
  * Graph events (`{ at, type, ...data }`). This is the single source for the
- * audit-log write used by the Graph HTTP server, FederationBus, and Runtime
+ * audit-log write used by the Graph HTTP server and Runtime
  * executors — they must all produce identical lines.
  */
 export function writeProjectLog(projectDir: string, type: string, data: Record<string, unknown>): void {
@@ -30,9 +48,12 @@ export function writeProjectLog(projectDir: string, type: string, data: Record<s
 export function sourceTitle(source: string): string {
   if (Buffer.byteLength(source, "utf8") <= 1024) return source;
   let result = "";
+  let bytes = 0;
   for (const character of source) {
-    if (Buffer.byteLength(result + character, "utf8") > 1021) break;
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > 1021) break;
     result += character;
+    bytes += characterBytes;
   }
   return `${result}...`;
 }

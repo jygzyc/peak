@@ -8,10 +8,11 @@ import { ArtifactStore } from "./artifact-store.js";
 import {
   extractProjectArchive, packProjectArchive, parseProjectArchiveGraph, PROJECT_ARCHIVE_DATABASE, PROJECT_ARCHIVE_GRAPH,
   PROJECT_ARCHIVE_FORMAT, PROJECT_ARCHIVE_MANIFEST, sha256File, validateProjectArchiveGraph,
-  type BoardProjectBlock, type ProjectArchiveManifest,
+  type ArchivedPathAbstract, type BoardProjectBlock, type ProjectArchiveManifest,
 } from "./project-archive.js";
+import { pathAbstractRelativePath, readPathAbstract } from "./path-abstract.js";
 import { SqliteStore } from "./sqlite-store.js";
-import { leafFacts, type ArtifactRef, type CreateProjectInput, type FactRef, type ProjectGraph, type ProjectMeta, type ReopenInput } from "./types.js";
+import { computePaths, leafFacts, type ArtifactRef, type CreateProjectInput, type FactRef, type ProjectGraph, type ProjectMeta, type ReopenInput } from "./types.js";
 
 export interface ProjectStores { graph: SqliteStore; artifacts: ArtifactStore; dir: string }
 export interface ImportedProjectArchive { project: ProjectMeta; boardProject: BoardProjectBlock }
@@ -31,6 +32,7 @@ export class ProjectStoreRegistry {
     return stores.graph.initialize(id, input);
   }
 
+  /** Exports a completed Project only when every non-origin leaf has a verified PathAbstract. */
   async exportProjectArchive(projectId: string, outputPath: string): Promise<ProjectArchiveManifest> {
     const stores = this.get(projectId);
     if (stores.graph.project()?.status !== "completed") throw new ApiError(409, "only completed Projects can be archived");
@@ -67,6 +69,21 @@ export class ProjectStoreRegistry {
           throw new Error(`persisted Artifact verification failed: ${artifact.sha256}`);
         }
       }
+      const pathAbstracts: ArchivedPathAbstract[] = [];
+      for (const path of computePaths(graph)) {
+        if (path.leaf.id === "origin") continue;
+        const relativePath = pathAbstractRelativePath(path.leaf.id);
+        const source = join(stores.dir, ...relativePath.split("/"));
+        const abstract = readPathAbstract(stores.dir, path.leaf.id);
+        if (!abstract || abstract.factRef.projectId !== projectId || abstract.factRef.id !== path.leaf.id
+          || abstract.factRef.description !== path.leaf.description) {
+          throw new Error(`completed Project is missing PathAbstract: ${projectId}/${path.leaf.id}`);
+        }
+        const target = join(staging, ...relativePath.split("/"));
+        try { linkSync(source, target); } catch { copyFileSync(source, target); }
+        const stat = lstatSync(target);
+        pathAbstracts.push({ factId: path.leaf.id, path: relativePath, sha256: await sha256File(target), sizeBytes: stat.size });
+      }
       const manifest: ProjectArchiveManifest = {
         format: PROJECT_ARCHIVE_FORMAT,
         exportedAt: localTimestamp(),
@@ -74,6 +91,7 @@ export class ProjectStoreRegistry {
         graph: PROJECT_ARCHIVE_GRAPH,
         database: PROJECT_ARCHIVE_DATABASE,
         artifacts,
+        pathAbstracts,
       };
       writeFileSync(join(staging, PROJECT_ARCHIVE_MANIFEST), `${JSON.stringify(manifest, null, 2)}\n`, { flag: "wx" });
       writeFileSync(join(staging, PROJECT_ARCHIVE_GRAPH), `${JSON.stringify(graph, null, 2)}\n`, { flag: "wx" });
@@ -121,6 +139,20 @@ export class ProjectStoreRegistry {
         const stat = lstatSync(path);
         if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== artifact.sizeBytes || await sha256File(path) !== artifact.sha256) {
           throw new Error(`Project archive Artifact verification failed: ${artifact.sha256}`);
+        }
+      }
+      const expectedPathIds = computePaths(databaseGraph).map((path) => path.leaf.id).filter((id) => id !== "origin").sort();
+      const archivedPathIds = manifest.pathAbstracts.map((item) => item.factId).sort();
+      if (!isDeepStrictEqual(archivedPathIds, expectedPathIds)) throw new Error("Project archive PathAbstract set does not match its leaf Paths");
+      for (const item of manifest.pathAbstracts) {
+        const path = join(staging, ...item.path.split("/"));
+        const stat = lstatSync(path);
+        const abstract = readPathAbstract(staging, item.factId);
+        const leaf = databaseGraph.facts.find((fact) => fact.id === item.factId);
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== item.sizeBytes || await sha256File(path) !== item.sha256
+          || !abstract || !leaf || abstract.factRef.projectId !== projectId || abstract.factRef.id !== leaf.id
+          || abstract.factRef.description !== leaf.description) {
+          throw new Error(`Project archive PathAbstract verification failed: ${item.factId}`);
         }
       }
       imported.close();

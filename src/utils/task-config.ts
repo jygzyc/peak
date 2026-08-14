@@ -31,9 +31,10 @@ export function loadTaskConfig(directory = "."): ResolvedTaskConfig {
   const { configPath, taskDir } = resolveTaskConfigPaths(directory);
   if (!existsSync(configPath)) throw new Error(`task config not found: ${configPath}`);
   const root = object(parseJson(readFileSync(configPath, "utf8")), "task config");
-  keys(root, ["board", "workers", "scheduler", "phase"], "task config");
+  keys(root, ["board", "execution", "workers", "scheduler", "phase"], "task config");
   const board = object(root.board, "board");
   keys(board, ["name", "skills", "projects"], "board");
+  const boardSkills = strings(board.skills, "board.skills") ?? [];
   const workers = parseWorkers(root.workers);
   if (!Object.values(workers).some((worker) => worker.taskTypes.includes("supervise"))) {
     throw new Error("at least one worker must support supervise");
@@ -46,12 +47,13 @@ export function loadTaskConfig(directory = "."): ResolvedTaskConfig {
     taskDir,
     board: {
       name: optionalString(board.name, "board.name"),
-      skills: strings(board.skills, "board.skills") ?? [],
+      skills: boardSkills,
       projects: parseProjects(board.projects),
     },
+    execution: parseExecution(root.execution),
     workers,
     scheduler: parseScheduler(root.scheduler),
-    phase: parsePhase(root.phase),
+    phase: parsePhase(root.phase, boardSkills),
   });
 }
 
@@ -114,7 +116,7 @@ function parseScheduler(value: unknown): ResolvedTaskConfig["scheduler"] {
   };
 }
 
-function parsePhase(value: unknown): ResolvedTaskConfig["phase"] {
+function parsePhase(value: unknown, boardSkills: string[]): ResolvedTaskConfig["phase"] {
   if (value === undefined) return structuredClone(DEFAULT_PHASE);
   const input = object(value, "phase");
   keys(input, ["plan", "supervise", "execute"], "phase");
@@ -123,15 +125,15 @@ function parsePhase(value: unknown): ResolvedTaskConfig["phase"] {
   const execute = section(input.execute, "phase.execute", ["maxArtifactBytes", "customProfile"]);
   return {
     plan: {
-      ...optionalCustomProfile(plan.customProfile, "phase.plan.customProfile"),
+      ...optionalCustomProfile(plan.customProfile, "phase.plan.customProfile", boardSkills),
     },
     supervise: {
       intervalMs: integer(supervise.intervalMs, "phase.supervise.intervalMs") ?? DEFAULT_PHASE.supervise.intervalMs,
-      ...optionalCustomProfile(supervise.customProfile, "phase.supervise.customProfile"),
+      ...optionalCustomProfile(supervise.customProfile, "phase.supervise.customProfile", boardSkills),
     },
     execute: {
       maxArtifactBytes: integer(execute.maxArtifactBytes, "phase.execute.maxArtifactBytes") ?? DEFAULT_PHASE.execute.maxArtifactBytes,
-      customProfile: customProfileList(execute.customProfile, "phase.execute.customProfile"),
+      customProfile: customProfileList(execute.customProfile, "phase.execute.customProfile", boardSkills),
     },
   };
 }
@@ -141,6 +143,17 @@ function section(value: unknown, label: string, allowed: string[]): Record<strin
   const result = object(value, label);
   keys(result, allowed, label);
   return result;
+}
+
+function parseExecution(value: unknown): ResolvedTaskConfig["execution"] {
+  if (value === undefined) return { mode: "local" };
+  const input = object(value, "execution");
+  keys(input, ["mode", "networkMode"], "execution");
+  const networkMode = optionalString(input.networkMode, "execution.networkMode");
+  return {
+    mode: enumeration(input.mode, ["local", "docker"] as const, "execution.mode"),
+    ...(networkMode === undefined ? {} : { networkMode }),
+  };
 }
 
 function parseJson(text: string): unknown {
@@ -188,31 +201,44 @@ function optionalPrompt(value: unknown, label: string): string | undefined {
   return result;
 }
 
-function optionalCustomProfile(value: unknown, label: string): { customProfile?: CustomProfileDefinition } {
-  return value === undefined ? {} : { customProfile: customProfile(value, label) };
+function optionalCustomProfile(value: unknown, label: string, boardSkills: string[]): { customProfile?: CustomProfileDefinition } {
+  return value === undefined ? {} : { customProfile: customProfile(value, label, boardSkills) };
 }
 
-function customProfile(value: unknown, label: string): CustomProfileDefinition {
+function customProfile(value: unknown, label: string, boardSkills: string[]): CustomProfileDefinition {
   const item = object(value, label);
-  keys(item, ["description", "prompt"], label);
+  keys(item, ["description", "prompt", "skills"], label);
   const description = requiredString(item.description, `${label}.description`);
   if (Buffer.byteLength(description, "utf8") > MAX_PROFILE_DESCRIPTION_BYTES) throw new Error(`${label}.description exceeds 1 KiB`);
   const prompt = optionalPrompt(item.prompt, `${label}.prompt`);
   if (!prompt) throw new Error(`${label}.prompt is required`);
-  return { description, prompt };
+  const skills = profileSkills(item.skills, `${label}.skills`, boardSkills);
+  return { description, prompt, skills };
 }
 
-function customProfileList(value: unknown, label: string): CustomProfileDefinition[] {
+function customProfileList(value: unknown, label: string, boardSkills: string[]): CustomProfileDefinition[] {
   if (value === undefined) return [];
   const items = array(value, label);
   const seen = new Set<string>();
   return items.map((value, index) => {
     const itemLabel = `${label}[${index}]`;
-    const profile = customProfile(value, itemLabel);
+    const profile = customProfile(value, itemLabel, boardSkills);
     if (seen.has(profile.description)) throw new Error(`duplicate Execute custom profile description: ${profile.description}`);
     seen.add(profile.description);
     return profile;
   });
+}
+
+/** Validates that a phase profile selects a unique subset of Task Skills. */
+function profileSkills(value: unknown, label: string, boardSkills: string[]): string[] {
+  if (value === undefined) return [];
+  const raw = array(value, label).map((item) => requiredString(item, label));
+  if (new Set(raw).size !== raw.length) throw new Error(`${label} contains duplicates`);
+  const declared = new Set(boardSkills);
+  for (const skill of raw) {
+    if (!declared.has(skill)) throw new Error(`${label} references undeclared board Skill: ${skill}`);
+  }
+  return raw;
 }
 
 function optionalModel(value: unknown, label: string): string | undefined {
@@ -255,8 +281,7 @@ function stringRecord(value: unknown, label: string): Record<string, string> {
  */
 export function executeCapacity(config: ResolvedTaskConfig): number {
   return Object.values(config.workers)
-    .filter((worker) => worker.taskTypes.includes("execute"))
-    .reduce((sum, worker) => sum + worker.maxRunning, 0);
+    .reduce((sum, worker) => sum + (worker.taskTypes.includes("execute") ? worker.maxRunning : 0), 0);
 }
 
 function integer(value: unknown, label: string, minimum = 1): number | undefined {

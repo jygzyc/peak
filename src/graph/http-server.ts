@@ -8,7 +8,7 @@ import {
 } from "./api.js";
 import { ProjectStoreRegistry } from "./project-store-registry.js";
 import { parsePathAbstract, readPathAbstract, writePathAbstract } from "./path-abstract.js";
-import { type ArtifactRef, type CompleteInput, type ConcludeInput, type CreateIntentInput, type FactRef } from "./types.js";
+import { computePaths, type ArtifactRef, type CompleteInput, type ConcludeInput, type CreateIntentInput, type FactRef } from "./types.js";
 
 export interface HttpServerOptions {
   host?: string;
@@ -17,6 +17,7 @@ export interface HttpServerOptions {
 }
 
 export type HttpRootHandler = (request: IncomingMessage, response: ServerResponse) => boolean;
+export type TaskFederationResolver = (taskName: string) => string[] | undefined;
 
 /**
  * Generic `/api/*` extension. An extension receives a matching request and may
@@ -40,6 +41,7 @@ export class GraphHttpServer {
     readonly registry: ProjectStoreRegistry,
     private readonly rootHandler?: HttpRootHandler,
     private readonly apiExtensions: ApiExtension[] = [],
+    private readonly taskFederationProjects?: TaskFederationResolver,
   ) {}
 
   get baseUrl(): string {
@@ -138,10 +140,24 @@ export class GraphHttpServer {
         }));
       }
 
-      // Extension probe: lets Runtime/CLI inject additional
-      // read-only /api/* routes (e.g. /api/runtime/*) without graph/ depending
-      // on runtime/. Probed before the project-scoped guard so non-projects
-      // paths are routable; each extension owns its own path matching.
+      if (parts[1] === "federation" && parts[2] === "joint-plan" && parts.length === 3 && method === "POST") {
+        const body = await bodyObject(request);
+        exact(body, ["taskName", "targetProjectId"]);
+        const projectIds = this.federationProjects(body.taskName);
+        const targetProjectId = requireDescription(body.targetProjectId, "targetProjectId");
+        if (!projectIds.includes(targetProjectId)) throw new ApiError(400, "Joint Plan target is not a Task Project");
+        const paths = projectIds.filter((projectId) => projectId !== targetProjectId).flatMap((projectId) =>
+          computePaths(this.registry.get(projectId).graph.graph()).map((path) => ({
+            projectId,
+            leaf: path.leaf,
+            segments: path.segments.map((segment) => segment.map((step) => step.fact)),
+          })),
+        );
+        return json(response, paths);
+      }
+
+      // Extension probe lets the Server composition root add control-plane
+      // routes (for example /api/tasks/*) without coupling Graph to them.
       for (const ext of this.apiExtensions) {
         if (ext.matches(method, parts) && await ext.handle(request, response)) return;
       }
@@ -277,6 +293,15 @@ export class GraphHttpServer {
       const status = error instanceof ApiError ? error.status : 500;
       json(response, { error: error instanceof Error ? error.message : String(error) }, status);
     }
+  }
+
+  /** Resolves the immutable Project membership used by a Task Joint Plan. */
+  private federationProjects(taskNameValue: unknown): string[] {
+    const taskName = requireShortDescription(taskNameValue, "taskName");
+    const projectIds = this.taskFederationProjects?.(taskName);
+    if (!projectIds?.length) throw new ApiError(409, `Task Federation is not mounted: ${taskName}`);
+    for (const projectId of projectIds) this.registry.get(projectId);
+    return projectIds;
   }
 
 }

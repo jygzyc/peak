@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 export type ServerProcessMode = "serve";
@@ -63,13 +63,14 @@ export function getServerProcessStatus(peakHome: string): ServerProcessStatus {
     return stoppedStatus();
   }
   const metadata = readMetadata(peakHome);
+  const current = metadata?.pid === pid ? metadata : undefined;
   return {
     running: true,
     pid,
-    mode: metadata?.pid === pid ? metadata.mode : null,
-    webUrl: metadata?.pid === pid ? metadata.webUrl : null,
-    startedAt: metadata?.pid === pid ? metadata.startedAt : null,
-    boardDir: metadata?.pid === pid ? metadata.boardDir : null,
+    mode: current?.mode ?? null,
+    webUrl: current?.webUrl ?? null,
+    startedAt: current?.startedAt ?? null,
+    boardDir: current?.boardDir ?? null,
   };
 }
 
@@ -139,7 +140,6 @@ export function isProcessAlive(pid: number): boolean {
 
 function cleanupFiles(peakHome: string): void {
   for (const path of [serverPidPath(peakHome), serverMetadataPath(peakHome)]) {
-    if (!existsSync(path)) continue;
     try { unlinkSync(path); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   }

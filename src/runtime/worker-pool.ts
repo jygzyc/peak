@@ -41,7 +41,7 @@ export class WorkerPool {
     cwd: string,
     signal?: AbortSignal,
     currentSession?: SessionRef,
-    options: { tmpDir?: string; onSpawn?: (pid: number) => void } = {},
+    options: { tmpDir?: string } = {},
   ): Promise<WorkerResult> {
     const route = this.config.workers[workerName];
     if (!route || !route.taskTypes.includes(taskType)) throw new Error(`worker is not routed for ${taskType}: ${workerName}`);
@@ -64,7 +64,7 @@ export class WorkerPool {
 }
 
 /** Strips config-only route metadata before it crosses into src/worker. */
-function workerDefinitions(config: ResolvedTaskConfig): WorkerRuntimeConfig {
+export function workerDefinitions(config: ResolvedTaskConfig): WorkerRuntimeConfig {
   return {
     workers: Object.fromEntries(Object.entries(config.workers).map(([name, worker]) => [name, {
       type: worker.type, model: worker.model, env: worker.env,

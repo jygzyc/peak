@@ -1,42 +1,79 @@
-# peak-task 镜像凭据注入矩阵
+# peak-task 镜像
 
-镜像只解决"装什么"，不解决"登录谁"。**凭据一律运行期注入**：只进 task 容器，不进 Server，不进镜像层。
+Peak 的执行层是 **Cairn 形式**：dispatcher（Runtime）在宿主机调度，每个 Project 对应一个**长驻 worker 容器**（`sleep infinity`），Runtime 用 `docker exec` 把 worker 命令推进容器。worker 容器**零宿主机挂载**——graph 数据在 prompt 内、API key 走 worker env、Skills 走 `docker cp`、工作目录是容器内 `/work`。
 
-| 后端 | CLI 命令 | 方式 A：task.json 显式 env（推荐） | 方式 B：登录态挂载（只读） |
-| --- | --- | --- | --- |
-| claude-code | `claude` | worker `env` 配置 `ANTHROPIC_API_KEY` | 自动挂载 `~/.claude` → `/root/.claude`（复用主机 OAuth 登录态） |
-| codex | `codex` | worker `env` 配置 `OPENAI_API_KEY` | 自动挂载 `~/.codex` → `/root/.codex` |
-| opencode | `opencode` | worker `env` 配置 provider key（`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `GOOGLE_API_KEY` 等） | 自动挂载 `~/.local/share/opencode` → `/root/.local/share/opencode` |
-| pi | `pi` | worker `env` 配置 provider key（同上矩阵，按其 provider 配置） | 自动挂载 `~/.pi` → `/root/.pi` |
+## 执行模式（task.json `execution`）
 
-## 注入规则
+| 模式 | 说明 |
+| --- | --- |
+| `local`（默认） | worker 作为宿主机子进程运行，per-project `.tmp` 工作目录，复用宿主机已配置的 CLI |
+| `docker` | Runtime 在宿主机，每个 Project 一个长驻容器 + `docker exec`，零挂载，自包含镜像 |
 
-- **Peak 绝不主动扫描主机环境变量**。API key 必须显式写在 `task.json` 的 per-worker `env` 里；该配置随 `/board` 挂载进容器，由容器内 Runtime 的 `ProcessRunner` 照常合并进 worker 子进程——值不经过 docker 命令行，`docker inspect` 不可见。
-- 登录态目录一律 **只读**。需要刷新登录态、写锁文件或在 home 下保存会话的 CLI 可能失败；Docker 严格隔离场景应优先使用方式 A。Worker 的显式临时状态必须落在当前 Project `.tmp/`。
-- 只有主机上**已存在**的登录态目录才会被挂载，无需手写任何 docker 参数。
+`execution.mode: "docker"` 时，容器引擎或镜像不可用会让整个 Task 回退 `local`。
 
-## Skills 挂载
+```json
+{ "execution": { "mode": "docker", "networkMode": "host" } }
+```
 
-- 主机 `~/.agents/skills`（OpenCode 与 Pi）和 `~/.claude/skills`（Claude Code）只读挂载；Codex 不使用 Skills。
-- Docker Runtime 总是使用 `--no-install-skills`。当目标全局 Skill 不存在时，启动器把 Board 自带 `skills/<name>` 直接只读 overlay 到相应容器发现路径；既不创建临时链接，也不修改主机 Skill 目录。
+### docker 模式数据流（零挂载如何工作）
 
-## entrypoint 凭据预检
+| 数据 | 传递方式 |
+| --- | --- |
+| Graph | 渲染进 prompt（worker 不直接访问 Project shard / SQLite） |
+| API key | task.json `workers[].env` 注入（如 `ANTHROPIC_AUTH_TOKEN`、`OPENAI_API_KEY`、`PI_API_KEY`），经 `docker exec -e` 进容器，**不挂载 `~/.claude`** |
+| Skills | Board skills 通过 `docker cp` 注入容器；常用全局 skill 预装进镜像 |
+| 工作目录 / 临时文件 | 容器内 `/work`（per-project 容器隔离，容器可写） |
+| Artifact | worker 以 inline 文本输出，Runtime 存为内容寻址 Artifact（不通过文件路径回传） |
 
-容器启动时 `entrypoint.sh` 对 task 实际使用的后端（`PEAK_PREFLIGHT_BACKENDS`，由 `peak start --docker` 从 `task.json` 的 worker 类型生成）逐一探测：
+容器生命周期：Project 激活时 `ensureWorkspace` 起独立容器（已存在则复用）；Runtime 结束时删除其管理的容器；同名已停止容器在下次启动前自动回收。
 
-1. CLI 在镜像中可执行（缺失 → 提示该 CLI 未安装，需重建镜像）；
-2. 存在至少一个认证信号：`task.json` worker `env` 中配置了对应 key、容器 env 已设置（用户自行注入的）、或对应登录态目录已挂载且非空。
+## 预装工具
 
-任一后端缺失即快速失败并打印该用的配置方式——避免任务跑到一半才在 worker 超时报错。预检是**启发式信号检查**，不验证凭据真实有效性；凭据过期/额度耗尽仍以 worker 阶段错误呈现。
+| 类别 | 工具 |
+| --- | --- |
+| Android 静态分析 | **decx**（`@jygzyc/decx-cli` + `decx self install`，JDK 17 运行） |
+| Android 动态分析 | frida-tools、adb（复用宿主机 adb server）、radare2 + r2ghidra + r2flutter |
+| Android 结构/脱壳 | androguard、unicorn、capstone |
+| Web / 网络渗透 | nmap、nuclei、ffuf、sqlmap、proxychains4、impacket、chisel |
+| 通用 | tmux、python3、git、curl、socat |
+| Peak 内置辅助脚本 | `adb-setup`、`frida-auto`（crypto/ssl/root hook 模板） |
+
+## Docker 网络（task.json `execution`）
+
+```json
+{
+  "execution": {
+    "mode": "docker",
+    "networkMode": "host"
+  }
+}
+```
+
+`networkMode` 省略时使用容器引擎默认网络（通常为 `bridge`）；动态分析需要宿主监听端口时可显式设为 `host`。
+
+## Android 设备接入
+
+容器复用宿主机 adb server，不依赖 USB 直通或 `privileged`，Linux 与 Docker Desktop（Windows/macOS）行为一致：
+
+1. 宿主机启动桥接：
+   ```bash
+   container/device-bridge.sh usb start          # USB 直连，推荐
+   container/device-bridge.sh wifi <phone-ip> start  # WiFi，备选
+   ```
+2. 任务容器内 `adb-setup` / `frida-auto` 自动经 `host.docker.internal` 连接（`ADB_SERVER_SOCKET`、`FRIDA_HOST` 已 bake 进镜像）。
 
 ## 镜像分发与构建
 
-- **镜像构建不是 Peak 运行时的职责，也不在 Peak 仓库范围内**。`container/` 仅保存镜像资产（Dockerfile、entrypoint、compose、AUTH.md）作为纯文件；构建上下文组装与 `docker build` 由仓库之外的流程负责，正式发布时推送 `peak-task:<version>` 到 docker.io。四个 agent CLI 一律安装最新版，不做版本钉版，升级随镜像重建自然发生。
-- **Peak 只使用镜像**：`peak start --docker` 在本地镜像缺失时先 pull 已发布镜像；pull 也拿不到时抛出 `DockerImageUnavailableError`，CLI 自动**回退本地模式**（task 管理 API 显式选择 docker 时则返回可读错误，不静默回退）。
-- 镜像预装常用工具：adb、frida（frida-tools）、radare2（含 r2ghidra、r2flutter 插件）、tmux。要新增工具请修改 `container/Dockerfile` 后用脚本重建——容器是 `--rm` 的，运行期安装不留存。
-- `container/docker-compose.yaml` 是镜像的对外编排接口：给出 adb 连接 USB 物理设备的挂载方式（Linux `/dev/bus/usb` + privileged；Windows 走 usbipd-win 进 WSL2；macOS 用 network adb），以及纳入既有 compose/K8s 体系的参考封装。
+- 镜像构建不属于 Peak 运行时。`container/` 保存 Dockerfile、device-bridge、脚本和本说明。
+- Dockerfile 兼容 docker 与 podman；两种引擎都可构建：
+  ```bash
+  docker  build container/ -t peak-task:$(cat version)
+  podman build container/ -t peak-task:$(cat version)
+  ```
+- `docker` 执行模式自动探测宿主机容器 CLI（优先 docker，次选 podman）；`PEAK_CONTAINER_RUNTIME` 可强制指定（如 `podman`）。DockerBackend 的 `--add-host host.docker.internal:host-gateway` 需要 podman >= 4。
+- `docker` 模式优先使用本地 `peak-task:<version>`；不存在时拉取发布镜像，拉取失败回退 `local`。
 
 ## 注意
 
-- Graph API 本身公开，Peak 不实现访问 token。是否增加反向代理或网络边界由部署方决定。
-- 容器内 `host.docker.internal` 经 `--add-host host.docker.internal:host-gateway` 提供；Docker Desktop（Windows/macOS）与 Linux 均可用。
+- `docker` 模式容器无 ENTRYPOINT，`CMD sleep infinity` 常驻等 `docker exec`；key 走 worker env（不挂载 CLI 配置目录）。
+- Graph API 公开，Peak 不实现访问 token；网络边界由部署环境负责。

@@ -16,6 +16,19 @@ export interface WorkerConfig extends WorkerDefinition {
 export interface CustomProfileDefinition {
   description: string;
   prompt: string;
+  /** Task Skills made available only while this profile is active. */
+  skills: string[];
+}
+
+/** Where worker processes run: `local` (host subprocesses) or `docker` (one long-lived container per project, `docker exec`). */
+export type ExecutionMode = "local" | "docker";
+
+/** Task-level execution policy from task.json. Docker still creates one container per Project. */
+export interface ExecutionConfig {
+  /** Preferred backend. Docker unavailability falls back the whole Task to local execution. */
+  mode: ExecutionMode;
+  /** Docker `--network` value, e.g. `host` for listening sockets / OOB exfil. Default: bridge. */
+  networkMode?: string;
 }
 
 export interface SchedulerConfig {
@@ -41,6 +54,7 @@ export interface ResolvedTaskConfig {
     skills: string[];
     projects: ProjectConfig[];
   };
+  execution: ExecutionConfig;
   workers: Record<string, WorkerConfig>;
   scheduler: SchedulerConfig;
   phase: {
@@ -66,6 +80,7 @@ export const DEFAULT_SCHEDULER: SchedulerConfig = {
   intervalMs: 3_000,
 };
 
+/** Default port of the Board-local embedded Peak Server. */
 export const DEFAULT_PHASE: ResolvedTaskConfig["phase"] = {
   plan: {},
   supervise: { intervalMs: 60_000 },
@@ -74,7 +89,7 @@ export const DEFAULT_PHASE: ResolvedTaskConfig["phase"] = {
 
 export function customProfileDigest(profile: CustomProfileDefinition): string {
   return createHash("sha256")
-    .update(`${profile.description}#${profile.prompt}`, "utf8")
+    .update(JSON.stringify({ description: profile.description, prompt: profile.prompt, skills: profile.skills }), "utf8")
     .digest("hex")
     .slice(0, 16);
 }
