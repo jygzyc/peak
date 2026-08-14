@@ -240,7 +240,7 @@ test("Plan, Supervise and Execute mutate Graph only through HTTP", async () => {
     const planPrompt = workers.calls.find((call) => call.type === "plan")!.prompt;
     const executePrompt = workers.calls.find((call) => call.type === "execute")!.prompt;
     assert.doesNotMatch(supervisePrompt, /skills?/i);
-    assert.match(supervisePrompt, /Independently judge/);
+    assert.match(supervisePrompt, /Independently review/);
     assert.match(planPrompt, /Available Skills:[\s\S]*"review"/);
     assert.match(planPrompt, /copy every selected reference exactly/);
     assert.match(planPrompt, /Exercise independent judgment/);
@@ -355,7 +355,7 @@ test("Execute resumes a failed started worker through Finalize", async () => {
     assert.equal(executeCalls[0]!.session, undefined);
     assert.deepEqual(executeCalls[1]!.session, resumeSession);
     assert.match(executeCalls[1]!.prompt, /Available Skills:[\s\S]*"review"/);
-    assert.match(executeCalls[1]!.prompt, /Convert the bound Execute's existing work into one valid Fact/i);
+    assert.match(executeCalls[1]!.prompt, /Convert the bound Execute's already-confirmed work into one valid Fact/i);
     assert.match(executeCalls[1]!.prompt, /"executionId": "e-resume"/);
     const result = await graph.getProject(project.id);
     assert.deepEqual(result.intents[0]!.to, {
